@@ -1,0 +1,230 @@
+-- This file and its contents are licensed under the Timescale License.
+-- Please see the included NOTICE for copyright information and
+-- LICENSE-TIMESCALE for a copy of the license.
+\c :TEST_DBNAME :ROLE_SUPERUSER
+CREATE FUNCTION ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(INT, INT) RETURNS VOID
+AS :MODULE_PATHNAME LANGUAGE C VOLATILE;
+CREATE FUNCTION ts_bgw_params_create() RETURNS VOID
+AS :MODULE_PATHNAME LANGUAGE C VOLATILE;
+CREATE FUNCTION ts_bgw_params_destroy() RETURNS VOID
+AS :MODULE_PATHNAME LANGUAGE C VOLATILE;
+CREATE FUNCTION ts_bgw_params_reset_time(set_time BIGINT, wait BOOLEAN) RETURNS VOID
+AS :MODULE_PATHNAME LANGUAGE C VOLATILE;
+-- The parameter that controls the background worker log level differs by
+-- PostgreSQL version: timescaledb.bgw_log_level before PG19, and the native
+-- per-backend-type log_min_messages from PG19 on. These helpers hide the
+-- difference so the rest of the test and its output stay version independent.
+CREATE FUNCTION bgw_log_param() RETURNS text LANGUAGE sql AS $$
+    SELECT CASE WHEN current_setting('server_version_num')::int >= 190000
+                THEN 'log_min_messages' ELSE 'timescaledb.bgw_log_level' END
+$$;
+CREATE FUNCTION bgw_log_value(level text) RETURNS text LANGUAGE sql AS $$
+    SELECT CASE WHEN current_setting('server_version_num')::int >= 190000
+                THEN 'warning, bgworker:' || lower(level) ELSE level END
+$$;
+CREATE FUNCTION set_bgw_log_level(dbname text, level text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    IF level IS NULL THEN
+        EXECUTE format('ALTER DATABASE %I RESET %s', dbname, bgw_log_param());
+    ELSE
+        EXECUTE format('ALTER DATABASE %I SET %s = %L', dbname, bgw_log_param(),
+                       bgw_log_value(level));
+    END IF;
+END
+$$;
+CREATE FUNCTION grant_bgw_log_param(rolename text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    EXECUTE format('GRANT ALTER SYSTEM, SET ON PARAMETER %s TO %I', bgw_log_param(), rolename);
+END
+$$;
+ALTER DATABASE :TEST_DBNAME OWNER TO :ROLE_DEFAULT_PERM_USER;
+GRANT EXECUTE ON FUNCTION pg_reload_conf TO :ROLE_DEFAULT_PERM_USER;
+SELECT grant_bgw_log_param(:'ROLE_DEFAULT_PERM_USER');
+ grant_bgw_log_param 
+---------------------
+ 
+
+-- These are needed to set up the test scheduler
+CREATE TABLE public.bgw_dsm_handle_store(handle BIGINT);
+INSERT INTO public.bgw_dsm_handle_store VALUES (0);
+SELECT ts_bgw_params_create();
+ ts_bgw_params_create 
+----------------------
+ 
+
+-- Test scheduler automatically writes to this table by name, so
+-- create it.
+CREATE TABLE public.bgw_log(
+    msg_no INT,
+    mock_time BIGINT,
+    application_name TEXT,
+    msg TEXT
+);
+CREATE VIEW cleaned_bgw_log AS
+    SELECT msg_no, application_name,
+    	   regexp_replace(regexp_replace(msg, '(Wait until|started at|execution time|database) [0-9]+(\.[0-9]+)?', '\1 (RANDOM)', 'g'), 'background worker "[^"]+"','connection') AS msg
+      FROM bgw_log ORDER BY mock_time, application_name COLLATE "C", msg_no;
+-- Remove all default jobs
+DELETE FROM _timescaledb_catalog.bgw_job WHERE TRUE;
+TRUNCATE _timescaledb_internal.bgw_job_stat;
+--
+-- Set bgw log level and reload config.
+--
+-- Debug messages should be in log now which it wasn't before.
+--
+-- We change user to make sure that granting SET and ALTER SYSTEM
+-- privileges to the default user actually works.
+SET ROLE :ROLE_DEFAULT_PERM_USER;
+SELECT set_bgw_log_level(:'TEST_DBNAME', 'DEBUG1');
+ set_bgw_log_level 
+-------------------
+ 
+
+SELECT pg_reload_conf();
+ pg_reload_conf 
+----------------
+ t
+
+RESET ROLE;
+SELECT ts_bgw_params_reset_time(0, false);
+ ts_bgw_params_reset_time 
+--------------------------
+ 
+
+INSERT INTO _timescaledb_catalog.bgw_job(
+       application_name,
+       schedule_interval,
+       max_runtime,
+       max_retries,
+       retry_period,
+       proc_schema,
+       proc_name,
+       owner,
+       scheduled,
+       fixed_schedule
+) VALUES (
+	'test_job_1b',		--application_name
+	INTERVAL '100ms',	--schedule_interval
+	INTERVAL '100s',	--max_runtime
+	5,			--max_retries
+	INTERVAL '1s',		--retry_period
+	'public',		--proc_schema
+	'bgw_test_job_1',	--proc_name
+	CURRENT_ROLE::regrole,	--owner
+	TRUE,			--scheduled
+	FALSE			--fixed_schedule
+) RETURNING id AS job_id \gset
+SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(25, 0);
+ ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish 
+------------------------------------------------------------
+ 
+
+SELECT * FROM cleaned_bgw_log;
+ msg_no | application_name |                                   msg                                   
+--------+------------------+-------------------------------------------------------------------------
+      0 | DB Scheduler     | extension state changed: unknown to created
+      1 | DB Scheduler     | database scheduler for database (RANDOM) starting
+      2 | DB Scheduler     | launching job 1000 "test_job_1b"
+      3 | DB Scheduler     | [TESTING] Registered new background worker
+      4 | DB Scheduler     | [TESTING] Wait until (RANDOM), started at (RANDOM)
+      0 | test_job_1b      | Execute job 1
+      1 | test_job_1b      | job 1000 (test_job_1b) exiting with success: execution time (RANDOM) ms
+      5 | DB Scheduler     | scheduler for database (RANDOM) exiting with exit status 0
+
+-- We test that we can set it to FATAL, which removed LOG level
+-- entries from the log.
+SELECT set_bgw_log_level(:'TEST_DBNAME', 'FATAL');
+ set_bgw_log_level 
+-------------------
+ 
+
+SELECT pg_reload_conf();
+ pg_reload_conf 
+----------------
+ t
+
+\c :TEST_DBNAME :ROLE_SUPERUSER
+TRUNCATE bgw_log;
+SELECT ts_bgw_params_reset_time(0, false);
+ ts_bgw_params_reset_time 
+--------------------------
+ 
+
+SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(25, 0);
+ ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish 
+------------------------------------------------------------
+ 
+
+SELECT * FROM cleaned_bgw_log;
+ msg_no | application_name | msg 
+--------+------------------+-----
+
+-- We test that we can set it to ERROR.
+SELECT set_bgw_log_level(:'TEST_DBNAME', 'ERROR');
+ set_bgw_log_level 
+-------------------
+ 
+
+SELECT pg_reload_conf();
+ pg_reload_conf 
+----------------
+ t
+
+\c :TEST_DBNAME :ROLE_SUPERUSER
+TRUNCATE bgw_log;
+SELECT ts_bgw_params_reset_time(0, false);
+ ts_bgw_params_reset_time 
+--------------------------
+ 
+
+SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(25, 0);
+ ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish 
+------------------------------------------------------------
+ 
+
+SELECT * FROM cleaned_bgw_log;
+ msg_no | application_name | msg 
+--------+------------------+-----
+
+-- Reset the log level and check that normal entries are showing up
+-- again.
+SELECT set_bgw_log_level(:'TEST_DBNAME', NULL);
+ set_bgw_log_level 
+-------------------
+ 
+
+SELECT pg_reload_conf();
+ pg_reload_conf 
+----------------
+ t
+
+\c :TEST_DBNAME :ROLE_SUPERUSER
+TRUNCATE bgw_log;
+SELECT ts_bgw_params_reset_time(0, false);
+ ts_bgw_params_reset_time 
+--------------------------
+ 
+
+SELECT ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish(25, 0);
+ ts_bgw_db_scheduler_test_run_and_wait_for_scheduler_finish 
+------------------------------------------------------------
+ 
+
+SELECT * FROM cleaned_bgw_log;
+ msg_no | application_name |                        msg                         
+--------+------------------+----------------------------------------------------
+      0 | DB Scheduler     | [TESTING] Wait until (RANDOM), started at (RANDOM)
+
+SELECT delete_job(:job_id);
+ delete_job 
+------------
+ 
+
+SET ROLE :ROLE_DEFAULT_PERM_USER;
+-- Make sure we can set the variable using ALTER SYSTEM using the
+-- previous grants. We don't bother about checking that it has an
+-- effect here since we already knows it works from the above code.
+-- ALTER SYSTEM cannot run inside a function, so build the version specific
+-- command and run it with \gexec. Silence the echo so the generated command
+-- (which names the version specific parameter) does not appear in the output.
+\set ECHO none
