@@ -763,6 +763,14 @@ func (st *ServerType) serversFromPairings(
 				}
 			}
 
+			// collect hosts that are forced to be automated
+			forceAutomatedNames := make(map[string]struct{})
+			if _, ok := sblock.pile["tls.force_automate"]; ok {
+				for _, host := range hosts {
+					forceAutomatedNames[host] = struct{}{}
+				}
+			}
+
 			// tls: connection policies
 			if cpVals, ok := sblock.pile["tls.connection_policy"]; ok {
 				// tls connection policies
@@ -793,8 +801,14 @@ func (st *ServerType) serversFromPairings(
 						cp.FallbackSNI = fallbackSNI
 					}
 
-					// only append this policy if it actually changes something
-					if !cp.SettingsEmpty() {
+					// only append this policy if it actually changes something,
+					// or if the configuration explicitly automates certs for
+					// these names (this is necessary to hoist a connection policy
+					// above one that may manually load a wildcard cert that would
+					// otherwise clobber the automated one; the code that appends
+					// policies that manually load certs comes later, so they're
+					// lower in the list)
+					if !cp.SettingsEmpty() || mapContains(forceAutomatedNames, hosts) {
 						srv.TLSConnPolicies = append(srv.TLSConnPolicies, cp)
 						hasCatchAllTLSConnPolicy = len(hosts) == 0
 					}
@@ -1655,6 +1669,18 @@ func listenersUseAnyPortOtherThan(addresses []string, otherPort string) bool {
 			continue
 		}
 		if uint(otherPortInt) > laddrs.EndPort || uint(otherPortInt) < laddrs.StartPort {
+			return true
+		}
+	}
+	return false
+}
+
+func mapContains[K comparable, V any](m map[K]V, keys []K) bool {
+	if len(m) == 0 || len(keys) == 0 {
+		return false
+	}
+	for _, key := range keys {
+		if _, ok := m[key]; ok {
 			return true
 		}
 	}
