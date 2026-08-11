@@ -22,6 +22,7 @@
 -- Supported headers:
 --   X-AI-Fixture: <path>          -- fixture file path relative to t/fixtures/
 --   X-AI-Fixture-Status: <code>   -- optional HTTP status code (default 200)
+--   X-AI-Fixture-Delay: <ms>      -- optional delay before responding (milliseconds)
 --   X-AI-Fixture-Flush-Events     -- for .sse fixtures, flush each SSE event separately
 
 local _M = {}
@@ -115,6 +116,7 @@ end
 -- For .sse files: sets Content-Type to text/event-stream and sends content as-is.
 -- For other files: sets Content-Type to application/json.
 -- Optional X-AI-Fixture-Status header overrides the HTTP status code.
+-- Optional X-AI-Fixture-Delay header sleeps that many milliseconds first.
 function _M.dispatch()
     local headers = ngx.req.get_headers()
     local fixture_name = headers["x-ai-fixture"]
@@ -132,6 +134,14 @@ function _M.dispatch()
     end
 
     content = apply_template(content)
+
+    local delay_ms = tonumber(headers["x-ai-fixture-delay"])
+    if delay_ms and delay_ms > 0 then
+        if delay_ms > 5000 then
+            delay_ms = 5000
+        end
+        ngx.sleep(delay_ms / 1000)
+    end
 
     local status = tonumber(headers["x-ai-fixture-status"])
     if status then

@@ -503,3 +503,153 @@ GET /apisix/prometheus/metrics
 qr/apisix_llm_prompt_tokens\{.*request_llm_model="",llm_model=""\}/
 --- response_body_unlike eval
 qr/apisix_llm_prompt_tokens\{.*request_llm_model="distinct-model-/
+
+
+
+=== TEST 27: create routes for llm_latency error-path exclusion
+--- config
+    location /t {
+        content_by_lua_block {
+            local data = {
+                {
+                    url = "/apisix/admin/routes/5",
+                    data = [[{
+                        "plugins": {
+                            "prometheus": {},
+                            "ai-proxy-multi": {
+                                "instances": [
+                                    {
+                                        "name": "openai-gpt4",
+                                        "provider": "openai",
+                                        "weight": 1,
+                                        "auth": {
+                                            "header": {
+                                                "Authorization": "Bearer token"
+                                            }
+                                        },
+                                        "options": {
+                                            "model": "gpt-4"
+                                        },
+                                        "override": {
+                                            "endpoint": "http://127.0.0.1:1980"
+                                        }
+                                    }
+                                ]
+                            }
+                        },
+                        "uri": "/chat-lat"
+                    }]],
+                },
+                {
+                    url = "/apisix/admin/routes/6",
+                    data = [[{
+                        "plugins": {
+                            "prometheus": {},
+                            "ai-proxy-multi": {
+                                "timeout": 1000,
+                                "instances": [
+                                    {
+                                        "name": "openai-down",
+                                        "provider": "openai",
+                                        "weight": 1,
+                                        "auth": {
+                                            "header": {
+                                                "Authorization": "Bearer token"
+                                            }
+                                        },
+                                        "options": {
+                                            "model": "gpt-4"
+                                        },
+                                        "override": {
+                                            "endpoint": "http://127.0.0.1:1979"
+                                        }
+                                    }
+                                ]
+                            }
+                        },
+                        "uri": "/chat-down"
+                    }]],
+                },
+            }
+            local t = require("lib.test_admin").test
+            for _, data in ipairs(data) do
+                local _, body = t(data.url, ngx.HTTP_PUT, data.data)
+                ngx.say(body)
+            end
+        }
+    }
+--- response_body eval
+"passed\n" x 2
+
+
+
+=== TEST 28: served 200 is observed on llm_latency
+--- request
+POST /chat-lat
+{"messages":[{"role":"user","content":"What is 1+1?"}], "model": "gpt-3"}
+--- more_headers
+X-AI-Fixture: prometheus/chat-basic.json
+--- error_code: 200
+
+
+
+=== TEST 29: llm_latency count is 1 after the successful request
+--- request
+GET /apisix/prometheus/metrics
+--- response_body eval
+qr/apisix_llm_latency_count\{.*route_id="5",.*,node="openai-gpt4".*request_type="ai_chat".*\} 1/
+
+
+
+=== TEST 30: upstream 429 is not observed on llm_latency
+--- request
+POST /chat-lat
+{"messages":[{"role":"user","content":"What is 1+1?"}], "model": "gpt-3"}
+--- more_headers
+X-AI-Fixture: prometheus/chat-basic.json
+X-AI-Fixture-Status: 429
+--- error_code: 429
+
+
+
+=== TEST 31: llm_latency count still 1 after 429
+--- request
+GET /apisix/prometheus/metrics
+--- response_body eval
+qr/apisix_llm_latency_count\{.*route_id="5",.*,node="openai-gpt4".*request_type="ai_chat".*\} 1/
+
+
+
+=== TEST 32: upstream 500 is not observed on llm_latency
+--- request
+POST /chat-lat
+{"messages":[{"role":"user","content":"What is 1+1?"}], "model": "gpt-3"}
+--- more_headers
+X-AI-Fixture: prometheus/chat-basic.json
+X-AI-Fixture-Status: 500
+--- error_code: 500
+
+
+
+=== TEST 33: llm_latency count still 1 after 500
+--- request
+GET /apisix/prometheus/metrics
+--- response_body eval
+qr/apisix_llm_latency_count\{.*route_id="5",.*,node="openai-gpt4".*request_type="ai_chat".*\} 1/
+
+
+
+=== TEST 34: unreachable upstream is not observed on llm_latency
+--- request
+POST /chat-down
+{"messages":[{"role":"user","content":"What is 1+1?"}], "model": "gpt-3"}
+--- error_code: 500
+--- ignore_error_log
+
+
+
+=== TEST 35: no llm_latency series for the unreachable route
+--- request
+GET /apisix/prometheus/metrics
+--- response_body_unlike eval
+qr/apisix_llm_latency_count\{.*route_id="6"/
