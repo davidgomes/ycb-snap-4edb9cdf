@@ -1,0 +1,84 @@
+# See the documentation for more information:
+# https://packit.dev/docs/configuration/
+
+# name in upstream package repository or registry (e.g. in PyPI)
+upstream_package_name: cri-o
+upstream_tag_template: v{version}
+# downstream (Fedora) RPM package name
+downstream_package_name: cri-o
+
+packages:
+  fedora-rawhide:
+    specfile_path: .packit_rpm/cri-o.spec
+    files_to_sync:
+      - .packit.yaml
+      - src: .packit_rpm/cri-o.spec
+        dest: cri-o.spec
+    actions:
+      get-current-version: "bash -ec 'grep \"^const Version\" internal/version/version.go | cut -d\\\" -f2'"
+      post-upstream-clone:
+        # Use the Fedora Rawhide specfile
+        - git clone https://src.fedoraproject.org/rpms/cri-o .packit_rpm --depth=1
+        # Drop the "sources" file
+        - rm -fv .packit_rpm/sources
+        # Update %global commit0 <sha> in specfile
+        - sed -i "s/^%global commit0.*/%global commit0 $(git rev-parse HEAD)/" .packit_rpm/cri-o.spec
+        # Remove downstream patches (if any)
+        - sed -ri "/^Patch[0-9].*/d" .packit_rpm/cri-o.spec
+  fedora-40:
+    # Propose minor and patch releases downstream
+    version_update_mask: '\d+\.\d+\.'
+    specfile_path: .packit_rpm/cri-o.spec
+    files_to_sync:
+      - .packit.yaml
+      - src: .packit_rpm/cri-o.spec
+        dest: cri-o.spec
+    actions:
+      post-upstream-clone:
+        # Use the Fedora 40 specfile
+        - "git clone https://src.fedoraproject.org/rpms/cri-o .packit_rpm --branch=f40 --depth=1"
+        # Drop the "sources" file so rebase-helper doesn't think we're a dist-git
+        - "rm -fv .packit_rpm/sources"
+        # Update %global commit0 <sha> in specfile
+        - 'sed -i "s/^%global commit0.*/%global commit0 $(git rev-parse HEAD)/" .packit_rpm/cri-o.spec'
+
+jobs:
+  - job: copr_build
+    trigger: pull_request
+    branch: main
+    targets:
+      - centos-stream-9-aarch64
+      - centos-stream-9-x86_64
+      - fedora-development-aarch64
+      - fedora-development-x86_64
+      - fedora-latest-stable-aarch64
+      - fedora-latest-stable-x86_64
+    packages:
+      - fedora-rawhide
+
+  - job: propose_downstream
+    trigger: release
+    dist_git_branches:
+      - rawhide
+    packages:
+      - fedora-rawhide
+
+  - job: propose_downstream
+    trigger: release
+    dist_git_branches:
+      - f40
+    packages:
+      - fedora-40
+
+  # downstream automation:
+  - job: koji_build
+    trigger: commit
+    allowed_pr_authors: ["packit-stg", "packit", "haircommander", "lorbus"]
+    dist_git_branches:
+      - fedora-all
+
+  - job: bodhi_update
+    trigger: commit
+    allowed_pr_authors: ["packit-stg", "packit", "haircommander", "lorbus"]
+    dist_git_branches:
+      - fedora-branched
