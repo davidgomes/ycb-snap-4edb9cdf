@@ -772,6 +772,14 @@ type Cfg struct {
 	// aggregating facets on the post-filter path. Zero falls back to the
 	// default in search.PostRankAuthzConfig.effective().
 	SearchPostRankAuthzFacetSampleSize int
+	// UnifiedStorageAuthzExemptionEnabled inverts limited-authz: every
+	// group/resource is enforced except UnifiedStorageAuthzExemptResources.
+	// When false (default), only the hardcoded allowlist and *.ext.grafana.app
+	// groups are enforced.
+	UnifiedStorageAuthzExemptionEnabled bool
+	// UnifiedStorageAuthzExemptResources is exact "group/resource" pairs skipped
+	// when UnifiedStorageAuthzExemptionEnabled is true.
+	UnifiedStorageAuthzExemptResources []string
 
 	// Vector storage
 	EnableVectorBackend bool

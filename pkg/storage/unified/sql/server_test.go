@@ -3,9 +3,12 @@ package sql
 import (
 	"testing"
 
+	claims "github.com/grafana/authlib/types"
+	"github.com/stretchr/testify/require"
+
 	"github.com/grafana/grafana/pkg/services/sqlstore/migrator"
 	"github.com/grafana/grafana/pkg/setting"
-	"github.com/stretchr/testify/require"
+	"github.com/grafana/grafana/pkg/storage/unified/resource"
 )
 
 func TestIsHighAvailabilityEnabled(t *testing.T) {
@@ -139,4 +142,61 @@ func TestIsHighAvailabilityEnabled(t *testing.T) {
 			require.Equal(t, tt.isHA, result)
 		})
 	}
+}
+
+func TestWithAccessClient(t *testing.T) {
+	t.Run("nil access client is a no-op", func(t *testing.T) {
+		resourceOpts := &resource.ResourceServerOptions{}
+		require.NoError(t, withAccessClient(&ServerOptions{}, resourceOpts))
+		require.Nil(t, resourceOpts.AccessClient)
+	})
+
+	t.Run("default config constructs limited client", func(t *testing.T) {
+		resourceOpts := &resource.ResourceServerOptions{}
+		err := withAccessClient(&ServerOptions{
+			AccessClient: claims.FixedAccessClient(true),
+			Cfg:          setting.NewCfg(),
+		}, resourceOpts)
+		require.NoError(t, err)
+		require.NotNil(t, resourceOpts.AccessClient)
+	})
+
+	t.Run("invalid exemptions fail setup", func(t *testing.T) {
+		cfg := setting.NewCfg()
+		cfg.UnifiedStorageAuthzExemptionEnabled = true
+		cfg.UnifiedStorageAuthzExemptResources = []string{"not-a-valid-entry"}
+		resourceOpts := &resource.ResourceServerOptions{}
+		err := withAccessClient(&ServerOptions{
+			AccessClient: claims.FixedAccessClient(true),
+			Cfg:          cfg,
+		}, resourceOpts)
+		require.Error(t, err)
+		require.Nil(t, resourceOpts.AccessClient)
+	})
+
+	t.Run("always-enforced exemption fails setup", func(t *testing.T) {
+		cfg := setting.NewCfg()
+		cfg.UnifiedStorageAuthzExemptionEnabled = true
+		cfg.UnifiedStorageAuthzExemptResources = []string{"dashboard.grafana.app/dashboards"}
+		resourceOpts := &resource.ResourceServerOptions{}
+		err := withAccessClient(&ServerOptions{
+			AccessClient: claims.FixedAccessClient(true),
+			Cfg:          cfg,
+		}, resourceOpts)
+		require.Error(t, err)
+		require.Nil(t, resourceOpts.AccessClient)
+	})
+
+	t.Run("valid exemptions construct limited client", func(t *testing.T) {
+		cfg := setting.NewCfg()
+		cfg.UnifiedStorageAuthzExemptionEnabled = true
+		cfg.UnifiedStorageAuthzExemptResources = []string{"playlist.grafana.app/playlists"}
+		resourceOpts := &resource.ResourceServerOptions{}
+		err := withAccessClient(&ServerOptions{
+			AccessClient: claims.FixedAccessClient(true),
+			Cfg:          cfg,
+		}, resourceOpts)
+		require.NoError(t, err)
+		require.NotNil(t, resourceOpts.AccessClient)
+	})
 }

@@ -146,6 +146,46 @@ func TestCfg_setUnifiedStorageConfig(t *testing.T) {
 		})
 	})
 
+	t.Run("authz exemption settings", func(t *testing.T) {
+		setSectionKey := func(cfg *Cfg, key, value string) {
+			section := cfg.Raw.Section("unified_storage")
+			_, err := section.NewKey(key, value)
+			assert.NoError(t, err)
+		}
+
+		t.Run("defaults to disabled with empty exemptions", func(t *testing.T) {
+			cfg := NewCfg()
+			err := cfg.Load(CommandLineArgs{HomePath: "../../", Config: "../../conf/defaults.ini"})
+			assert.NoError(t, err)
+			cfg.setUnifiedStorageConfig()
+			assert.False(t, cfg.UnifiedStorageAuthzExemptionEnabled)
+			assert.Empty(t, cfg.UnifiedStorageAuthzExemptResources)
+		})
+
+		t.Run("reads configured values", func(t *testing.T) {
+			cfg := NewCfg()
+			err := cfg.Load(CommandLineArgs{HomePath: "../../", Config: "../../conf/defaults.ini"})
+			assert.NoError(t, err)
+			setSectionKey(cfg, "authz_exemption_enabled", "true")
+			setSectionKey(cfg, "authz_exempt_resources", "playlist.grafana.app/playlists, shorturl.grafana.app/shorturls")
+			cfg.setUnifiedStorageConfig()
+			assert.True(t, cfg.UnifiedStorageAuthzExemptionEnabled)
+			assert.Equal(t, []string{"playlist.grafana.app/playlists", "shorturl.grafana.app/shorturls"}, cfg.UnifiedStorageAuthzExemptResources)
+		})
+
+		t.Run("env vars override authz exemption settings", func(t *testing.T) {
+			t.Setenv("GF_UNIFIED_STORAGE_AUTHZ_EXEMPTION_ENABLED", "true")
+			t.Setenv("GF_UNIFIED_STORAGE_AUTHZ_EXEMPT_RESOURCES", "playlist.grafana.app/playlists,shorturl.grafana.app/shorturls")
+
+			cfg := NewCfg()
+			err := cfg.Load(CommandLineArgs{HomePath: "../../", Config: "../../conf/defaults.ini"})
+			assert.NoError(t, err)
+			cfg.setUnifiedStorageConfig()
+			assert.True(t, cfg.UnifiedStorageAuthzExemptionEnabled)
+			assert.Equal(t, []string{"playlist.grafana.app/playlists", "shorturl.grafana.app/shorturls"}, cfg.UnifiedStorageAuthzExemptResources)
+		})
+	})
+
 	t.Run("search_post_rank_authz", func(t *testing.T) {
 		setSectionKey := func(cfg *Cfg, key, value string) {
 			section := cfg.Raw.Section("unified_storage")

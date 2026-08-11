@@ -20,9 +20,18 @@ import (
 type groupResource map[string]map[string]interface{}
 
 const (
-	metricsNamespace = "grafana"
-	metricsSubSystem = "grpc_authz_limited_client"
+	metricsNamespace    = "grafana"
+	metricsSubSystem    = "grpc_authz_limited_client"
+	extGrafanaAppSuffix = ".ext.grafana.app"
 )
+
+// rbacAllowlist is the hardcoded set of group/resource pairs that always go
+// through RBAC. These cannot be configured as exemptions.
+var rbacAllowlist = groupResource{
+	"dashboard.grafana.app": {"dashboards": nil},
+	"folder.grafana.app":    {"folders": nil},
+	"iam.grafana.app":       {"users": nil, "teams": nil, "serviceaccounts": nil},
+}
 
 var metOnce sync.Once
 
@@ -81,16 +90,85 @@ func newMetrics(reg prometheus.Registerer) *accessMetrics {
 // This is a temporary solution until the authz service is fully implemented.
 // The authz service will be responsible for enforcing RBAC.
 // For now, it makes one call to the authz service for each list items. This is known to be inefficient.
+//
+// When exemptionEnabled is false (default), only allowlist resources and
+// *.ext.grafana.app groups are enforced. When true, every group/resource is
+// enforced except exact exemptions; allowlist and *.ext.grafana.app stay enforced.
 type authzLimitedClient struct {
-	client claims.AccessClient
-	// allowlist is a map of group to resources that are compatible with RBAC.
-	allowlist groupResource
-	logger    log.Logger
-	metrics   *accessMetrics
+	client           claims.AccessClient
+	exemptionEnabled bool
+	exemptions       groupResource
+	logger           log.Logger
+	metrics          *accessMetrics
 }
 
 type AuthzOptions struct {
-	Registry prometheus.Registerer
+	Registry         prometheus.Registerer
+	ExemptionEnabled bool
+	ExemptResources  []string
+}
+
+// ValidateAuthzOptions checks exemption entries. Malformed values and attempts
+// to exempt always-enforced resources fail here so server init can refuse to
+// start instead of running with a bad list. Call this before NewAuthzLimitedClient.
+func ValidateAuthzOptions(opts AuthzOptions) error {
+	for _, entry := range opts.ExemptResources {
+		group, resource, err := parseGroupResource(entry)
+		if err != nil {
+			return err
+		}
+		if isAlwaysEnforced(group, resource) {
+			return fmt.Errorf("authz exemption %q is always enforced and cannot be exempted", strings.TrimSpace(entry))
+		}
+	}
+	return nil
+}
+
+func parseGroupResource(entry string) (group, resource string, err error) {
+	entry = strings.TrimSpace(entry)
+	if entry == "" {
+		return "", "", fmt.Errorf("authz exemption must not be empty")
+	}
+	if strings.Contains(entry, "*") {
+		return "", "", fmt.Errorf("authz exemption %q must not contain wildcards", entry)
+	}
+	group, resource, ok := strings.Cut(entry, "/")
+	if !ok || strings.Contains(resource, "/") {
+		return "", "", fmt.Errorf("authz exemption %q must be exactly group/resource", entry)
+	}
+	group = strings.TrimSpace(group)
+	resource = strings.TrimSpace(resource)
+	if group == "" || resource == "" {
+		return "", "", fmt.Errorf("authz exemption %q has empty group or resource", entry)
+	}
+	return group, resource, nil
+}
+
+func isAlwaysEnforced(group, resource string) bool {
+	if strings.HasSuffix(group, extGrafanaAppSuffix) {
+		return true
+	}
+	if resources, ok := rbacAllowlist[group]; ok {
+		if _, ok := resources[resource]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func parseExemptResources(entries []string) groupResource {
+	out := make(groupResource, len(entries))
+	for _, entry := range entries {
+		group, resource, err := parseGroupResource(entry)
+		if err != nil || isAlwaysEnforced(group, resource) {
+			continue
+		}
+		if _, ok := out[group]; !ok {
+			out[group] = map[string]interface{}{}
+		}
+		out[group][resource] = nil
+	}
+	return out
 }
 
 // NewAuthzLimitedClient creates a new authzLimitedClient.
@@ -99,16 +177,16 @@ func NewAuthzLimitedClient(client claims.AccessClient, opts AuthzOptions) claims
 	if opts.Registry == nil {
 		opts.Registry = prometheus.DefaultRegisterer
 	}
-	return &authzLimitedClient{
-		client: client,
-		allowlist: groupResource{
-			"dashboard.grafana.app": map[string]interface{}{"dashboards": nil},
-			"folder.grafana.app":    map[string]interface{}{"folders": nil},
-			"iam.grafana.app":       map[string]interface{}{"users": nil, "teams": nil, "serviceaccounts": nil},
-		},
-		logger:  logger,
-		metrics: newMetrics(opts.Registry),
+	c := &authzLimitedClient{
+		client:           client,
+		exemptionEnabled: opts.ExemptionEnabled,
+		logger:           logger,
+		metrics:          newMetrics(opts.Registry),
 	}
+	if opts.ExemptionEnabled {
+		c.exemptions = parseExemptResources(opts.ExemptResources)
+	}
+	return c
 }
 
 // Check implements claims.AccessClient.
@@ -185,20 +263,22 @@ func (c authzLimitedClient) Compile(ctx context.Context, id claims.AuthInfo, req
 }
 
 func (c authzLimitedClient) IsCompatibleWithRBAC(group, resource string) bool {
-	// When the allow list is disabled, *.ext.grafana.app groups are additionally
-	// forwarded to the underlying authz client so the new dual-check path runs
-	// for K8s-native CRDs. This mirrors narrowing in
+	// Allowlist resources and *.ext.grafana.app groups are always forwarded to
+	// the underlying authz client. This mirrors narrowing in
 	// rbac.Service.checkPermission and keeps folder/dashboard/iam flow on the
-	// existing allow-list path.
-	if strings.HasSuffix(group, ".ext.grafana.app") {
+	// existing allow-list path. They cannot be exempted.
+	if isAlwaysEnforced(group, resource) {
 		return true
 	}
-	if _, ok := c.allowlist[group]; ok {
-		if _, ok := c.allowlist[group][resource]; ok {
-			return true
+	if !c.exemptionEnabled {
+		return false
+	}
+	if resources, ok := c.exemptions[group]; ok {
+		if _, ok := resources[resource]; ok {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 func (c authzLimitedClient) BatchCheck(ctx context.Context, id claims.AuthInfo, req claims.BatchCheckRequest) (claims.BatchCheckResponse, error) {

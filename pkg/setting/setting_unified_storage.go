@@ -186,6 +186,8 @@ func (cfg *Cfg) setUnifiedStorageConfig() {
 	cfg.SearchPostRankAuthzMaxWindow = section.Key("search_post_rank_authz_max_window").MustInt(0)
 	cfg.SearchPostRankAuthzMaxCandidates = section.Key("search_post_rank_authz_max_candidates").MustInt(0)
 	cfg.SearchPostRankAuthzFacetSampleSize = section.Key("search_post_rank_authz_facet_sample_size").MustInt(0)
+	cfg.UnifiedStorageAuthzExemptionEnabled = section.Key("authz_exemption_enabled").MustBool(false)
+	cfg.UnifiedStorageAuthzExemptResources = parseCommaSeparatedList(section.Key("authz_exempt_resources").MustString(""))
 	cfg.EnableVectorBackend = section.Key("vector_backend").MustBool(false)
 	cfg.VectorAllowedInternalCollections = section.Key("vector_allowed_internal_collections").Strings(",")
 	if len(cfg.VectorAllowedInternalCollections) == 0 {
