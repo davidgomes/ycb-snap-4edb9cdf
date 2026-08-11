@@ -1142,7 +1142,7 @@ func (r *TaskGeneratorImpl) RegenerateTimerTasksForTimeSkipping() error {
 	// Do not require ScheduledTime to still be in the future: after a skip lands on
 	// the next-attempt time, virtual now may already equal ScheduledTime.
 	for _, ai := range r.mutableState.GetPendingActivityInfos() {
-		if !activityInRetryBackoff(ai) || ai.GetScheduledTime().AsTime().IsZero() {
+		if !activityInRetryBackoff(ai) || ai.GetScheduledTime() == nil {
 			continue
 		}
 		if err := r.GenerateActivityRetryTasks(ai); err != nil {

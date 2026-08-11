@@ -75,11 +75,10 @@ func activityInRetryBackoff(ai *persistencespb.ActivityInfo) bool {
 // backoff and the next attempt is still in the future. Used by the idle check
 // (such activities do not block time skipping) and as skip-target candidates.
 func activityWaitingOnFutureRetryBackoff(ai *persistencespb.ActivityInfo, now time.Time) bool {
-	if !activityInRetryBackoff(ai) {
+	if !activityInRetryBackoff(ai) || ai.GetScheduledTime() == nil {
 		return false
 	}
-	nextAttempt := ai.GetScheduledTime().AsTime()
-	return !nextAttempt.IsZero() && nextAttempt.After(now)
+	return ai.GetScheduledTime().AsTime().After(now)
 }
 
 // ClearActivityStartedState resets the per-attempt "started" fields on an ActivityInfo.
