@@ -1,0 +1,187 @@
+//                           _       _
+// __      _____  __ ___   ___  __ _| |_ ___
+// \ \ /\ / / _ \/ _` \ \ / / |/ _` | __/ _ \
+//  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
+//   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
+//
+//  Copyright © 2016 - 2026 Weaviate B.V. All rights reserved.
+//
+//  CONTACT: hello@weaviate.io
+//
+
+package backup
+
+import (
+	"context"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/weaviate/weaviate/entities/backup"
+)
+
+type fakeSchemaManger struct {
+	errRestoreClass error
+	nodeName        string
+	// Track NodeMapping passed to RestoreClass for testing
+	lastNodeMapping map[string]string
+}
+
+func (f *fakeSchemaManger) RestoreClass(ctx context.Context, desc *backup.ClassDescriptor, nodeMapping map[string]string, overwriteAlias bool) error {
+	f.lastNodeMapping = nodeMapping
+	return f.errRestoreClass
+}
+
+func (f *fakeSchemaManger) NodeName() string {
+	return f.nodeName
+}
+
+func TestFilterClasses(t *testing.T) {
+	tests := []struct {
+		in  []string
+		xs  []string
+		out []string
+	}{
+		{in: []string{}, xs: []string{}, out: []string{}},
+		{in: []string{"a"}, xs: []string{}, out: []string{"a"}},
+		{in: []string{"a"}, xs: []string{"a"}, out: []string{}},
+		{in: []string{"1", "2", "3", "4"}, xs: []string{"2", "3"}, out: []string{"1", "4"}},
+		{in: []string{"1", "2", "3"}, xs: []string{"1", "3"}, out: []string{"2"}},
+		{in: []string{"1", "2", "1", "3", "1", "3"}, xs: []string{"2"}, out: []string{"1", "3"}},
+	}
+	for _, tc := range tests {
+		got := filterClasses(tc.in, tc.xs)
+		assert.ElementsMatch(t, tc.out, got)
+	}
+}
+
+func TestServerVersionOlderThan(t *testing.T) {
+	tests := []struct {
+		serverVersion string
+		want          bool
+	}{
+		{serverVersion: "1.9", want: true},
+		{serverVersion: "1.100", want: false},
+		{serverVersion: "1.22.3", want: true},
+		{serverVersion: "1.23", want: false},
+		{serverVersion: "1.23.0", want: false},
+		{serverVersion: "1.16", want: true},
+		{serverVersion: "2.0", want: false},
+		{serverVersion: "0.9", want: true},
+		{serverVersion: "", want: false},
+		{serverVersion: "garbage", want: false},
+		{serverVersion: "1", want: false},
+		{serverVersion: "1.x", want: false},
+		{serverVersion: "v1.22", want: false},
+	}
+	for _, tc := range tests {
+		t.Run(fmt.Sprintf("%q", tc.serverVersion), func(t *testing.T) {
+			assert.Equal(t, tc.want, serverVersionOlderThan(tc.serverVersion, 1, 23))
+		})
+	}
+}
+
+func TestCheckRestorableVersion(t *testing.T) {
+	const current = "1.23"
+	tests := []struct {
+		version       string
+		serverVersion string
+		wantErr       error
+		wantMsg       string
+	}{
+		{version: "1.0", serverVersion: current, wantErr: errLegacyUncompressed},
+		{version: "1", serverVersion: current, wantErr: errLegacyUncompressed},
+		{version: "0.9", serverVersion: current, wantErr: errLegacyUncompressed},
+		{version: "2.0", serverVersion: current},
+		{version: "2.1", serverVersion: current},
+		{version: "2.9", serverVersion: current},
+		{version: "3.0", serverVersion: current, wantMsg: errMsgHigherVersion},
+		// A structure version may omit the minor; the major still decides.
+		{version: "3", serverVersion: current, wantMsg: errMsgHigherVersion},
+		{version: "10", serverVersion: current, wantMsg: errMsgHigherVersion},
+		// A byte compare read this as older than "2.1" and wrongly accepted it.
+		{version: "10.0", serverVersion: current, wantMsg: errMsgHigherVersion},
+		// A corrupt descriptor is reported by Validate, not refused as an old format.
+		{version: "", serverVersion: current},
+		// The version this build writes must stay restorable by it.
+		{version: Version, serverVersion: current},
+
+		{version: Version, serverVersion: "1.22", wantErr: errLegacyFlatFS},
+		{version: Version, serverVersion: "1.16", wantErr: errLegacyFlatFS},
+		// A lexical compare read "1.100" as older than "1.23" and would have refused it.
+		{version: Version, serverVersion: "1.100"},
+		{version: Version, serverVersion: "2.0"},
+		// An unreadable server version is never classified as an old format.
+		{version: Version, serverVersion: ""},
+		{version: Version, serverVersion: "garbage"},
+		// Both clauses match; the format the version names is reported first.
+		{version: "1.0", serverVersion: "1.16", wantErr: errLegacyUncompressed},
+	}
+	for _, tc := range tests {
+		t.Run(fmt.Sprintf("%q/%q", tc.version, tc.serverVersion), func(t *testing.T) {
+			err := checkRestorableVersion(tc.version, tc.serverVersion)
+			switch {
+			case tc.wantErr != nil:
+				require.ErrorIs(t, err, tc.wantErr)
+			case tc.wantMsg != "":
+				require.ErrorContains(t, err, tc.wantMsg)
+			default:
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestHandlerValidateCoordinationOperation(t *testing.T) {
+	var (
+		ctx = context.Background()
+		bm  = createManager(nil, nil, nil, nil)
+	)
+
+	{ // OnCanCommit
+		req := Request{
+			Method:   "Unknown",
+			ID:       "1",
+			Classes:  []string{"class1"},
+			Backend:  "s3",
+			Duration: time.Millisecond * 20,
+			Bucket:   "bucket",
+			Path:     "path",
+		}
+		resp := bm.OnCanCommit(ctx, &req)
+		assert.Contains(t, resp.Err, "unknown backup operation")
+		assert.Equal(t, resp.Timeout, time.Duration(0))
+	}
+
+	{ // OnCommit
+		req := StatusRequest{
+			Method:  "Unknown",
+			ID:      "1",
+			Backend: "s3",
+		}
+		err := bm.OnCommit(ctx, &req)
+		assert.NotNil(t, err)
+		assert.ErrorIs(t, err, errUnknownOp)
+	}
+
+	{ // OnAbort
+		req := AbortRequest{
+			Method: "Unknown",
+			ID:     "1",
+		}
+		err := bm.OnAbort(ctx, &req)
+		assert.NotNil(t, err)
+		assert.ErrorIs(t, err, errUnknownOp)
+	}
+	{ // OnStatus
+		req := StatusRequest{
+			Method: "Unknown",
+			ID:     "1",
+		}
+		ret := bm.OnStatus(ctx, &req)
+		assert.Contains(t, ret.Err, errUnknownOp.Error())
+	}
+}

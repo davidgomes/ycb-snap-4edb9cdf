@@ -1,0 +1,294 @@
+//                           _       _
+// __      _____  __ ___   ___  __ _| |_ ___
+// \ \ /\ / / _ \/ _` \ \ / / |/ _` | __/ _ \
+//  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
+//   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
+//
+//  Copyright © 2016 - 2026 Weaviate B.V. All rights reserved.
+//
+//  CONTACT: hello@weaviate.io
+//
+
+package lsmkv
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"time"
+
+	"github.com/weaviate/weaviate/entities/lsmkv"
+)
+
+type CursorMap struct {
+	innerCursors []innerCursorMap
+	state        []cursorStateMap
+	unlock       func()
+	listCfg      MapListOptionConfig
+	keyOnly      bool
+	// inner cursors whose advance was deferred from the previous return, applied
+	// on the next call so reusable cursors don't overwrite still-in-use data
+	pendingAdvanceIDs []int
+}
+
+type cursorStateMap struct {
+	key   []byte
+	value []MapPair
+	err   error
+}
+
+type innerCursorMap interface {
+	first() ([]byte, []MapPair, error)
+	next() ([]byte, []MapPair, error)
+	seek([]byte) ([]byte, []MapPair, error)
+}
+
+func (b *Bucket) MapCursor(cfgs ...MapListOption) (*CursorMap, error) {
+	if b.strategy != StrategyMapCollection && b.strategy != StrategyInverted {
+		return nil, fmt.Errorf("cannot create map cursor on bucket with strategy %s", b.strategy)
+	}
+	cursorOpenedAt := time.Now()
+	b.metrics.IncBucketOpenedCursorsByStrategy(b.strategy)
+	b.metrics.IncBucketOpenCursorsByStrategy(b.strategy)
+
+	b.flushLock.RLock()
+	defer b.flushLock.RUnlock()
+
+	c := MapListOptionConfig{}
+	for _, cfg := range cfgs {
+		cfg(&c)
+	}
+
+	innerCursors, unlockSegmentGroup := b.disk.newMapCursors()
+
+	// we hold a flush-lock during initialzation, but we release it before
+	// returning to the caller. However, `*memtable.newCursor` creates a deep
+	// copy of the entire content, so this cursor will remain valid even after we
+	// release the lock
+	if b.flushing != nil {
+		innerCursors = append(innerCursors, b.flushing.newMapCursor())
+	}
+
+	innerCursors = append(innerCursors, b.active.newMapCursor())
+
+	return &CursorMap{
+		unlock: func() {
+			unlockSegmentGroup()
+
+			b.metrics.DecBucketOpenCursorsByStrategy(b.strategy)
+			b.metrics.ObserveBucketCursorDurationByStrategy(b.strategy, time.Since(cursorOpenedAt))
+		},
+		// cursor are in order from oldest to newest, with the memtable cursor
+		// being at the very top
+		innerCursors: innerCursors,
+		listCfg:      c,
+	}, nil
+}
+
+func (b *Bucket) MapCursorKeyOnly(cfgs ...MapListOption) (*CursorMap, error) {
+	c, err := b.MapCursor(cfgs...)
+	if err != nil {
+		return nil, err
+	}
+	c.keyOnly = true
+	return c, nil
+}
+
+func (c *CursorMap) Seek(ctx context.Context, key []byte) ([]byte, []MapPair) {
+	// re-seeking repositions every inner cursor, so any deferred advance is moot
+	c.pendingAdvanceIDs = c.pendingAdvanceIDs[:0]
+	c.seekAll(key)
+	return c.serveCurrentStateAndAdvance(ctx)
+}
+
+func (c *CursorMap) Next(ctx context.Context) ([]byte, []MapPair) {
+	return c.serveCurrentStateAndAdvance(ctx)
+}
+
+func (c *CursorMap) First(ctx context.Context) ([]byte, []MapPair) {
+	c.pendingAdvanceIDs = c.pendingAdvanceIDs[:0]
+	c.firstAll()
+	return c.serveCurrentStateAndAdvance(ctx)
+}
+
+func (c *CursorMap) Close() {
+	c.unlock()
+}
+
+func (c *CursorMap) seekAll(target []byte) {
+	state := make([]cursorStateMap, len(c.innerCursors))
+	for i, cur := range c.innerCursors {
+		key, value, err := cur.seek(target)
+		if errors.Is(err, lsmkv.NotFound) {
+			state[i].err = err
+			continue
+		}
+
+		if err != nil {
+			panic(fmt.Errorf("unexpected error in seek: %w", err))
+		}
+
+		state[i].key = key
+		// capture the value even in keyOnly mode: serveCurrentStateAndAdvance
+		// merges the per-segment values to decide which keys survive, so dropping
+		// them here makes every key look empty. keyOnly only omits them from the
+		// returned tuple (see firstAll/advanceInner for the same reason).
+		state[i].value = value
+	}
+
+	c.state = state
+}
+
+func (c *CursorMap) firstAll() {
+	state := make([]cursorStateMap, len(c.innerCursors))
+	for i, cur := range c.innerCursors {
+		key, value, err := cur.first()
+		if errors.Is(err, lsmkv.NotFound) {
+			state[i].err = err
+			continue
+		}
+
+		if err != nil {
+			panic(fmt.Errorf("unexpected error in seek: %w", err))
+		}
+
+		state[i].key = key
+		state[i].value = value
+	}
+
+	c.state = state
+}
+
+func (c *CursorMap) serveCurrentStateAndAdvance(ctx context.Context) ([]byte, []MapPair) {
+	// Apply the advances deferred from the previous return. Inner cursors that
+	// reuse their Key/Value buffers (segmentCursorInvertedReusable) overwrite them
+	// on next(), so we advance only once the caller has consumed what we returned.
+	for _, id := range c.pendingAdvanceIDs {
+		c.advanceInner(id)
+	}
+	c.pendingAdvanceIDs = c.pendingAdvanceIDs[:0]
+
+	for {
+		id, err := c.cursorWithLowestKey()
+		if err != nil {
+			if errors.Is(err, lsmkv.NotFound) {
+				return nil, nil
+			}
+		}
+
+		ids, _ := c.haveDuplicatesInState(id)
+
+		// Copy the key: some inner cursors reuse one key buffer across iterations,
+		// so it would be overwritten once the cursor advances. The merged values
+		// are valid until the next call (deferred advance), which is the cursor's
+		// contract — callers must consume them before advancing.
+		src := c.state[ids[0]].key
+		key := make([]byte, len(src))
+		copy(key, src)
+
+		var perSegmentResults [][]MapPair
+		for _, id := range ids {
+			perSegmentResults = append(perSegmentResults, c.state[id].value)
+		}
+
+		if c.listCfg.legacyRequireManualSorting {
+			for i := range perSegmentResults {
+				sort.Slice(perSegmentResults[i], func(a, b int) bool {
+					return bytes.Compare(perSegmentResults[i][a].Key,
+						perSegmentResults[i][b].Key) == -1
+				})
+			}
+		}
+
+		merged, err := newSortedMapMerger().do(ctx, perSegmentResults)
+		if err != nil {
+			panic(fmt.Errorf("unexpected error decoding map values: %w", err))
+		}
+		if len(merged) == 0 {
+			// all values deleted: the data is discarded, so advance immediately
+			for _, id := range ids {
+				c.advanceInner(id)
+			}
+			continue
+		}
+
+		// Defer advancing until the next call so the caller can consume the
+		// returned key/values before the reusable buffers are overwritten.
+		c.pendingAdvanceIDs = append(c.pendingAdvanceIDs, ids...)
+
+		if !c.keyOnly {
+			return key, merged
+		}
+		return key, nil
+	}
+}
+
+func (c *CursorMap) cursorWithLowestKey() (int, error) {
+	err := lsmkv.NotFound
+	pos := -1
+	var lowest []byte
+
+	for i, res := range c.state {
+		if errors.Is(res.err, lsmkv.NotFound) {
+			continue
+		}
+
+		if lowest == nil || bytes.Compare(res.key, lowest) <= 0 {
+			pos = i
+			err = res.err
+			lowest = res.key
+		}
+	}
+
+	if err != nil {
+		return pos, err
+	}
+
+	return pos, nil
+}
+
+func (c *CursorMap) haveDuplicatesInState(idWithLowestKey int) ([]int, bool) {
+	key := c.state[idWithLowestKey].key
+
+	var idsFound []int
+
+	for i, cur := range c.state {
+		if i == idWithLowestKey {
+			idsFound = append(idsFound, i)
+			continue
+		}
+
+		if bytes.Equal(key, cur.key) {
+			idsFound = append(idsFound, i)
+		}
+	}
+
+	return idsFound, len(idsFound) > 1
+}
+
+func (c *CursorMap) advanceInner(id int) {
+	k, v, err := c.innerCursors[id].next()
+	if errors.Is(err, lsmkv.NotFound) {
+		c.state[id].err = err
+		c.state[id].key = nil
+		c.state[id].value = nil
+		return
+	}
+
+	if errors.Is(err, lsmkv.Deleted) {
+		c.state[id].err = err
+		c.state[id].key = k
+		c.state[id].value = nil
+		return
+	}
+
+	if err != nil {
+		panic(fmt.Errorf("unexpected error in advance: %w", err))
+	}
+
+	c.state[id].key = k
+	c.state[id].value = v
+	c.state[id].err = nil
+}

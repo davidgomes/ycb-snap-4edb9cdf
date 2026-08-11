@@ -1,0 +1,52 @@
+//                           _       _
+// __      _____  __ ___   ___  __ _| |_ ___
+// \ \ /\ / / _ \/ _` \ \ / / |/ _` | __/ _ \
+//  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
+//   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
+//
+//  Copyright © 2016 - 2026 Weaviate B.V. All rights reserved.
+//
+//  CONTACT: hello@weaviate.io
+//
+
+package telemetry
+
+import (
+	"context"
+
+	"github.com/stretchr/testify/mock"
+	"github.com/weaviate/weaviate/entities/models"
+)
+
+type fakeNodesStatusGetter struct {
+	mock.Mock
+}
+
+func (n *fakeNodesStatusGetter) LocalNodeStatus(ctx context.Context,
+	className, shardName, verbosity string,
+) (*models.NodeStatus, error) {
+	args := n.Called(ctx, className, shardName, verbosity)
+	var status *models.NodeStatus
+	if args.Get(0) != nil {
+		status = args.Get(0).(*models.NodeStatus)
+	}
+	// expectations that set only a status have no error to return
+	if len(args) > 1 {
+		return status, args.Error(1)
+	}
+	return status, nil
+}
+
+type fakeCloudInfoProvider struct {
+	mock.Mock
+}
+
+func (f *fakeCloudInfoProvider) getCloudInfo() *cloudInfo {
+	if len(f.ExpectedCalls) > 0 {
+		args := f.Called()
+		if args.Get(0) != nil {
+			return args.Get(0).(*cloudInfo)
+		}
+	}
+	return nil
+}
