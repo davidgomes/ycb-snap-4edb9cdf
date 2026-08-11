@@ -1,0 +1,111 @@
+# Flink End-to-End Tests
+
+This module contains tests that verify end-to-end behaviour of Flink. 
+
+The tests defined in `run-nightly-tests.sh` are run by the CI system on every pull request
+and push to master.
+
+
+## Running Tests
+You can run all tests by executing
+
+```
+$ FLINK_DIR=<flink dir> flink-end-to-end-tests/run-nightly-tests.sh
+```
+
+where \<flink dir\> is a Flink distribution directory, e.g. `build-target` after building Flink
+from source, or the directory of an unpacked release.
+
+You can also run tests individually via
+
+```
+$ FLINK_DIR=<flink dir> flink-end-to-end-tests/run-single-test.sh flink-end-to-end-tests/test-scripts/your_test.sh arg1 arg2
+```
+
+**NOTICE**: Please _DON'T_ run the scripts with explicit command like ```sh run-nightly-tests.sh``` since ```#!/usr/bin/env bash``` is specified as the header of the scripts to assure flexibility on different systems.
+
+**NOTICE**: We do not recommend executing the nightly test script on production or personal desktop systems, as tests contained there might modify the environment (leftover processes, modification of system files, request for root permissions via sudo, ...).
+
+### Kubernetes test
+
+Kubernetes test (test_kubernetes_embedded_job.sh) assumes a running minikube cluster.
+
+### Testing against S3
+
+A number of tests exercise Flink's S3 file systems. They use one of two mechanisms.
+
+Tests that source `common_s3.sh` run against a real S3 bucket and are silently skipped unless the
+following environment variables are set (`AWS_REGION` defaults to `us-east-1`):
+
+```
+export IT_CASE_S3_BUCKET=<bucket>
+export IT_CASE_S3_ACCESS_KEY=<access-key>
+export IT_CASE_S3_SECRET_KEY=<secret-key>
+```
+
+The tests requiring these credentials are:
+
+```
+$ FLINK_DIR=<flink dir> flink-end-to-end-tests/run-single-test.sh flink-end-to-end-tests/test-scripts/test_batch_wordcount.sh hadoop
+$ FLINK_DIR=<flink dir> flink-end-to-end-tests/run-single-test.sh flink-end-to-end-tests/test-scripts/test_batch_wordcount.sh hadoop_with_provider
+$ FLINK_DIR=<flink dir> flink-end-to-end-tests/run-single-test.sh flink-end-to-end-tests/test-scripts/test_batch_wordcount.sh presto
+```
+
+`test_kubernetes_materialized_table.sh` also reads these variables but additionally requires a
+running Kubernetes cluster.
+
+Tests that source `common_s3_seaweedfs.sh` instead start a local
+[SeaweedFS](https://github.com/seaweedfs/seaweedfs) S3 gateway in Docker. They need a running
+Docker daemon but no AWS credentials:
+
+```
+$ FLINK_DIR=<flink dir> flink-end-to-end-tests/run-single-test.sh skip flink-end-to-end-tests/test-scripts/test_file_sink.sh s3
+$ FLINK_DIR=<flink dir> flink-end-to-end-tests/run-single-test.sh flink-end-to-end-tests/test-scripts/test_batch_wordcount.sh hadoop_seaweedfs
+$ FLINK_DIR=<flink dir> flink-end-to-end-tests/run-single-test.sh flink-end-to-end-tests/test-scripts/test_batch_wordcount.sh presto_seaweedfs_read
+```
+
+
+## Writing Tests
+
+As of November 2020, Flink has two broad types of end-to-end tests: Bash-based end-to-end tests, located in the `test-scripts/` directory and Java-based end-to-end tests, such as the `PrometheusReporterEndToEndITCase`. The community recommends writing new tests as Java tests, as we are planning to deprecate the bash-based tests in the long run.
+
+
+### Examples
+Have a look at `test_batch_wordcount.sh` for a very basic test and
+`test_streaming_kafka010.sh` for a more involved example. Whenever possible, try
+to put new functionality in `common.sh` so that it can be reused by other tests.
+
+### Adding a test case
+In order to add a new test case you need add it to `test-scripts/run-nightly-tests.sh`. Templates on how to add tests can be found in those respective files.
+
+_Note: If you want to parameterize your tests please do so by adding multiple test cases with parameters as arguments to the nightly / pre-commit test suites. This allows the test runner to do a cleanup in between each individual test and also to fail those tests individually._
+
+_Note: While developing a new test case make sure to enable bash's error handling in `test-scripts/common.sh` by uncommenting `set -Eexuo pipefail` and commenting the current default `set` call. Once your test is implemented properly, add `set -Eeuo pipefail` on the very top of your test script (before any `common` script)._
+
+### Passing your test
+A test is considered to have passed if it:
+- has exit code 0
+- there are no non-empty .out files (nothing was written to stdout / stderr by your Flink program)
+- there are no exceptions in the log files
+- there are no errors in the log files
+
+_Note: There is a whitelist for exceptions and errors that do not lead to failure, which can be found in the `check_logs_for_errors` and `check_logs_for_exceptions` in `test-scripts/common.sh`._
+
+Please note that a previously supported pattern where you could assign a value the global variable `PASS` to have your tests fail **is not supported anymore**.
+
+### Cleanup
+The test runner performs a cleanup after each test case, which includes:
+- Stopping the cluster
+- Killing all task and job managers
+- Reverting `conf` and `lib` dirs to default
+- Cleaning up log and temp directories
+
+In some cases your test is required to do some *additional* cleanup, for example shutting down external systems like Kafka or Elasticsearch. In this case you can register a function that will be called on test exit like this:
+
+```sh
+function test_cleanup {
+    # do your custom cleanup here
+}
+
+on_exit test_cleanup
+```
