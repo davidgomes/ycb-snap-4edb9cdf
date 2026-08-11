@@ -1,0 +1,53 @@
+---
+source: influxdb3_cache/src/last_cache/mod.rs
+expression: caches
+snapshot_kind: text
+---
+[
+  {
+    "table_id": 0,
+    "table": "test_table_1",
+    "name": "test_cache_1",
+    "key_columns": [
+      0,
+      1
+    ],
+    "value_columns": "all_non_key_columns",
+    "count": 1,
+    "ttl": 600
+  },
+  {
+    "table_id": 1,
+    "table": "test_table_2",
+    "name": "test_cache_2",
+    "key_columns": [
+      6
+    ],
+    "value_columns": {
+      "explicit": {
+        "columns": [
+          8,
+          7
+        ]
+      }
+    },
+    "count": 5,
+    "ttl": 60
+  },
+  {
+    "table_id": 1,
+    "table": "test_table_2",
+    "name": "test_cache_3",
+    "key_columns": [],
+    "value_columns": {
+      "explicit": {
+        "columns": [
+          9,
+          7
+        ]
+      }
+    },
+    "count": 10,
+    "ttl": 500
+  }
+]

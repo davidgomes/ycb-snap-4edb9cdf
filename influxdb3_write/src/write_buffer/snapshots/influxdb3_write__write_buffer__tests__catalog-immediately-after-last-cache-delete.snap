@@ -1,0 +1,93 @@
+---
+source: influxdb3_write/src/write_buffer/mod.rs
+expression: catalog_json
+snapshot_kind: text
+---
+{
+  "databases": [
+    [
+      0,
+      {
+        "deleted": false,
+        "id": 0,
+        "name": "db",
+        "processing_engine_plugins": [],
+        "processing_engine_triggers": [],
+        "tables": [
+          [
+            0,
+            {
+              "cols": [
+                [
+                  1,
+                  {
+                    "id": 1,
+                    "influx_type": "field",
+                    "name": "f1",
+                    "nullable": true,
+                    "type": "bool"
+                  }
+                ],
+                [
+                  3,
+                  {
+                    "id": 3,
+                    "influx_type": "field",
+                    "name": "f2",
+                    "nullable": true,
+                    "type": "i64"
+                  }
+                ],
+                [
+                  0,
+                  {
+                    "id": 0,
+                    "influx_type": "tag",
+                    "name": "t1",
+                    "nullable": false,
+                    "type": {
+                      "dict": [
+                        "i32",
+                        "str"
+                      ]
+                    }
+                  }
+                ],
+                [
+                  2,
+                  {
+                    "id": 2,
+                    "influx_type": "time",
+                    "name": "time",
+                    "nullable": false,
+                    "type": {
+                      "time": [
+                        "ns",
+                        null
+                      ]
+                    }
+                  }
+                ]
+              ],
+              "deleted": false,
+              "key": [
+                0
+              ],
+              "table_id": 0,
+              "table_name": "table"
+            }
+          ]
+        ]
+      }
+    ]
+  ],
+  "db_map": [
+    {
+      "db_id": 0,
+      "name": "db"
+    }
+  ],
+  "host_id": "test_host",
+  "instance_id": "[uuid]",
+  "sequence": 4
+}
