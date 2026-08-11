@@ -27,6 +27,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/volume"
 	volumeutil "k8s.io/kubernetes/pkg/volume/util"
 )
@@ -208,7 +210,7 @@ func (b *configMapVolumeMounter) SetUpAt(dir string, mounterArgs volume.MounterA
 		len(configMap.Data)+len(configMap.BinaryData),
 		totalBytes)
 
-	payload, err := MakePayload(b.source.Items, configMap, b.source.DefaultMode, optional)
+	payload, err := MakePayload(b.source.Items, configMap, b.source.DefaultMode, b.source.DefaultUser, optional)
 	if err != nil {
 		return err
 	}
@@ -260,7 +262,7 @@ func (b *configMapVolumeMounter) SetUpAt(dir string, mounterArgs volume.MounterA
 }
 
 // MakePayload function is exported so that it can be called from the projection volume driver
-func MakePayload(mappings []v1.KeyToPath, configMap *v1.ConfigMap, defaultMode *int32, optional bool) (map[string]volumeutil.FileProjection, error) {
+func MakePayload(mappings []v1.KeyToPath, configMap *v1.ConfigMap, defaultMode *int32, defaultUser *int64, optional bool) (map[string]volumeutil.FileProjection, error) {
 	if defaultMode == nil {
 		return nil, fmt.Errorf("no defaultMode used, not even the default value for it")
 	}
@@ -269,14 +271,17 @@ func MakePayload(mappings []v1.KeyToPath, configMap *v1.ConfigMap, defaultMode *
 	var fileProjection volumeutil.FileProjection
 
 	if len(mappings) == 0 {
+		fsUser := fsUserForProjection(nil, defaultUser)
 		for name, data := range configMap.Data {
 			fileProjection.Data = []byte(data)
 			fileProjection.Mode = *defaultMode
+			fileProjection.FsUser = fsUser
 			payload[name] = fileProjection
 		}
 		for name, data := range configMap.BinaryData {
 			fileProjection.Data = data
 			fileProjection.Mode = *defaultMode
+			fileProjection.FsUser = fsUser
 			payload[name] = fileProjection
 		}
 	} else {
@@ -297,11 +302,24 @@ func MakePayload(mappings []v1.KeyToPath, configMap *v1.ConfigMap, defaultMode *
 			} else {
 				fileProjection.Mode = *defaultMode
 			}
+			fileProjection.FsUser = fsUserForProjection(ktp.User, defaultUser)
 			payload[ktp.Path] = fileProjection
 		}
 	}
 
 	return payload, nil
+}
+
+// fsUserForProjection applies ownership only when AtomicWriteVolumeUserFields is enabled.
+// Per-key User takes precedence over DefaultUser, matching the volume API contract.
+func fsUserForProjection(itemUser, defaultUser *int64) *int64 {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.AtomicWriteVolumeUserFields) {
+		return nil
+	}
+	if itemUser != nil {
+		return itemUser
+	}
+	return defaultUser
 }
 
 func totalBytes(configMap *v1.ConfigMap) int {

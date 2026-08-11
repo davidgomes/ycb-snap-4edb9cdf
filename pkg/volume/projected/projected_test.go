@@ -38,11 +38,14 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	clitesting "k8s.io/client-go/testing"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	pkgauthenticationv1 "k8s.io/kubernetes/pkg/apis/authentication/v1"
 	pkgcorev1 "k8s.io/kubernetes/pkg/apis/core/v1"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/volume"
 	"k8s.io/kubernetes/pkg/volume/emptydir"
 	volumetest "k8s.io/kubernetes/pkg/volume/testing"
@@ -303,14 +306,18 @@ func TestCollectDataWithSecret(t *testing.T) {
 
 func TestCollectDataWithConfigMap(t *testing.T) {
 	caseMappingMode := int32(0400)
+	caseDefaultUser := int64(1000)
+	caseItemUser := int64(2000)
 	cases := []struct {
-		name      string
-		mappings  []v1.KeyToPath
-		configMap *v1.ConfigMap
-		mode      int32
-		optional  bool
-		payload   map[string]util.FileProjection
-		success   bool
+		name              string
+		mappings          []v1.KeyToPath
+		configMap         *v1.ConfigMap
+		mode              int32
+		defaultUser       *int64
+		optional          bool
+		userFieldsEnabled bool
+		payload           map[string]util.FileProjection
+		success           bool
 	}{
 		{
 			name: "no overrides",
@@ -500,9 +507,135 @@ func TestCollectDataWithConfigMap(t *testing.T) {
 			payload:  map[string]util.FileProjection{},
 			success:  true,
 		},
+		{
+			name: "mapping with defaultUser",
+			mappings: []v1.KeyToPath{
+				{
+					Key:  "foo",
+					Path: "foo.txt",
+				},
+				{
+					Key:  "bar",
+					Path: "bar.bin",
+				},
+			},
+			configMap: &v1.ConfigMap{
+				Data: map[string]string{
+					"foo": "foo",
+					"bar": "bar",
+				},
+			},
+			mode:              0644,
+			defaultUser:       &caseDefaultUser,
+			userFieldsEnabled: true,
+			payload: map[string]util.FileProjection{
+				"foo.txt": {Data: []byte("foo"), Mode: 0644, FsUser: &caseDefaultUser},
+				"bar.bin": {Data: []byte("bar"), Mode: 0644, FsUser: &caseDefaultUser},
+			},
+			success: true,
+		},
+		{
+			name: "mapping with per-key User",
+			mappings: []v1.KeyToPath{
+				{
+					Key:  "foo",
+					Path: "foo.txt",
+					User: &caseItemUser,
+				},
+				{
+					Key:  "bar",
+					Path: "bar.bin",
+				},
+			},
+			configMap: &v1.ConfigMap{
+				Data: map[string]string{
+					"foo": "foo",
+					"bar": "bar",
+				},
+			},
+			mode:              0644,
+			userFieldsEnabled: true,
+			payload: map[string]util.FileProjection{
+				"foo.txt": {Data: []byte("foo"), Mode: 0644, FsUser: &caseItemUser},
+				"bar.bin": {Data: []byte("bar"), Mode: 0644},
+			},
+			success: true,
+		},
+		{
+			name: "per-key User overrides defaultUser",
+			mappings: []v1.KeyToPath{
+				{
+					Key:  "foo",
+					Path: "foo.txt",
+					User: &caseItemUser,
+				},
+				{
+					Key:  "bar",
+					Path: "bar.bin",
+				},
+			},
+			configMap: &v1.ConfigMap{
+				Data: map[string]string{
+					"foo": "foo",
+				},
+				BinaryData: map[string][]byte{
+					"bar": []byte("bar"),
+				},
+			},
+			mode:              0644,
+			defaultUser:       &caseDefaultUser,
+			userFieldsEnabled: true,
+			payload: map[string]util.FileProjection{
+				"foo.txt": {Data: []byte("foo"), Mode: 0644, FsUser: &caseItemUser},
+				"bar.bin": {Data: []byte("bar"), Mode: 0644, FsUser: &caseDefaultUser},
+			},
+			success: true,
+		},
+		{
+			name: "empty mappings with defaultUser including BinaryData",
+			configMap: &v1.ConfigMap{
+				Data: map[string]string{
+					"foo": "foo",
+				},
+				BinaryData: map[string][]byte{
+					"bar": []byte("bar"),
+				},
+			},
+			mode:              0644,
+			defaultUser:       &caseDefaultUser,
+			userFieldsEnabled: true,
+			payload: map[string]util.FileProjection{
+				"foo": {Data: []byte("foo"), Mode: 0644, FsUser: &caseDefaultUser},
+				"bar": {Data: []byte("bar"), Mode: 0644, FsUser: &caseDefaultUser},
+			},
+			success: true,
+		},
+		{
+			name: "user fields ignored when feature gate disabled",
+			mappings: []v1.KeyToPath{
+				{
+					Key:  "foo",
+					Path: "foo.txt",
+					User: &caseItemUser,
+				},
+			},
+			configMap: &v1.ConfigMap{
+				Data: map[string]string{
+					"foo": "foo",
+				},
+			},
+			mode:              0644,
+			defaultUser:       &caseDefaultUser,
+			userFieldsEnabled: false,
+			payload: map[string]util.FileProjection{
+				"foo.txt": {Data: []byte("foo"), Mode: 0644},
+			},
+			success: true,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.AtomicWriteVolumeUserFields, tc.userFieldsEnabled)
 			testNamespace := "test_projected_namespace"
 			tc.configMap.ObjectMeta = metav1.ObjectMeta{
 				Namespace: testNamespace,
@@ -510,6 +643,7 @@ func TestCollectDataWithConfigMap(t *testing.T) {
 			}
 
 			source := makeProjection(tc.name, ptr.To[int32](tc.mode), "configMap")
+			source.DefaultUser = tc.defaultUser
 			source.Sources[0].ConfigMap.Items = tc.mappings
 			source.Sources[0].ConfigMap.Optional = &tc.optional
 
