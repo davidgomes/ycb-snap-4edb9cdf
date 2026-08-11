@@ -17,6 +17,7 @@
 
 local ngx = ngx
 local ngx_now = ngx.now
+local math = math
 local core = require("apisix.core")
 local require = require
 local pcall   = pcall
@@ -68,6 +69,28 @@ local function read_upstream_error_body(res)
     end
     res._upstream_bytes = #body
     return body
+end
+
+
+-- Stamp integer-millisecond upstream latency from the same per-attempt clock
+-- used on the success path (ctx.llm_request_start_time). Without this, early
+-- exits leave $apisix_upstream_response_time unset and the log phase falls
+-- back to nginx $upstream_response_time (seconds), ~1000x off from a 200.
+-- include_ttft is true when the upstream actually responded (headers received).
+local function record_attempt_latency_ms(ctx, include_ttft)
+    local start = ctx.llm_request_start_time
+    if not start then
+        return
+    end
+    local duration_ms = math.floor((ngx_now() - start) * 1000)
+    ctx.var.apisix_upstream_response_time = duration_ms
+    if include_ttft then
+        ctx.var.llm_time_to_first_token = duration_ms
+    else
+        -- Keep the nginx default string so prometheus `~= "0"` still holds
+        -- after a retry whose previous attempt set a numeric TTFT.
+        ctx.var.llm_time_to_first_token = "0"
+    end
 end
 
 function _M.set_logging(ctx, summaries, payloads)
@@ -243,6 +266,9 @@ function _M.before_proxy(conf, ctx, on_error)
 
         local do_request = function()
             ctx.llm_request_start_time = ngx.now()
+            -- Reset TTFT each attempt so a prior 429/5xx value cannot leak
+            -- onto a later transport failure (ai-proxy-multi fallback).
+            ctx.var.llm_time_to_first_token = "0"
             ctx.var.llm_request_body = request_body
 
             -- Step 3: Build HTTP request params
@@ -297,6 +323,7 @@ function _M.before_proxy(conf, ctx, on_error)
                         })
                     end
                 end
+                record_attempt_latency_ms(ctx, false)
                 return transport_http.handle_error(transport_err)
             end
 
@@ -335,6 +362,7 @@ function _M.before_proxy(conf, ctx, on_error)
                         response_length = res._upstream_bytes or 0,
                     })
                 end
+                record_attempt_latency_ms(ctx, true)
                 if res._httpc then
                     res._httpc:close()
                 end

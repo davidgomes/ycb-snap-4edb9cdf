@@ -1224,8 +1224,10 @@ function _M.http_log_phase()
     end
     tracer.finish_all(api_ctx.ngx_ctx)
 
-    if not api_ctx.var.apisix_upstream_response_time or
-    api_ctx.var.apisix_upstream_response_time == "" then
+    -- 0 is a valid integer-ms reading (e.g. instant connect failure). Only
+    -- fall back to nginx $upstream_response_time (seconds) when unset/empty.
+    local urt = api_ctx.var.apisix_upstream_response_time
+    if urt == nil or urt == "" then
         api_ctx.var.apisix_upstream_response_time = ngx.var.upstream_response_time
     end
     local api_ctx = common_phase("log")
