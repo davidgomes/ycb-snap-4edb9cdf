@@ -37,7 +37,7 @@ using namespace JSC;
 // https://github.com/nodejs/node/blob/main/lib/internal/event_target.js
 static PrivateName& resistStopPropagationPrivateName()
 {
-    static PrivateName name("kResistStopPropagation"_s);
+    static PrivateName name(PrivateName::Description, String("kResistStopPropagation"_s));
     return name;
 }
 
@@ -106,7 +106,7 @@ template<> AddEventListenerOptions convertDictionary<AddEventListenerOptions>(JS
     // Own-property lookup only: prototype pollution / string keys / userland
     // Symbol() / Symbol.for() must not opt into non-suppressible dispatch.
     if (object) {
-        if (JSValue resistValue = object->getDirect(vm, Identifier::fromUid(vm, &resistStopPropagationPrivateName().uid()))) {
+        if (JSValue resistValue = object->getDirect(vm, Identifier::fromUid(resistStopPropagationPrivateName()))) {
             result.resistStopPropagation = resistValue.toBoolean(&lexicalGlobalObject);
             RETURN_IF_EXCEPTION(throwScope, {});
         }
