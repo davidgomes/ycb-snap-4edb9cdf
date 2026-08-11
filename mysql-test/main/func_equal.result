@@ -1,0 +1,86 @@
+drop table if exists t1,t2;
+select 0<=>0,0.0<=>0.0,0E0=0E0,"A"<=>"A",NULL<=>NULL;
+0<=>0	0.0<=>0.0	0E0=0E0	"A"<=>"A"	NULL<=>NULL
+1	1	1	1	1
+select 1<=>0,0<=>NULL,NULL<=>0;
+1<=>0	0<=>NULL	NULL<=>0
+0	0	0
+select 1.0<=>0.0,0.0<=>NULL,NULL<=>0.0;
+1.0<=>0.0	0.0<=>NULL	NULL<=>0.0
+0	0	0
+select "A"<=>"B","A"<=>NULL,NULL<=>"A";
+"A"<=>"B"	"A"<=>NULL	NULL<=>"A"
+0	0	0
+select 0<=>0.0, 0.0<=>0E0, 0E0<=>"0", 10.0<=>1E1, 10<=>10.0, 10<=>1E1;
+0<=>0.0	0.0<=>0E0	0E0<=>"0"	10.0<=>1E1	10<=>10.0	10<=>1E1
+1	1	1	1	1	1
+select 1.0<=>0E1,10<=>NULL,NULL<=>0.0, NULL<=>0E0;
+1.0<=>0E1	10<=>NULL	NULL<=>0.0	NULL<=>0E0
+0	0	0	0
+create table t1 (id int, value int);
+create table t2 (id int, value int);
+insert into t1 values (1,null);
+insert into t2 values (1,null);
+select t1.*, t2.*, t1.value<=>t2.value from t1, t2 where t1.id=t2.id and t1.id=1;
+id	value	id	value	t1.value<=>t2.value
+1	NULL	1	NULL	1
+select * from t1 where id <=>id;
+id	value
+1	NULL
+select * from t1 where value <=> value;
+id	value
+1	NULL
+select * from t1 where id <=> value or value<=>id;
+id	value
+drop table t1,t2;
+create table t1 (a bigint unsigned);
+insert into t1 values (4828532208463511553);
+select * from t1 where a = '4828532208463511553';
+a
+4828532208463511553
+select * from t1 where a in ('4828532208463511553');
+a
+4828532208463511553
+drop table t1;
+#End of 4.1 tests
+# Start of 10.5 tests
+#
+# MDEV-21029 Incorrect result for expression with the <=> operator and IS NULL
+#
+CREATE TABLE t0(c0 INT);
+INSERT INTO t0 VALUES (1);
+SELECT (c0 > (NULL <=> 0)) IS NULL AS c1 FROM t0;
+c1
+0
+DROP TABLE t0;
+# End of 10.5 tests
+#
+# MDEV-36792: UBSAN load of null pointer and Assertion `b == &type_handler_row || b == &type_handler_null` in `Arg_comparator::set_cmp_func when using ROW()`
+#
+CREATE FUNCTION f() RETURNS ROW TYPE OF t RETURN 1;
+CREATE TABLE t (a INT);
+SELECT ROW(f(),1)=ROW(1,1) AS eq;
+ERROR HY000: Illegal parameter data types row and int for operation '='
+DROP FUNCTION f;
+DROP TABLE t;
+# End of 11.8 tests
+#
+# MDEV-36964: Infinite loop in `cmp_row_type`, SIGABRT in `Type_handler_composite::Item_update_null_value`
+#
+CREATE FUNCTION f() RETURNS ROW TYPE OF t RETURN 1;
+CREATE TABLE t (c INT KEY,c2 INT,UNIQUE (c2));
+SELECT ROW(COALESCE(f()),1)=ROW(1,1) AS eq;
+ERROR HY000: Illegal parameter data type row for operation 'coalesce'
+SELECT ROW(COALESCE(ROW(1,1)),1)=ROW(1,1) AS eq;
+ERROR HY000: Illegal parameter data type row for operation 'coalesce'
+SELECT ROW(1,1)=ROW(COALESCE(f()),1) AS eq;
+ERROR HY000: Illegal parameter data type row for operation 'coalesce'
+SELECT ROW(1,1)=ROW(COALESCE(ROW(1,1)),1) AS eq;
+ERROR HY000: Illegal parameter data type row for operation 'coalesce'
+SELECT ROW(COALESCE(f()),1)=ROW(COALESCE(f()),1) AS eq;
+ERROR HY000: Illegal parameter data type row for operation 'coalesce'
+SELECT ROW(1, COALESCE(f()), 1)=ROW(1, COALESCE(f()), 1) AS eq;
+ERROR HY000: Illegal parameter data type row for operation 'coalesce'
+DROP FUNCTION f;
+DROP TABLE t;
+# End of 12.3 tests

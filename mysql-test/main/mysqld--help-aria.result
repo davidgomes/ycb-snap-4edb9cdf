@@ -1,0 +1,10 @@
+flush tables;
+[Warning] --table-cache is deprecated and will be removed in a future release. Please use --table-open-cache instead.
+#
+# Check that we don't write any data to wrong or not existing datadir
+#
+[Warning] --table-cache is deprecated and will be removed in a future release. Please use --table-open-cache instead.
+#
+# Check with existing directory
+#
+[Warning] --table-cache is deprecated and will be removed in a future release. Please use --table-open-cache instead.
