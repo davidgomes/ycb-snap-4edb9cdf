@@ -1,0 +1,43 @@
+---
+source: datafusion-cli/tests/cli_integration.rs
+info:
+  program: datafusion-cli
+  args:
+    - "--command"
+    - EXPLAIN SELECT 123
+  env:
+    DATAFUSION_EXPLAIN_FORMAT: pgjson
+---
+success: true
+exit_code: 0
+----- stdout -----
+[CLI_VERSION]
++--------------+-----------------------------------------+
+| plan_type    | plan                                    |
++--------------+-----------------------------------------+
+| logical_plan | [                                       |
+|              |   {                                     |
+|              |     "Plan": {                           |
+|              |       "Node Type": "Projection",        |
+|              |       "Expressions": [                  |
+|              |         "Int64(123)"                    |
+|              |       ],                                |
+|              |       "Plans": [                        |
+|              |         {                               |
+|              |           "Node Type": "EmptyRelation", |
+|              |           "Plans": [],                  |
+|              |           "Output": []                  |
+|              |         }                               |
+|              |       ],                                |
+|              |       "Output": [                       |
+|              |         "Int64(123)"                    |
+|              |       ]                                 |
+|              |     }                                   |
+|              |   }                                     |
+|              | ]                                       |
++--------------+-----------------------------------------+
+1 row(s) fetched. 
+[ELAPSED]
+
+
+----- stderr -----
