@@ -137,9 +137,16 @@ struct ARROW_COMPUTE_EXPORT DictionaryKeyEncoder : FixedWidthKeyEncoder {
   std::shared_ptr<Array> dictionary_;
 };
 
-template <typename T>
-struct VarLengthKeyEncoder : KeyEncoder {
-  using Offset = typename T::offset_type;
+// Shared implementation of the variable-length row encoding used by the plain
+// binary/string encoder and the view encoder. The on-row format is
+// [null byte][length : Offset][raw key bytes]; only Decode differs between the
+// two, so subclasses override just that.
+template <typename T, typename OffsetType>
+struct BaseVarLengthKeyEncoder : KeyEncoder {
+  using Offset = OffsetType;
+
+  explicit BaseVarLengthKeyEncoder(std::shared_ptr<DataType> type)
+      : type_(std::move(type)) {}
 
   void AddLength(const ExecValue& data, int64_t batch_length, int32_t* lengths) override {
     if (data.is_array()) {
@@ -210,11 +217,24 @@ struct VarLengthKeyEncoder : KeyEncoder {
     encoded_ptr += sizeof(Offset);
   }
 
+  std::shared_ptr<DataType> type_;
+};
+
+// Encodes plain binary/string keys, decoding back into the aliasable
+// offsets + data buffer layout.
+template <typename T>
+struct VarLengthKeyEncoder : BaseVarLengthKeyEncoder<T, typename T::offset_type> {
+  using Base = BaseVarLengthKeyEncoder<T, typename T::offset_type>;
+  using Base::Base;
+  using Base::type_;
+  using typename Base::Offset;
+
   Result<std::shared_ptr<ArrayData>> Decode(uint8_t** encoded_bytes, int32_t length,
                                             MemoryPool* pool) override {
     std::shared_ptr<Buffer> null_buf;
     int32_t null_count;
-    ARROW_RETURN_NOT_OK(DecodeNulls(pool, length, encoded_bytes, &null_buf, &null_count));
+    ARROW_RETURN_NOT_OK(
+        this->DecodeNulls(pool, length, encoded_bytes, &null_buf, &null_count));
 
     Offset length_sum = 0;
     for (int32_t i = 0; i < length; ++i) {
@@ -246,10 +266,17 @@ struct VarLengthKeyEncoder : KeyEncoder {
         type_, length, {std::move(null_buf), std::move(offset_buf), std::move(key_buf)},
         null_count);
   }
+};
 
-  explicit VarLengthKeyEncoder(std::shared_ptr<DataType> type) : type_(std::move(type)) {}
+// Encodes BinaryView/StringView keys in the same row format as the plain
+// encoder above. The row copies the key bytes, so Decode builds a fresh view
+// array rather than aliasing the input's variadic buffers.
+struct ARROW_COMPUTE_EXPORT BinaryViewKeyEncoder
+    : BaseVarLengthKeyEncoder<BinaryViewType, int32_t> {
+  using BaseVarLengthKeyEncoder::BaseVarLengthKeyEncoder;
 
-  std::shared_ptr<DataType> type_;
+  Result<std::shared_ptr<ArrayData>> Decode(uint8_t** encoded_bytes, int32_t length,
+                                            MemoryPool* pool) override;
 };
 
 struct ARROW_COMPUTE_EXPORT NullKeyEncoder : KeyEncoder {
