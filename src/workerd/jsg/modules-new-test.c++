@@ -1535,6 +1535,143 @@ KJ_TEST("Recursively require ESM from CJS required from ESM fails as expected (s
 
 // ======================================================================================
 
+KJ_TEST("Nested require during ESM evaluation with sibling TLA does not crash") {
+  // entry statically imports (1) a TLA module and (2) a CJS module whose body
+  // require()s another module. During entry evaluation the TLA module suspends
+  // while entry is still kEvaluating. The nested require must not drain
+  // microtasks (that would run the TLA fulfillment too early and trip V8's
+  // status() >= kEvaluatingAsync CHECK). After Evaluate(entry) returns pending,
+  // the outer require drains once and the graph settles.
+  PREAMBLE([&](Lock& js) {
+    ResolveObserverImpl observer;
+    CompilationObserver compilationObserver;
+
+    ModuleBundle::BundleBuilder bundleBuilder(BASE);
+
+    auto tla = kj::str("await Promise.resolve(); export default 1;");
+    bundleBuilder.addEsmModule("tla", tla);
+
+    auto other = kj::str("export default 2;");
+    bundleBuilder.addEsmModule("other", other);
+
+    auto cjsSource = kj::str("exports = require('other');");
+    bundleBuilder.addSyntheticModule("cjs",
+        Module::newCjsStyleModuleHandler<TestType, TestIsolate_TypeWrapper>(cjsSource, "cjs"_kj));
+
+    auto entry = kj::str("import 'tla'; import cjs from 'cjs'; export default cjs;");
+    bundleBuilder.addEsmModule("entry", entry, Module::Flags::MAIN);
+
+    auto registry = ModuleRegistry::Builder(observer, BASE).add(bundleBuilder.finish()).finish();
+    auto attached = registry->attachToIsolate(js, compilationObserver);
+
+    auto val = ModuleRegistry::resolve(js, "file:///entry", "default"_kjc);
+    KJ_ASSERT(val.isNumber());
+  });
+}
+
+// ======================================================================================
+
+KJ_TEST("Synchronous require does not flush unrelated microtasks") {
+  PREAMBLE([&](Lock& js) {
+    ResolveObserverImpl observer;
+    CompilationObserver compilationObserver;
+
+    ModuleBundle::BundleBuilder bundleBuilder(BASE);
+    auto foo = kj::str(
+        "const state = { value: 1, ran: false };"
+        "Promise.resolve().then(() => { state.ran = true; });"
+        "export default state;");
+    bundleBuilder.addEsmModule("foo", foo);
+
+    auto registry = ModuleRegistry::Builder(observer, BASE).add(bundleBuilder.finish()).finish();
+    auto attached = registry->attachToIsolate(js, compilationObserver);
+
+    auto val = ModuleRegistry::resolve(js, "file:///foo", "default"_kjc);
+    KJ_ASSERT(val.isObject());
+    auto obj = KJ_ASSERT_NONNULL(val.tryCast<JsObject>());
+    KJ_ASSERT(obj.get(js, "value").isNumber());
+    auto ran = KJ_ASSERT_NONNULL(obj.get(js, "ran").tryCast<JsBoolean>());
+    KJ_ASSERT(!ran.value(js));
+
+    js.runMicrotasks();
+    ran = KJ_ASSERT_NONNULL(obj.get(js, "ran").tryCast<JsBoolean>());
+    KJ_ASSERT(ran.value(js));
+  });
+}
+
+// ======================================================================================
+
+KJ_TEST("Nested require of unsettled TLA fails without breaking later top-level require") {
+  PREAMBLE([&](Lock& js) {
+    ResolveObserverImpl observer;
+    CompilationObserver compilationObserver;
+
+    ModuleBundle::BundleBuilder bundleBuilder(BASE);
+
+    auto tla = kj::str("await Promise.resolve(); export default 42;");
+    bundleBuilder.addEsmModule("tla", tla);
+
+    auto cjsSource = kj::str("exports = require('tla');");
+    bundleBuilder.addSyntheticModule("cjs",
+        Module::newCjsStyleModuleHandler<TestType, TestIsolate_TypeWrapper>(cjsSource, "cjs"_kj));
+
+    auto registry = ModuleRegistry::Builder(observer, BASE).add(bundleBuilder.finish()).finish();
+    auto attached = registry->attachToIsolate(js, compilationObserver);
+
+    js.tryCatch([&] {
+      ModuleRegistry::resolve(js, "file:///cjs", "default"_kjc);
+      KJ_FAIL_ASSERT("Should have failed");
+    }, [&](Value exception) {
+      auto str = kj::str(exception.getHandle(js));
+      KJ_ASSERT(str ==
+          "Error: Use of top-level await in a synchronously "
+          "required module is restricted to promises that are resolved "
+          "synchronously. This includes any top-level awaits in the "
+          "entrypoint module for a worker. Specifier: \"file:///tla\".");
+    });
+
+    auto val = ModuleRegistry::resolve(js, "file:///tla", "default"_kjc);
+    KJ_ASSERT(val.isNumber());
+
+    // Already-settled TLA must still be requireable.
+    auto val2 = ModuleRegistry::resolve(js, "file:///tla", "default"_kjc);
+    KJ_ASSERT(val2.isNumber());
+  });
+}
+
+// ======================================================================================
+
+KJ_TEST("Throwing evaluation does not break later top-level require of sync TLA") {
+  PREAMBLE([&](Lock& js) {
+    ResolveObserverImpl observer;
+    CompilationObserver compilationObserver;
+
+    ModuleBundle::BundleBuilder bundleBuilder(BASE);
+
+    auto bad = kj::str("throw new Error('nope');");
+    bundleBuilder.addEsmModule("bad", bad);
+
+    auto tla = kj::str("await Promise.resolve(); export default 7;");
+    bundleBuilder.addEsmModule("tla", tla);
+
+    auto registry = ModuleRegistry::Builder(observer, BASE).add(bundleBuilder.finish()).finish();
+    auto attached = registry->attachToIsolate(js, compilationObserver);
+
+    js.tryCatch([&] {
+      ModuleRegistry::resolve(js, "file:///bad", "default"_kjc);
+      KJ_FAIL_ASSERT("Should have failed");
+    }, [&](Value exception) {
+      auto str = kj::str(exception.getHandle(js));
+      KJ_ASSERT(str == "Error: nope");
+    });
+
+    auto val = ModuleRegistry::resolve(js, "file:///tla", "default"_kjc);
+    KJ_ASSERT(val.isNumber());
+  });
+}
+
+// ======================================================================================
+
 KJ_TEST("ESM -> CJS -> require(ESM) -> static import CJS circular dependency fails gracefully") {
   // This tests a specific crash scenario: when a CJS module (b) is mid-evaluation
   // (kEvaluating), and it require()s an ESM (c) that statically imports the same

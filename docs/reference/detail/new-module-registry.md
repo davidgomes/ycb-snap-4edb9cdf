@@ -344,14 +344,19 @@ CJS code: const foo = require('./bar.js')
 4. Evaluate the module:
    a. If status == kErrored -> throw the stored exception
    b. If ESM and status == kEvaluating -> throw circular dependency error
-   c. If status == kEvaluated or kEvaluating -> return namespace directly
+   c. If status == kEvaluating -> return namespace directly
       (allows CJS circular deps with incomplete exports, same as Node.js)
-   d. Otherwise: call module.evaluate() -> Promise
-   e. Run microtasks
-   f. Check promise state:
-      - kFulfilled -> return module namespace
+   d. If status == kEvaluated and the graph is sync (or TLA is forbidden) ->
+      return namespace. If the graph is async and TLA is allowed, fall through
+      to Evaluate() so a previously pending TLA promise can still settle.
+   e. Otherwise: call module.evaluate() -> Promise
+   f. Check promise state immediately (do not drain first):
+      - kFulfilled -> return module namespace (no microtask drain)
       - kRejected -> throw rejection reason
-      - kPending -> throw "top-level await" error
+      - kPending -> genuine suspended TLA. Drain only if no module evaluation
+        is on the stack. If this require() is nested inside another module's
+        evaluation, throw unsettled TLA (Node.js require(esm) /
+        ERR_REQUIRE_ASYNC_MODULE style) instead of draining.
 
 5. Return the module namespace as v8::Object
 ```
@@ -760,6 +765,11 @@ returning a rejected promise with the cached exception.
    `KJ_FAIL_ASSERT` for `PythonModule` content. Python support remains on the
    legacy registry path.
 
-10. **Top-level await handling.** Same as legacy: after `Evaluate`, microtasks
-    are drained. If the returned Promise is still pending, a "top-level await"
-    error is thrown. Workers must fully initialize synchronously.
+10. **Top-level await handling.** After `Evaluate`, if the promise is already
+    fulfilled, `require()` returns the namespace without draining microtasks
+    (sync graphs and internal builtins). Rejected promises are propagated.
+    Pending promises (genuine TLA) are drained only when no module evaluation
+    is on the stack. A nested `require()` reports unsettled TLA instead of
+    draining, which would otherwise run a sibling TLA fulfillment too early
+    and trip V8's `status() >= kEvaluatingAsync` CHECK. Workers must still
+    fully initialize synchronously at top level.

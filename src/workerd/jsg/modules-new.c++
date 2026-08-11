@@ -43,6 +43,14 @@ kj::Maybe<const Url&> maybeRedirectNodeProcess(Lock& js, const Url& spec) {
   return kj::none;
 }
 
+// Tracks V8 module evaluation currently on the C++ stack. require() must not
+// drain microtasks while another module is still evaluating: doing so can run a
+// sibling TLA fulfillment too early and trip V8's
+// status() >= kEvaluatingAsync CHECK in GatherAvailableAncestors.
+void enterModuleEvaluation(Lock& js);
+void exitModuleEvaluation(Lock& js);
+bool isModuleEvaluationOnStack(Lock& js);
+
 kj::String specifierToString(jsg::Lock& js, v8::Local<v8::String> spec) {
   // Source files in workers end up being converted to UTF-8 bytes, so if the specifier
   // string contains non-ASCII unicode characters, those will be directly encoded as UTF-8
@@ -237,6 +245,9 @@ class EsModule final: public Module {
       }
       return {};
     }
+
+    enterModuleEvaluation(js);
+    KJ_DEFER(exitModuleEvaluation(js));
 
     KJ_IF_SOME(result, maybeEvaluate(js, *this, module, observer)) {
       v8::Local<v8::Value> val = result;
@@ -705,14 +716,17 @@ class IsolateModuleRegistry final {
         JSG_FAIL_REQUIRE(Error, "Circular dependency when resolving module: ", id);
       }
 
-      // If the module has already been evaluated, or is in the process of being
-      // evaluated, return the module namespace object directly. Note that if the
-      // module is a synthetic module, and status is kEvaluating, it is possible
-      // and likely that the namespace has not yet been fully evaluated and will
-      // be incomplete here. This allows CJS circular dependencies to be supported
-      // to a degree. Just like in Node.js, however, such circular dependencies
-      // can still be problematic depending on how they are used.
-      if (status == v8::Module::kEvaluated || status == v8::Module::kEvaluating) {
+      const bool noTopLevelAwait =
+          (option & RequireOption::NO_TOP_LEVEL_AWAIT) == RequireOption::NO_TOP_LEVEL_AWAIT;
+
+      // If the module is in the process of being evaluated, return the module
+      // namespace object directly. Note that if the module is a synthetic module,
+      // and status is kEvaluating, it is possible and likely that the namespace
+      // has not yet been fully evaluated and will be incomplete here. This allows
+      // CJS circular dependencies to be supported to a degree. Just like in
+      // Node.js, however, such circular dependencies can still be problematic
+      // depending on how they are used.
+      if (status == v8::Module::kEvaluating) {
         // require() must reject a module that uses top-level await (matching
         // Node.js require(esm), which throws ERR_REQUIRE_ASYNC_MODULE) even when
         // the module has already been evaluated by a prior import. Without this
@@ -720,17 +734,29 @@ class IsolateModuleRegistry final {
         // require() throws would depend on evaluation order (it would throw only
         // if nothing had imported the module first). The module is already
         // instantiated at this point, so IsGraphAsync() is valid to query.
-        if ((option & RequireOption::NO_TOP_LEVEL_AWAIT) == RequireOption::NO_TOP_LEVEL_AWAIT) {
+        if (noTopLevelAwait) {
           JSG_REQUIRE(!module->IsGraphAsync(), Error,
               "Top-level await is not supported in this context for module: ", id);
         }
         return maybeUnwrapDefault(js, module, moduleDef, option);
       }
 
-      // Matches the require(esm) behavior implemented in Node.js, which is to
-      // throw if the module being imported uses top-level await.
-      if ((option & RequireOption::NO_TOP_LEVEL_AWAIT) == RequireOption::NO_TOP_LEVEL_AWAIT) {
-        // We have to ensure the module is instantiated before we can check for top-level await.
+      if (status == v8::Module::kEvaluated) {
+        if (noTopLevelAwait) {
+          JSG_REQUIRE(!module->IsGraphAsync(), Error,
+              "Top-level await is not supported in this context for module: ", id);
+          return maybeUnwrapDefault(js, module, moduleDef, option);
+        }
+        if (!module->IsGraphAsync()) {
+          return maybeUnwrapDefault(js, module, moduleDef, option);
+        }
+        // Async graph: Evaluate() again to obtain the top-level capability.
+        // A prior nested require() may have started evaluation but could not
+        // drain, leaving the promise pending. Re-settling here lets a later
+        // top-level require of a synchronously-settling TLA module succeed.
+      } else if (noTopLevelAwait) {
+        // Matches the require(esm) behavior implemented in Node.js, which is to
+        // throw if the module being imported uses top-level await.
         JSG_REQUIRE(ensureInstantiated(js, module, observer, moduleDef), Error,
             "Failed to instantiate module: ", id);
         JSG_REQUIRE(!module->IsGraphAsync(), Error,
@@ -741,44 +767,44 @@ class IsolateModuleRegistry final {
       auto promise =
           check(moduleDef.evaluate(js, module, observer, maybeEvaluate)).As<v8::Promise>();
 
-      // Run the microtasks to ensure that any promises that happen to be scheduled
-      // during the evaluation of the top-level scope have a chance to be settled.
-      // We only pump the microtasks queue if NO_TOP_LEVEL_AWAIT is not set.
-      if ((option & RequireOption::NO_TOP_LEVEL_AWAIT) != RequireOption::NO_TOP_LEVEL_AWAIT) {
-        js.runMicrotasks();
+      static const auto kTopLevelAwaitError =
+          "Use of top-level await in a synchronously required module is restricted to "
+          "promises that are resolved synchronously. This includes any top-level awaits "
+          "in the entrypoint module for a worker."_kj;
 
-        static const auto kTopLevelAwaitError =
-            "Use of top-level await in a synchronously required module is restricted to "
-            "promises that are resolved synchronously. This includes any top-level awaits "
-            "in the entrypoint module for a worker."_kj;
+      switch (promise->State()) {
+        case v8::Promise::kFulfilled:
+          // Synchronous graphs and internal builtins settle before Evaluate()
+          // returns. Do not drain: that would flush unrelated fire-and-forget
+          // microtasks scheduled during evaluation, and if another module is
+          // still evaluating it can trip V8's kEvaluatingAsync CHECK.
+          return maybeUnwrapDefault(js, module, moduleDef, option);
+        case v8::Promise::kRejected:
+          js.throwException(JsValue(promise->Result()));
+          break;
+        case v8::Promise::kPending:
+          break;
+      }
 
-        switch (promise->State()) {
-          case v8::Promise::kFulfilled: {
-            // This is what we want. The module namespace should be fully populated
-            // and evaluated at this point.
-            return maybeUnwrapDefault(js, module, moduleDef, option);
-          }
-          case v8::Promise::kRejected: {
-            // Oops, there was an error. We should throw it.
-            js.throwException(JsValue(promise->Result()));
-            break;
-          }
-          case v8::Promise::kPending: {
-            // The module evaluation could not complete in a single drain of the
-            // microtask queue. This means we've got a pending promise somewhere
-            // that is being awaited preventing the module from being ready to
-            // go. We can't have that! Throw! Throw!
-            JSG_FAIL_REQUIRE(Error, kTopLevelAwaitError, " Specifier: \"", id, "\".");
-          }
-        }
-      } else {
+      // Genuine suspended TLA. Draining is only safe when no module evaluation
+      // is on the stack. A nested require() must report unsettled TLA instead
+      // (Node.js require(esm) / ERR_REQUIRE_ASYNC_MODULE style).
+      if (noTopLevelAwait) {
         KJ_ASSERT(!module->IsGraphAsync() && promise->State() != v8::Promise::kPending,
             "Top-level await is not supported in this context, so the module promise "
             "should never be pending");
-        if (promise->State() == v8::Promise::kRejected) {
+      }
+      if (isModuleEvaluationOnStack(js)) {
+        JSG_FAIL_REQUIRE(Error, kTopLevelAwaitError, " Specifier: \"", id, "\".");
+      }
+      js.runMicrotasks();
+      switch (promise->State()) {
+        case v8::Promise::kFulfilled:
+          return maybeUnwrapDefault(js, module, moduleDef, option);
+        case v8::Promise::kRejected:
           js.throwException(JsValue(promise->Result()));
-        }
-        return maybeUnwrapDefault(js, module, moduleDef, option);
+        case v8::Promise::kPending:
+          JSG_FAIL_REQUIRE(Error, kTopLevelAwaitError, " Specifier: \"", id, "\".");
       }
       KJ_UNREACHABLE;
     };
@@ -848,6 +874,17 @@ class IsolateModuleRegistry final {
 
   const CompilationObserver& getObserver() const {
     return observer;
+  }
+
+  void enterEvaluation() {
+    evaluationDepth++;
+  }
+  void exitEvaluation() {
+    KJ_DASSERT(evaluationDepth > 0);
+    evaluationDepth--;
+  }
+  bool isEvaluationOnStack() const {
+    return evaluationDepth > 0;
   }
 
   struct EntryCallbacks final {
@@ -933,14 +970,32 @@ class IsolateModuleRegistry final {
       kj::HashIndex<ContextCallbacks>,
       kj::HashIndex<UrlCallbacks>>
       lookupCache;
+  uint evaluationDepth = 0;
   friend class SyntheticModule;
+  friend void enterModuleEvaluation(Lock& js);
+  friend void exitModuleEvaluation(Lock& js);
+  friend bool isModuleEvaluationOnStack(Lock& js);
 };
+
+void enterModuleEvaluation(Lock& js) {
+  IsolateModuleRegistry::from(js.v8Isolate).enterEvaluation();
+}
+
+void exitModuleEvaluation(Lock& js) {
+  IsolateModuleRegistry::from(js.v8Isolate).exitEvaluation();
+}
+
+bool isModuleEvaluationOnStack(Lock& js) {
+  return IsolateModuleRegistry::from(js.v8Isolate).isEvaluationOnStack();
+}
 
 v8::MaybeLocal<v8::Value> SyntheticModule::evaluationSteps(
     v8::Local<v8::Context> context, v8::Local<v8::Module> module) {
   auto& js = Lock::current();
   KJ_TRY {
     auto& registry = IsolateModuleRegistry::from(js.v8Isolate);
+    enterModuleEvaluation(js);
+    KJ_DEFER(exitModuleEvaluation(js));
     KJ_IF_SOME(found, registry.lookup(js, module)) {
       return found.module.actuallyEvaluate(js, module, registry.getObserver());
     }
