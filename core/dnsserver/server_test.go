@@ -1,0 +1,277 @@
+package dnsserver
+
+import (
+	"context"
+	"errors"
+	"net"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/coredns/coredns/plugin"
+	"github.com/coredns/coredns/plugin/pkg/log"
+	"github.com/coredns/coredns/plugin/test"
+
+	"github.com/miekg/dns"
+)
+
+type testPlugin struct{}
+
+func (tp testPlugin) ServeDNS(_ctx context.Context, _w dns.ResponseWriter, _r *dns.Msg) (int, error) {
+	return 0, nil
+}
+
+func (tp testPlugin) Name() string { return "local" }
+
+type updateResponsePlugin struct {
+	called atomic.Bool
+}
+
+func (p *updateResponsePlugin) Name() string { return "update-response" }
+
+func (p *updateResponsePlugin) ServeDNS(_ context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+	p.called.Store(true)
+
+	m := new(dns.Msg)
+	m.SetReply(r)
+	if err := w.WriteMsg(m); err != nil {
+		return dns.RcodeServerFailure, err
+	}
+	return dns.RcodeSuccess, nil
+}
+
+func mustPackRFC2136Update(t *testing.T) []byte {
+	t.Helper()
+
+	m := new(dns.Msg).SetUpdate("example.com.")
+	rr, err := dns.NewRR("foo.example.com. 300 IN A 192.0.2.123")
+	if err != nil {
+		t.Fatalf("dns.NewRR() failed: %v", err)
+	}
+	m.Insert([]dns.RR{rr})
+	// DNS-over-QUIC requires the DNS message ID to be zero.
+	m.Id = 0
+
+	wire, err := m.Pack()
+	if err != nil {
+		t.Fatalf("dns.Msg.Pack() failed: %v", err)
+	}
+	return wire
+}
+
+// blockingPlugin uses sync.Mutex to simulate extended processing.
+type blockingPlugin struct {
+	sync.Mutex
+}
+
+func (b *blockingPlugin) Name() string { return "blocking" }
+
+func (b *blockingPlugin) ServeDNS(_ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+	// Respond immediately to avoid waiting in dns.Exchange
+	m := new(dns.Msg)
+	m.SetRcodeFormatError(r)
+	w.WriteMsg(m)
+
+	b.Lock()
+	defer b.Unlock()
+	return dns.RcodeSuccess, nil
+}
+
+func testConfig(transport string, p plugin.Handler) *Config {
+	c := &Config{
+		Zone:        "example.com.",
+		Transport:   transport,
+		ListenHosts: []string{"127.0.0.1"},
+		Port:        "53",
+		Debug:       false,
+		Stacktrace:  false,
+	}
+
+	c.AddPlugin(func(_next plugin.Handler) plugin.Handler { return p })
+	return c
+}
+
+func TestNewServer(t *testing.T) {
+	_, err := NewServer("127.0.0.1:53", []*Config{testConfig("dns", testPlugin{})})
+	if err != nil {
+		t.Errorf("Expected no error for NewServer, got %s", err)
+	}
+
+	_, err = NewServergRPC("127.0.0.1:53", []*Config{testConfig("grpc", testPlugin{})})
+	if err != nil {
+		t.Errorf("Expected no error for NewServergRPC, got %s", err)
+	}
+
+	_, err = NewServerTLS("127.0.0.1:53", []*Config{testConfig("tls", testPlugin{})})
+	if err != nil {
+		t.Errorf("Expected no error for NewServerTLS, got %s", err)
+	}
+
+	_, err = NewServerQUIC("127.0.0.1:53", []*Config{testConfig("quic", testPlugin{})})
+	if err != nil {
+		t.Errorf("Expected no error for NewServerQUIC, got %s", err)
+	}
+}
+
+func TestDebug(t *testing.T) {
+	configNoDebug, configDebug := testConfig("dns", testPlugin{}), testConfig("dns", testPlugin{})
+	configDebug.Debug = true
+
+	s1, err := NewServer("127.0.0.1:53", []*Config{configDebug, configNoDebug})
+	if err != nil {
+		t.Errorf("Expected no error for NewServer, got %s", err)
+	}
+	if !s1.debug {
+		t.Errorf("Expected debug mode enabled for server s1")
+	}
+	if !log.D.Value() {
+		t.Errorf("Expected debug logging enabled")
+	}
+
+	s2, err := NewServer("127.0.0.1:53", []*Config{configNoDebug})
+	if err != nil {
+		t.Errorf("Expected no error for NewServer, got %s", err)
+	}
+	if s2.debug {
+		t.Errorf("Expected debug mode disabled for server s2")
+	}
+	if log.D.Value() {
+		t.Errorf("Expected debug logging disabled")
+	}
+}
+
+func TestStacktrace(t *testing.T) {
+	configNoStacktrace, configStacktrace := testConfig("dns", testPlugin{}), testConfig("dns", testPlugin{})
+	configStacktrace.Stacktrace = true
+
+	s1, err := NewServer("127.0.0.1:53", []*Config{configStacktrace, configStacktrace})
+	if err != nil {
+		t.Errorf("Expected no error for NewServer, got %s", err)
+	}
+	if !s1.stacktrace {
+		t.Errorf("Expected stacktrace mode enabled for server s1")
+	}
+
+	s2, err := NewServer("127.0.0.1:53", []*Config{configNoStacktrace})
+	if err != nil {
+		t.Errorf("Expected no error for NewServer, got %s", err)
+	}
+	if s2.stacktrace {
+		t.Errorf("Expected stacktrace disabled for server s2")
+	}
+}
+
+func TestGracefulStopTimeout_Internal(t *testing.T) {
+	p := new(blockingPlugin)
+	cfg := testConfig("dns", p)
+
+	s, err := NewServer("127.0.0.1:0", []*Config{cfg})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+
+	// Shorten the graceful timeout
+	s.graceTimeout = 500 * time.Millisecond
+
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket failed: %v", err)
+	}
+	defer pc.Close()
+
+	go s.ServePacket(pc)
+	udp := pc.LocalAddr().String()
+
+	// Block the handler
+	p.Lock()
+	defer p.Unlock()
+
+	m := new(dns.Msg)
+	m.SetQuestion("example.com.", dns.TypeA)
+	_, err = dns.Exchange(m, udp)
+	if err != nil {
+		t.Fatalf("dns.Exchange failed: %v", err)
+	}
+
+	err = s.Stop()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded, got %v", err)
+	}
+}
+
+func BenchmarkCoreServeDNS(b *testing.B) {
+	s, err := NewServer("127.0.0.1:53", []*Config{testConfig("dns", testPlugin{})})
+	if err != nil {
+		b.Errorf("Expected no error for NewServer, got %s", err)
+	}
+
+	ctx := context.TODO()
+	w := &test.ResponseWriter{}
+	m := new(dns.Msg)
+	m.SetQuestion("aaa.example.com.", dns.TypeTXT)
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		s.ServeDNS(ctx, w, m)
+	}
+}
+
+// recordingWriter counts the packed frames the decorated writer receives
+// before forwarding them to the real writer. The decorator mints a fresh
+// wrapper per packet; the frames counter is shared across them.
+type recordingWriter struct {
+	dns.Writer
+	frames *atomic.Int64
+}
+
+func (rw *recordingWriter) Write(b []byte) (int, error) {
+	rw.frames.Add(1)
+	return rw.Writer.Write(b)
+}
+
+func TestUDPDecorateWriterFunc(t *testing.T) {
+	cfg := testConfig("dns", test.ErrorHandler())
+
+	frames := new(atomic.Int64)
+	var gotServer atomic.Pointer[Server]
+	var calls atomic.Int64
+	cfg.UDPDecorateWriterFunc = func(srv *Server) dns.DecorateWriter {
+		calls.Add(1)
+		gotServer.Store(srv)
+		return func(w dns.Writer) dns.Writer {
+			return &recordingWriter{Writer: w, frames: frames}
+		}
+	}
+
+	s, err := NewServer("127.0.0.1:0", []*Config{cfg})
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenPacket failed: %v", err)
+	}
+	defer pc.Close()
+
+	go s.ServePacket(pc)
+	defer s.Stop()
+
+	m := new(dns.Msg)
+	m.SetQuestion("example.com.", dns.TypeA)
+	if _, err := dns.Exchange(m, pc.LocalAddr().String()); err != nil {
+		t.Fatalf("dns.Exchange failed: %v", err)
+	}
+
+	if n := calls.Load(); n != 1 {
+		t.Errorf("expected UDPDecorateWriterFunc to be called once per socket, got %d", n)
+	}
+	if gotServer.Load() != s {
+		t.Errorf("expected UDPDecorateWriterFunc to receive the serving *Server")
+	}
+	if frames.Load() == 0 {
+		t.Errorf("expected the decorated writer to observe the response write")
+	}
+}
