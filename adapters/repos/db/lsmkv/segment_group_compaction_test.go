@@ -14,6 +14,8 @@ package lsmkv
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -1316,6 +1318,52 @@ func TestSegmenGroup_CompactionLargerThanMaxSize(t *testing.T) {
 	ok, err := sg.compactOnce(context.Background())
 	assert.False(t, ok, "segments are too large to run")
 	assert.Nil(t, err)
+}
+
+func TestDiscardSegmentFile(t *testing.T) {
+	t.Run("closes and removes an open file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "segment-1_2.db.tmp")
+		f, err := os.Create(path)
+		require.NoError(t, err)
+
+		require.NoError(t, discardSegmentFile(f, path, nil))
+		_, err = os.Stat(path)
+		require.True(t, os.IsNotExist(err))
+	})
+
+	t.Run("tolerates already closed file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "segment-1_2.db.tmp")
+		f, err := os.Create(path)
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+
+		require.NoError(t, discardSegmentFile(f, path, nil))
+		_, err = os.Stat(path)
+		require.True(t, os.IsNotExist(err))
+	})
+
+	t.Run("tolerates already removed path", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "segment-1_2.db.tmp")
+		f, err := os.Create(path)
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+		require.NoError(t, os.Remove(path))
+
+		require.NoError(t, discardSegmentFile(f, path, nil))
+	})
+
+	t.Run("joins close/remove failures into the original error", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "segment-1_2.db.tmp")
+		f, err := os.Create(path)
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+
+		orig := fmt.Errorf("compaction failed")
+		got := discardSegmentFile(f, path, orig)
+		require.ErrorIs(t, got, orig)
+		_, err = os.Stat(path)
+		require.True(t, os.IsNotExist(err))
+	})
 }
 
 func TestSegmentGroup_CompactionCandidates(t *testing.T) {
