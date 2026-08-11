@@ -43,6 +43,8 @@ describe("setTimeout", () => {
     abortController.signal.addEventListener("abort", e => e.stopImmediatePropagation(), { once: true });
     const promise = setTimeout(60_000, undefined, { signal: abortController.signal });
     abortController.abort();
+    await Promise.resolve();
+    expect(Bun.peek.status(promise)).toBe("rejected");
     await expect(promise).rejects.toMatchObject({ name: "AbortError" });
   });
 });
@@ -76,6 +78,8 @@ describe("setImmediate", () => {
     abortController.signal.addEventListener("abort", e => e.stopImmediatePropagation(), { once: true });
     const promise = setImmediate(undefined, { signal: abortController.signal });
     abortController.abort();
+    await Promise.resolve();
+    expect(Bun.peek.status(promise)).toBe("rejected");
     await expect(promise).rejects.toMatchObject({ name: "AbortError" });
   });
 });
@@ -87,6 +91,8 @@ describe("setInterval", () => {
     const iterator = setInterval(60_000, "tick", { signal: abortController.signal });
     const nextPromise = iterator.next();
     abortController.abort();
+    await Promise.resolve();
+    expect(Bun.peek.status(nextPromise)).toBe("rejected");
     await expect(nextPromise).rejects.toMatchObject({ name: "AbortError" });
   });
 });

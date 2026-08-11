@@ -87,5 +87,7 @@ test("aborted resolves even if an earlier abort listener calls stopImmediateProp
   ac.signal.addEventListener("abort", e => e.stopImmediatePropagation(), { once: true });
   const abortedPromise = aborted(ac.signal, {});
   ac.abort();
+  await Promise.resolve();
+  expect(Bun.peek.status(abortedPromise)).toBe("fulfilled");
   await expect(abortedPromise).resolves.toBeUndefined();
 });
