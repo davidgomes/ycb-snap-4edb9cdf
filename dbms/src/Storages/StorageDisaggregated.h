@@ -1,0 +1,194 @@
+// Copyright 2023 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#pragma once
+
+#include <Common/Logger.h>
+#include <Common/config.h> // For ENABLE_NEXT_GEN_COLUMNAR
+#include <Flash/Coprocessor/DAGExpressionAnalyzer.h>
+#include <Flash/Coprocessor/DAGPipeline.h>
+#include <Flash/Coprocessor/RemoteRequest.h>
+#include <Flash/Mpp/MPPTaskId.h>
+#include <Interpreters/Context_fwd.h>
+#include <Interpreters/SharedContexts/Disagg.h>
+#include <Storages/DeltaMerge/ColumnDefine_fwd.h>
+#include <Storages/DeltaMerge/Filter/RSOperator_fwd.h>
+#include <Storages/DeltaMerge/Remote/DisaggTaskId.h>
+#include <Storages/DeltaMerge/Remote/RNWorkers_fwd.h>
+#include <Storages/DeltaMerge/ScanContext_fwd.h>
+#include <Storages/DeltaMerge/SegmentReadTask.h>
+#include <Storages/DeltaMerge/SegmentReadTaskPool.h>
+#include <Storages/IStorage.h>
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#include <kvproto/mpp.pb.h>
+#include <pingcap/kv/RegionCache.h>
+#include <tipb/executor.pb.h>
+#pragma GCC diagnostic pop
+
+namespace DB
+{
+class DAGContext;
+
+// StorageDisaggregated is a virtual IStorage which will that handle reading Block data  for tiflash-compute node under the disaggregated architecture. It will be used in two scenarios:
+// 1. For deployed with tiflash-write, StorageDisaggregated will build a `DisaggReadSnapshot` from tiflash-write and read data from the snapshot.
+// 2. For deployed with tikv columnar, StorageDisaggregated will read data from the columnar proxy.
+class StorageDisaggregated : public IStorage
+{
+public:
+    StorageDisaggregated(
+        Context & context_,
+        const TiDBTableScan & table_scan_,
+        const FilterConditions & filter_conditions_);
+
+    std::string getName() const override { return "StorageDisaggregated"; }
+
+    std::string getTableName() const override { return "StorageDisaggregated_" + table_scan.getTableScanExecutorID(); }
+
+    BlockInputStreams read(
+        const Names & column_names,
+        const SelectQueryInfo & query_info,
+        const Context & context,
+        QueryProcessingStage::Enum & processed_stage,
+        size_t max_block_size,
+        unsigned num_streams) override;
+
+    void read(
+        PipelineExecutorContext & exec_context,
+        PipelineExecGroupBuilder & group_builder,
+        const Names & /*column_names*/,
+        const SelectQueryInfo & /*query_info*/,
+        const Context & /*context*/,
+        size_t /*max_block_size*/,
+        unsigned num_streams) override;
+
+private:
+    // helper functions for building the task read from the disagg tiflash-write nodes
+    BlockInputStreams readThroughTiFlashWrite(const Context & db_context, unsigned num_streams);
+    void readThroughTiFlashWrite(
+        PipelineExecutorContext & exec_context,
+        PipelineExecGroupBuilder & group_builder,
+        const Context & db_context,
+        unsigned num_streams);
+
+    bool isReadColumnar();
+    // helper functions for building the task read from the columnar proxy nodes
+    BlockInputStreams readThroughColumnar(const Context & db_context, unsigned num_streams);
+    void readThroughColumnar(
+        PipelineExecutorContext & exec_context,
+        PipelineExecGroupBuilder & group_builder,
+        const Context & db_context,
+        unsigned num_streams);
+
+    DM::SegmentReadTasks buildReadTaskWithBackoff(const Context & db_context, const DM::ScanContextPtr & scan_context);
+
+    DM::SegmentReadTasks buildReadTask(const Context & db_context, const DM::ScanContextPtr & scan_context);
+
+    void buildReadTaskForWriteNode(
+        const Context & db_context,
+        const DM::ScanContextPtr & scan_context,
+        const pingcap::coprocessor::BatchCopTask & batch_cop_task,
+        std::mutex & output_lock,
+        DM::SegmentReadTasks & output_seg_tasks);
+
+    void buildReadTaskForWriteNodeTable(
+        const Context & db_context,
+        const DM::ScanContextPtr & scan_context,
+        const DM::DisaggTaskId & snapshot_id,
+        StoreID store_id,
+        const String & store_address,
+        const String & serialized_physical_table,
+        bool is_same_zone,
+        bool is_first_table,
+        size_t resp_size,
+        std::mutex & output_lock,
+        DM::SegmentReadTasks & output_seg_tasks);
+    bool isSameZone(const pingcap::coprocessor::BatchCopTask & batch_cop_task) const;
+
+    std::shared_ptr<disaggregated::EstablishDisaggTaskRequest> buildEstablishDisaggTaskReq(
+        const Context & db_context,
+        const pingcap::coprocessor::BatchCopTask & batch_cop_task);
+    std::tuple<DM::RSOperatorPtr, DM::ColumnRangePtr> buildRSOperatorAndColumnRange(
+        const Context & db_context,
+        const DM::ColumnDefinesPtr & columns_to_read);
+    std::tuple<std::variant<DM::Remote::RNWorkersPtr, DM::SegmentReadTaskPoolPtr>, DM::ColumnDefinesPtr> packSegmentReadTasks(
+        const Context & db_context,
+        DM::SegmentReadTasks && read_tasks,
+        const DM::ColumnDefinesPtr & column_defines,
+        const DM::ScanContextPtr & scan_context,
+        size_t num_streams,
+        int extra_table_id_index);
+    void buildRemoteSegmentInputStreams(
+        const Context & db_context,
+        DM::SegmentReadTasks && read_tasks,
+        size_t num_streams,
+        DAGPipeline & pipeline,
+        const DM::ScanContextPtr & scan_context);
+    void buildRemoteSegmentSourceOps(
+        PipelineExecutorContext & exec_context,
+        PipelineExecGroupBuilder & group_builder,
+        const Context & db_context,
+        DM::SegmentReadTasks && read_tasks,
+        size_t num_streams,
+        const DM::ScanContextPtr & scan_context);
+
+    using RemoteTableRange = std::pair<TableID, pingcap::coprocessor::KeyRanges>;
+    std::tuple<std::vector<RemoteTableRange>, UInt64> buildRemoteTableRanges();
+    std::vector<pingcap::coprocessor::BatchCopTask> buildBatchCopTasks(
+        const std::vector<RemoteTableRange> & remote_table_ranges,
+        const pingcap::kv::LabelFilter & label_filter);
+
+    void filterConditions(DAGExpressionAnalyzer & analyzer, DAGPipeline & pipeline);
+    void filterConditions(
+        PipelineExecutorContext & exec_context,
+        PipelineExecGroupBuilder & group_builder,
+        DAGExpressionAnalyzer & analyzer);
+#if ENABLE_NEXT_GEN_COLUMNAR
+    void filterConditionsWithPushedDownFilters(DAGExpressionAnalyzer & analyzer, DAGPipeline & pipeline);
+    void filterConditionsWithPushedDownFilters(
+        PipelineExecutorContext & exec_context,
+        PipelineExecGroupBuilder & group_builder,
+        DAGExpressionAnalyzer & analyzer);
+#endif
+    ExpressionActionsPtr getExtraCastExpr(
+        DAGExpressionAnalyzer & analyzer,
+        bool include_pushed_down_filter_columns = false);
+    void extraCast(
+        DAGExpressionAnalyzer & analyzer,
+        DAGPipeline & pipeline,
+        bool include_pushed_down_filter_columns = false);
+    void extraCast(
+        PipelineExecutorContext & exec_context,
+        PipelineExecGroupBuilder & group_builder,
+        DAGExpressionAnalyzer & analyzer,
+        bool include_pushed_down_filter_columns = false);
+    tipb::Executor buildTableScanTiPB();
+
+    size_t getBuildTaskRPCTimeout() const;
+    size_t getBuildTaskIOThreadPoolTimeout() const;
+
+private:
+    Context & context;
+    const TiDBTableScan & table_scan;
+    LoggerPtr log;
+    MPPTaskId sender_target_mpp_task_id;
+    const FilterConditions & filter_conditions;
+
+    std::unique_ptr<DAGExpressionAnalyzer> analyzer;
+    static constexpr auto ZONE_LABEL_KEY = "zone";
+    std::optional<String> zone_label;
+    // For generated column, just need a placeholder, and TiDB will fill this column.
+    std::vector<std::tuple<UInt64, String, DataTypePtr>> generated_column_infos;
+};
+} // namespace DB

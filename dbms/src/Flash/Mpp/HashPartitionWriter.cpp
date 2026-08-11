@@ -1,0 +1,265 @@
+// Copyright 2023 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <Common/TiFlashException.h>
+#include <Flash/Coprocessor/CHBlockChunkCodec.h>
+#include <Flash/Coprocessor/CHBlockChunkCodecV1.h>
+#include <Flash/Coprocessor/DAGContext.h>
+#include <Flash/Mpp/HashBaseWriterHelper.h>
+#include <Flash/Mpp/HashPartitionWriter.h>
+#include <Flash/Mpp/MPPTunnelSetWriter.h>
+#include <TiDB/Decode/TypeMapping.h>
+
+namespace DB
+{
+const char * HashPartitionWriterLabels[] = {"HashPartitionWriter", "HashPartitionWriter-V1"};
+
+template <class ExchangeWriterPtr>
+HashPartitionWriter<ExchangeWriterPtr>::HashPartitionWriter(
+    ExchangeWriterPtr writer_,
+    std::vector<Int64> partition_col_ids_,
+    TiDB::TiDBCollators collators_,
+    Int64 max_buffered_rows_,
+    UInt64 max_buffered_bytes_,
+    DAGContext & dag_context_,
+    MPPDataPacketVersion data_codec_version_,
+    tipb::CompressionMode compression_mode_)
+    : DAGResponseWriter(/*records_per_chunk=*/-1, dag_context_)
+    , writer(writer_)
+    , partition_col_ids(std::move(partition_col_ids_))
+    , collators(std::move(collators_))
+    , data_codec_version(data_codec_version_)
+    , compression_method(ToInternalCompressionMethod(compression_mode_))
+{
+    partition_num = writer_->getPartitionNum();
+    RUNTIME_CHECK(partition_num > 0);
+    RUNTIME_CHECK(dag_context.encode_type == tipb::EncodeType::TypeCHBlock);
+
+    switch (data_codec_version)
+    {
+    case MPPDataPacketV0:
+        if (max_buffered_rows_ <= 0)
+            max_buffered_rows_ = 1;
+        break;
+    case MPPDataPacketV1:
+    default:
+    {
+        // make `batch_send_min_limit` always GT 0
+        if (max_buffered_rows_ <= 0)
+        {
+            // set upper limit if not specified
+            max_buffered_rows_ = 8 * 1024 * partition_num /* 8K * partition-num */;
+        }
+        for (const auto & field_type : dag_context.result_field_types)
+        {
+            expected_types.emplace_back(getDataTypeByFieldTypeForComputingLayer(field_type));
+        }
+        break;
+    }
+    }
+    max_buffered_rows = static_cast<UInt64>(max_buffered_rows_);
+    max_buffered_bytes = max_buffered_bytes_;
+}
+
+template <class ExchangeWriterPtr>
+WriteResult HashPartitionWriter<ExchangeWriterPtr>::flush()
+{
+    has_pending_flush = false;
+    if (0 == buffered_rows)
+        return WriteResult::Done;
+
+    auto wait_res = waitForWritable();
+    if (wait_res == WaitResult::Ready)
+    {
+        switch (data_codec_version)
+        {
+        case MPPDataPacketV0:
+        {
+            partitionAndWriteBlocks();
+            break;
+        }
+        case MPPDataPacketV1:
+        default:
+        {
+            partitionAndWriteBlocksV1();
+            break;
+        }
+        }
+        return WriteResult::Done;
+    }
+    // set has_pending_flush to true since current flush is not done
+    has_pending_flush = true;
+    return wait_res == WaitResult::WaitForPolling ? WriteResult::NeedWaitForPolling : WriteResult::NeedWaitForNotify;
+}
+
+template <class ExchangeWriterPtr>
+WaitResult HashPartitionWriter<ExchangeWriterPtr>::waitForWritable() const
+{
+    return writer->waitForWritable();
+}
+
+template <class ExchangeWriterPtr>
+WriteResult HashPartitionWriter<ExchangeWriterPtr>::write(const Block & block)
+{
+    assert(has_pending_flush == false);
+    RUNTIME_CHECK_MSG(
+        block.columns() == dag_context.result_field_types.size(),
+        "Output column size mismatch with field type size");
+
+    size_t rows = 0;
+    if (block.info.selective)
+        rows = block.info.selective->size();
+    else
+        rows = block.rows();
+
+    if (rows > 0)
+    {
+        buffered_rows += rows;
+        buffered_bytes += block.allocatedBytes();
+        blocks.push_back(block);
+    }
+
+    if (needFlush())
+        return flush();
+    return WriteResult::Done;
+}
+
+template <class ExchangeWriterPtr>
+void HashPartitionWriter<ExchangeWriterPtr>::partitionAndWriteBlocksV1()
+{
+    assert(buffered_rows > 0);
+    assert(buffered_bytes > 0);
+    assert(!blocks.empty());
+
+    HashBaseWriterHelper::materializeBlocks(blocks);
+    // All blocks are same, use one block's meta info as header
+    Block dest_block_header = blocks.back().cloneEmpty();
+    std::vector<String> partition_key_containers(collators.size());
+    std::vector<std::vector<MutableColumns>> dest_columns(partition_num);
+    size_t total_rows = 0;
+
+    for (auto & block : blocks)
+    {
+        {
+            // check schema
+            assertBlockSchema(expected_types, block, HashPartitionWriterLabels[MPPDataPacketV1]);
+        }
+        auto && dest_tbl_cols = HashBaseWriterHelper::createDestColumns(block, partition_num);
+        if (block.info.selective)
+            HashBaseWriterHelper::scatterColumnsSelectiveBlock(
+                block,
+                partition_col_ids,
+                collators,
+                partition_key_containers,
+                partition_num,
+                dest_tbl_cols);
+        else
+            HashBaseWriterHelper::scatterColumns(
+                block,
+                partition_col_ids,
+                collators,
+                partition_key_containers,
+                partition_num,
+                dest_tbl_cols);
+        block.clear();
+
+        for (size_t part_id = 0; part_id < partition_num; ++part_id)
+        {
+            auto & columns = dest_tbl_cols[part_id];
+            if unlikely (!columns.front())
+                continue;
+            size_t expect_size = columns.front()->size();
+            total_rows += expect_size;
+            dest_columns[part_id].emplace_back(std::move(columns));
+        }
+    }
+    blocks.clear();
+    RUNTIME_CHECK(buffered_rows, total_rows);
+
+    for (size_t part_id = 0; part_id < partition_num; ++part_id)
+    {
+        writer->partitionWrite(
+            dest_block_header,
+            std::move(dest_columns[part_id]),
+            part_id,
+            data_codec_version,
+            compression_method);
+    }
+
+    assert(blocks.empty());
+    buffered_rows = 0;
+    buffered_bytes = 0;
+}
+
+template <class ExchangeWriterPtr>
+void HashPartitionWriter<ExchangeWriterPtr>::partitionAndWriteBlocks()
+{
+    assert(!blocks.empty());
+
+    std::vector<Blocks> partition_blocks;
+    partition_blocks.resize(partition_num);
+    {
+        HashBaseWriterHelper::materializeBlocks(blocks);
+        std::vector<String> partition_key_containers(collators.size());
+
+        Block header = blocks[0].cloneEmpty();
+        while (!blocks.empty())
+        {
+            const auto & block = blocks.back();
+            auto dest_tbl_cols = HashBaseWriterHelper::createDestColumns(block, partition_num);
+            if (block.info.selective)
+                HashBaseWriterHelper::scatterColumnsSelectiveBlock(
+                    block,
+                    partition_col_ids,
+                    collators,
+                    partition_key_containers,
+                    partition_num,
+                    dest_tbl_cols);
+            else
+                HashBaseWriterHelper::scatterColumns(
+                    block,
+                    partition_col_ids,
+                    collators,
+                    partition_key_containers,
+                    partition_num,
+                    dest_tbl_cols);
+
+            blocks.pop_back();
+
+            for (size_t part_id = 0; part_id < partition_num; ++part_id)
+            {
+                Block dest_block = header.cloneEmpty();
+                dest_block.setColumns(std::move(dest_tbl_cols[part_id]));
+                if (dest_block.rows() > 0)
+                    partition_blocks[part_id].push_back(std::move(dest_block));
+            }
+        }
+        assert(blocks.empty());
+        buffered_rows = 0;
+        buffered_bytes = 0;
+    }
+
+    for (size_t part_id = 0; part_id < partition_num; ++part_id)
+    {
+        auto & blocks = partition_blocks[part_id];
+        writer->partitionWrite(blocks, part_id);
+        blocks.clear();
+    }
+}
+
+template class HashPartitionWriter<SyncMPPTunnelSetWriterPtr>;
+template class HashPartitionWriter<AsyncMPPTunnelSetWriterPtr>;
+
+
+} // namespace DB

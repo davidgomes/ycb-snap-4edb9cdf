@@ -1,0 +1,296 @@
+// Copyright 2023 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <DataStreams/ExpressionBlockInputStream.h>
+#include <Flash/Coprocessor/DAGContext.h>
+#include <Flash/Coprocessor/DAGUtils.h>
+#include <Flash/Coprocessor/InterpreterUtils.h>
+#include <Flash/Coprocessor/RequestUtils.h>
+#include <Interpreters/Context.h>
+#include <Interpreters/SharedContexts/Disagg.h>
+#include <Operators/ExpressionTransformOp.h>
+#include <Storages/KVStore/KVStore.h>
+#include <Storages/KVStore/TMTContext.h>
+#include <Storages/KVStore/Types.h>
+#include <Storages/S3/S3Common.h>
+#include <Storages/StorageDisaggregated.h>
+#include <kvproto/kvrpcpb.pb.h>
+
+#include <magic_enum.hpp>
+
+
+namespace DB
+{
+StorageDisaggregated::StorageDisaggregated(
+    Context & context_,
+    const TiDBTableScan & table_scan_,
+    const FilterConditions & filter_conditions_)
+    : context(context_)
+    , table_scan(table_scan_)
+    , log(Logger::get(context_.getDAGContext()->log ? context_.getDAGContext()->log->identifier() : ""))
+    , sender_target_mpp_task_id(context_.getDAGContext()->getMPPTaskMeta())
+    , filter_conditions(filter_conditions_)
+{
+    if (context.getSharedContextDisagg()->use_columnar)
+        return;
+
+    const auto my_store_id = context.getTMTContext().getKVStore()->getStoreID();
+    pingcap::kv::Backoffer bo(pingcap::kv::copBuildTaskMaxBackoff);
+    // TODO: PD may not have label info of CN when AutoScaler is enabled.
+    // Need to find a way to fix that later.
+    const auto store_labels = context.getTMTContext().getKVCluster()->region_cache->getStore(bo, my_store_id).labels;
+    auto iter = store_labels.find(ZONE_LABEL_KEY);
+    if (iter != store_labels.end())
+        zone_label = std::make_optional(iter->second);
+}
+
+BlockInputStreams StorageDisaggregated::read(
+    const Names &,
+    const SelectQueryInfo & /*query_info*/,
+    const Context & db_context,
+    QueryProcessingStage::Enum &,
+    size_t,
+    unsigned num_streams)
+{
+    RUNTIME_CHECK_MSG(
+        db_context.getSharedContextDisagg()->disaggregated_mode != DisaggregatedMode::None,
+        "storage disaggregated mode must disaggregated, mode={}",
+        magic_enum::enum_name(db_context.getSharedContextDisagg()->disaggregated_mode));
+    if (isReadColumnar())
+        return readThroughColumnar(context, num_streams);
+    return readThroughTiFlashWrite(db_context, num_streams);
+}
+
+void StorageDisaggregated::read(
+    PipelineExecutorContext & exec_context,
+    PipelineExecGroupBuilder & group_builder,
+    const Names & /*column_names*/,
+    const SelectQueryInfo & /*query_info*/,
+    const Context & db_context,
+    size_t /*max_block_size*/,
+    unsigned num_streams)
+{
+    RUNTIME_CHECK_MSG(
+        db_context.getSharedContextDisagg()->disaggregated_mode != DisaggregatedMode::None,
+        "storage disaggregated mode must disaggregated, mode={}",
+        magic_enum::enum_name(db_context.getSharedContextDisagg()->disaggregated_mode));
+    if (isReadColumnar())
+        return readThroughColumnar(exec_context, group_builder, context, num_streams);
+    return readThroughTiFlashWrite(exec_context, group_builder, db_context, num_streams);
+}
+
+bool StorageDisaggregated::isReadColumnar()
+{
+#if ENABLE_NEXT_GEN_COLUMNAR == 1
+    return context.getSharedContextDisagg()->use_columnar;
+#else
+    static_cast<void>(context);
+    return false;
+#endif
+}
+
+std::tuple<std::vector<StorageDisaggregated::RemoteTableRange>, UInt64> StorageDisaggregated::buildRemoteTableRanges()
+{
+    std::unordered_map<TableID, RegionRetryList> all_remote_regions;
+    UInt64 region_num = 0;
+    for (auto physical_table_id : table_scan.getPhysicalTableIDs())
+    {
+        const auto & table_regions_info = context.getDAGContext()->getTableRegionsInfoByTableID(physical_table_id);
+
+        RUNTIME_CHECK_MSG(
+            table_regions_info.local_regions.empty(),
+            "in disaggregated_compute_mode, local_regions should be empty");
+        region_num += table_regions_info.remote_regions.size();
+        for (const auto & reg : table_regions_info.remote_regions)
+            all_remote_regions[physical_table_id].emplace_back(std::cref(reg));
+    }
+
+    std::vector<RemoteTableRange> remote_table_ranges;
+    for (auto physical_table_id : table_scan.getPhysicalTableIDs())
+    {
+        const auto & remote_regions = all_remote_regions[physical_table_id];
+        if (remote_regions.empty())
+            continue;
+        auto key_ranges = RemoteRequest::buildKeyRanges(remote_regions);
+        remote_table_ranges.emplace_back(RemoteTableRange{physical_table_id, key_ranges});
+    }
+    return std::make_tuple(std::move(remote_table_ranges), region_num);
+}
+
+std::vector<pingcap::coprocessor::BatchCopTask> StorageDisaggregated::buildBatchCopTasks(
+    const std::vector<RemoteTableRange> & remote_table_ranges,
+    const pingcap::kv::LabelFilter & label_filter)
+{
+    std::vector<TableID> physical_table_ids;
+    physical_table_ids.reserve(remote_table_ranges.size());
+    std::vector<pingcap::coprocessor::KeyRanges> ranges_for_each_physical_table;
+    ranges_for_each_physical_table.reserve(remote_table_ranges.size());
+    for (const auto & remote_table_range : remote_table_ranges)
+    {
+        physical_table_ids.emplace_back(remote_table_range.first);
+        ranges_for_each_physical_table.emplace_back(remote_table_range.second);
+    }
+    bool has_ann_query = table_scan.getANNQueryInfo().query_type() != tipb::ANNQueryType::InvalidQueryType;
+    pingcap::kv::Cluster * cluster = context.getTMTContext().getKVCluster();
+    pingcap::kv::Backoffer bo(pingcap::kv::copBuildTaskMaxBackoff);
+    pingcap::kv::StoreType store_type = pingcap::kv::StoreType::TiFlash;
+    auto batch_cop_tasks = pingcap::coprocessor::buildBatchCopTasks(
+        bo,
+        cluster,
+        /*is_mpp=*/true,
+        table_scan.isPartitionTableScan(),
+        physical_table_ids,
+        ranges_for_each_physical_table,
+        context.getStoreIdBlockList(),
+        store_type,
+        label_filter,
+        &Poco::Logger::get("pingcap/coprocessor"),
+        has_ann_query);
+    LOG_DEBUG(log, "batch cop tasks(nums: {}) build finish for tiflash_storage node", batch_cop_tasks.size());
+    return batch_cop_tasks;
+}
+
+tipb::Executor StorageDisaggregated::buildTableScanTiPB()
+{
+    // TODO: For now, to avoid versions of tiflash_compute nodes and tiflash_storage being different,
+    // disable filter push down to avoid unsupported expression in tiflash_storage.
+    // Uncomment this when we are sure versions are same.
+    // executor = filter_conditions.constructSelectionForRemoteRead(dag_req.mutable_root_executor());
+
+    tipb::Executor ts_exec;
+    ts_exec.set_tp(tipb::ExecType::TypeTableScan);
+    ts_exec.set_executor_id(table_scan.getTableScanExecutorID());
+
+    // In disaggregated mode, use DAGRequest sent from TiDB directly, so no need to rely on SchemaSyncer.
+    if (table_scan.isPartitionTableScan())
+    {
+        ts_exec.set_tp(tipb::ExecType::TypePartitionTableScan);
+        auto * mutable_partition_table_scan = ts_exec.mutable_partition_table_scan();
+        *mutable_partition_table_scan = table_scan.getTableScanPB()->partition_table_scan();
+    }
+    else
+    {
+        ts_exec.set_tp(tipb::ExecType::TypeTableScan);
+        auto * mutable_table_scan = ts_exec.mutable_tbl_scan();
+        *mutable_table_scan = table_scan.getTableScanPB()->tbl_scan();
+    }
+    return ts_exec;
+}
+
+void StorageDisaggregated::filterConditions(DAGExpressionAnalyzer & analyzer, DAGPipeline & pipeline)
+{
+    if (filter_conditions.hasValue())
+    {
+        // No need to cast, because already done by tiflash_storage node.
+        ::DB::executePushedDownFilter(filter_conditions, analyzer, log, pipeline);
+
+        auto & profile_streams = context.getDAGContext()->getProfileStreamsMap()[filter_conditions.executor_id];
+        pipeline.transform([&profile_streams](auto & stream) { profile_streams.push_back(stream); });
+    }
+}
+
+void StorageDisaggregated::filterConditions(
+    PipelineExecutorContext & exec_context,
+    PipelineExecGroupBuilder & group_builder,
+    DAGExpressionAnalyzer & analyzer)
+{
+    if (filter_conditions.hasValue())
+    {
+        ::DB::executePushedDownFilter(exec_context, group_builder, filter_conditions, analyzer, log);
+        context.getDAGContext()->addOperatorProfileInfos(
+            filter_conditions.executor_id,
+            group_builder.getCurProfileInfos());
+    }
+}
+
+ExpressionActionsPtr StorageDisaggregated::getExtraCastExpr(
+    DAGExpressionAnalyzer & analyzer,
+    bool include_pushed_down_filter_columns)
+{
+    const bool need_timezone_cast = !context.getTimezoneInfo().is_utc_timezone;
+    bool has_cast_candidate = false;
+    for (const auto & col : table_scan.getColumns())
+    {
+        if (col.hasGeneratedColumnFlag() || col.id == -1)
+            continue;
+        if ((need_timezone_cast && col.tp == TiDB::TypeTimestamp) || col.tp == TiDB::TypeTime)
+        {
+            has_cast_candidate = true;
+            break;
+        }
+    }
+    if (!has_cast_candidate)
+        return nullptr;
+
+    std::vector<UInt8> may_need_add_cast_column;
+    may_need_add_cast_column.reserve(table_scan.getColumnSize());
+    std::unordered_set<ColumnID> filter_col_id_set;
+    if (!include_pushed_down_filter_columns)
+    {
+        for (const auto & expr : table_scan.getPushedDownFilters())
+            getColumnIDsFromExpr(expr, table_scan.getColumns(), filter_col_id_set);
+    }
+    for (const auto & col : table_scan.getColumns())
+    {
+        bool need_cast = !col.hasGeneratedColumnFlag() && col.id != -1;
+        if (!include_pushed_down_filter_columns)
+            need_cast = need_cast && !filter_col_id_set.contains(col.id);
+        may_need_add_cast_column.push_back(need_cast);
+    }
+    bool has_need_cast_column = std::find(may_need_add_cast_column.begin(), may_need_add_cast_column.end(), true)
+        != may_need_add_cast_column.end();
+    ExpressionActionsChain chain;
+    if (has_need_cast_column && analyzer.appendExtraCastsAfterTS(chain, may_need_add_cast_column, table_scan))
+    {
+        ExpressionActionsPtr extra_cast = chain.getLastActions();
+        chain.finalize();
+        chain.clear();
+        return extra_cast;
+    }
+    else
+    {
+        return nullptr;
+    }
+}
+
+void StorageDisaggregated::extraCast(
+    DAGExpressionAnalyzer & analyzer,
+    DAGPipeline & pipeline,
+    bool include_pushed_down_filter_columns)
+{
+    if (auto extra_cast = getExtraCastExpr(analyzer, include_pushed_down_filter_columns); extra_cast)
+    {
+        pipeline.transform([&](auto & stream) {
+            stream = std::make_shared<ExpressionBlockInputStream>(stream, extra_cast, log->identifier());
+            stream->setExtraInfo("cast after local tableScan");
+        });
+    }
+}
+
+void StorageDisaggregated::extraCast(
+    PipelineExecutorContext & exec_context,
+    PipelineExecGroupBuilder & group_builder,
+    DAGExpressionAnalyzer & analyzer,
+    bool include_pushed_down_filter_columns)
+{
+    if (auto extra_cast = getExtraCastExpr(analyzer, include_pushed_down_filter_columns); extra_cast)
+    {
+        group_builder.transform([&](auto & builder) {
+            builder.appendTransformOp(
+                std::make_unique<ExpressionTransformOp>(exec_context, log->identifier(), extra_cast));
+        });
+    }
+}
+
+} // namespace DB

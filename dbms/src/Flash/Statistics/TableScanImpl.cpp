@@ -1,0 +1,237 @@
+// Copyright 2023 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <Common/formatReadable.h>
+#include <DataStreams/TiRemoteBlockInputStream.h>
+#include <Flash/Coprocessor/ColumnarScanContext.h>
+#include <Flash/Statistics/ConnectionProfileInfo.h>
+#include <Flash/Statistics/TableScanImpl.h>
+#include <Interpreters/Join.h>
+#include <Storages/DeltaMerge/ReadThread/UnorderedInputStream.h>
+#include <Storages/DeltaMerge/Remote/RNSegmentInputStream.h>
+#include <Storages/DeltaMerge/ScanContext.h>
+
+namespace DB
+{
+String TableScanTimeDetail::toJson() const
+{
+    if (num_streams == 0)
+        return R"("num_streams":0)";
+    auto max_cost_ms = max_stream_cost_ns < 0 ? 0 : max_stream_cost_ns / 1'000'000.0;
+    auto min_cost_ms = min_stream_cost_ns < 0 ? 0 : min_stream_cost_ns / 1'000'000.0;
+    return fmt::format(
+        R"("max":{},"min":{},"num_streams":{},"rows_per_sec":{:.3f},"bytes_per_sec":"{}")",
+        max_cost_ms,
+        min_cost_ms,
+        num_streams,
+        total_speed_rows_per_sec,
+        ReadableSize(total_speed_bytes_per_sec));
+}
+String LocalTableScanDetail::toJson() const
+{
+    return fmt::format(R"({{"is_local":true,"bytes":{},{}}})", bytes, time_detail.toJson());
+}
+String RemoteTableScanDetail::toJson() const
+{
+    return fmt::format(
+        R"({{"{}":{{"packets":{},"bytes":{}}},"{}":{{"packets":{},"bytes":{}}},{}}})",
+        inner_zone_conn_profile_info.getTypeString(),
+        inner_zone_conn_profile_info.packets,
+        inner_zone_conn_profile_info.bytes,
+        inter_zone_conn_profile_info.getTypeString(),
+        inter_zone_conn_profile_info.packets,
+        inter_zone_conn_profile_info.bytes,
+        time_detail.toJson());
+}
+void TableScanStatistics::appendExtraJson(FmtBuffer & fmt_buffer) const
+{
+    auto columnar_scan_ctx_it = dag_context.columnar_scan_context_map.find(executor_id);
+    auto scan_ctx_it = dag_context.scan_context_map.find(executor_id);
+    // A table scan runs on either the columnar path or the DeltaMerge path, so tracing should only show one.
+    const bool has_columnar_scan_ctx
+        = columnar_scan_ctx_it != dag_context.columnar_scan_context_map.end() && columnar_scan_ctx_it->second;
+    const char * scan_details = "{}";
+    String scan_details_buf;
+    if (has_columnar_scan_ctx)
+    {
+        scan_details_buf = columnar_scan_ctx_it->second->toJson();
+        scan_details = scan_details_buf.c_str();
+    }
+    else if (scan_ctx_it != dag_context.scan_context_map.end() && scan_ctx_it->second)
+    {
+        scan_details_buf = scan_ctx_it->second->toJson();
+        scan_details = scan_details_buf.c_str();
+    }
+    fmt_buffer.fmtAppend(
+        R"("connection_details":[{},{}],"scan_details":{})",
+        local_table_scan_detail.toJson(),
+        remote_table_scan_detail.toJson(),
+        scan_details);
+}
+
+void TableScanStatistics::updateTableScanDetail(const std::vector<ConnectionProfileInfo> & connection_profile_infos)
+{
+    for (const auto & connection_profile_info : connection_profile_infos)
+    {
+        if (connection_profile_info.type == ConnectionProfileInfo::InnerZoneRemote)
+        {
+            remote_table_scan_detail.inner_zone_conn_profile_info.packets += connection_profile_info.packets;
+            remote_table_scan_detail.inner_zone_conn_profile_info.bytes += connection_profile_info.bytes;
+        }
+        else
+        {
+            remote_table_scan_detail.inter_zone_conn_profile_info.packets += connection_profile_info.packets;
+            remote_table_scan_detail.inter_zone_conn_profile_info.bytes += connection_profile_info.bytes;
+        }
+        // Whether it's for remote read (non-disaggregated mode) or communication between CN and WN (disaggregated mode),
+        // send bytes are always collected on the node that sends the request (i.e., the node where the table scan executor resides).
+        // Therefore, both send bytes and receive bytes are collected here.
+        base.updateSendConnectionInfo(connection_profile_info);
+        base.updateReceiveConnectionInfo(connection_profile_info);
+    }
+}
+
+void TableScanStatistics::updateTableScanDetailForDisaggIfNecessary(const IProfilingBlockInputStream * stream)
+{
+    if (const auto * unordered_stream = dynamic_cast<const DM::UnorderedInputStream *>(stream))
+        updateTableScanDetail(unordered_stream->getConnectionProfileInfos());
+    else if (const auto * rn_segment_stream = dynamic_cast<const DM::Remote::RNSegmentInputStream *>(stream))
+        updateTableScanDetail(rn_segment_stream->getConnectionProfileInfos());
+}
+
+void TableScanStatistics::collectExtraRuntimeDetail()
+{
+    switch (dag_context.getExecutionMode())
+    {
+    case ExecutionMode::None:
+        break;
+    case ExecutionMode::Stream:
+        transformInBoundIOProfileForStream(dag_context, executor_id, [&](const IBlockInputStream & stream) {
+            if (const auto * cop_stream = dynamic_cast<const CoprocessorBlockInputStream *>(&stream); cop_stream)
+            {
+                /// remote read
+                updateTableScanDetail(cop_stream->getConnectionProfileInfos());
+                // TODO: Can not get the execution time of remote read streams?
+            }
+            else if (const auto * local_stream = dynamic_cast<const IProfilingBlockInputStream *>(&stream);
+                     local_stream)
+            {
+                updateTableScanDetailForDisaggIfNecessary(local_stream);
+
+                /// local read input stream also is IProfilingBlockInputStream
+                const auto & prof = local_stream->getProfileInfo();
+                local_table_scan_detail.bytes += prof.bytes;
+                const double this_execution_time = prof.execution_time * 1.0;
+                // collect the avg rows_per_second and bytes_per_second of local read
+                const double this_execution_time_sec = this_execution_time / 1'000'000'000.0;
+                double bytes_per_second = prof.bytes / this_execution_time_sec;
+                double rows_per_second = prof.rows / this_execution_time_sec;
+                local_table_scan_detail.time_detail.num_streams += 1;
+                local_table_scan_detail.time_detail.total_speed_bytes_per_sec += bytes_per_second;
+                local_table_scan_detail.time_detail.total_speed_rows_per_sec += rows_per_second;
+                LOG_INFO(
+                    dag_context.log,
+                    "TableScan local stream details, rows={} bytes={} cost={:.3f}s rows_speed={:.3f} bytes_speed={}",
+                    prof.rows,
+                    ReadableSize(prof.bytes),
+                    this_execution_time_sec,
+                    rows_per_second,
+                    ReadableSize(bytes_per_second));
+                if (local_table_scan_detail.time_detail.max_stream_cost_ns < 0.0 // not inited
+                    || local_table_scan_detail.time_detail.max_stream_cost_ns < this_execution_time)
+                    local_table_scan_detail.time_detail.max_stream_cost_ns = this_execution_time;
+                if (local_table_scan_detail.time_detail.min_stream_cost_ns < 0.0 // not inited
+                    || local_table_scan_detail.time_detail.min_stream_cost_ns > this_execution_time)
+                    local_table_scan_detail.time_detail.min_stream_cost_ns = this_execution_time;
+            }
+            else
+            {
+                /// Streams like: NullBlockInputStream.
+            }
+        });
+        break;
+    case ExecutionMode::Pipeline:
+        transformInBoundIOProfileForPipeline(dag_context, executor_id, [&](const IOProfileInfo & profile_info) {
+            if (profile_info.is_local)
+            {
+                local_table_scan_detail.bytes += profile_info.operator_info->bytes;
+                const double this_execution_time = profile_info.operator_info->execution_time * 1.0;
+                // collect the avg rows_per_second and bytes_per_second of local read
+                const double this_execution_time_sec = this_execution_time / 1'000'000'000.0;
+                double bytes_per_second = profile_info.operator_info->bytes / this_execution_time_sec;
+                double rows_per_second = profile_info.operator_info->rows / this_execution_time_sec;
+                local_table_scan_detail.time_detail.num_streams += 1;
+                local_table_scan_detail.time_detail.total_speed_bytes_per_sec += bytes_per_second;
+                local_table_scan_detail.time_detail.total_speed_rows_per_sec += rows_per_second;
+                LOG_INFO(
+                    dag_context.log,
+                    "TableScan local stream details, rows={} bytes={} cost={:.3f}s rows_speed={:.3f}/s "
+                    "bytes_speed={}/s",
+                    profile_info.operator_info->rows,
+                    ReadableSize(profile_info.operator_info->bytes),
+                    this_execution_time_sec,
+                    rows_per_second,
+                    ReadableSize(bytes_per_second));
+                if (local_table_scan_detail.time_detail.max_stream_cost_ns < 0.0 // not inited
+                    || local_table_scan_detail.time_detail.max_stream_cost_ns < this_execution_time)
+                    local_table_scan_detail.time_detail.max_stream_cost_ns = this_execution_time;
+                if (local_table_scan_detail.time_detail.min_stream_cost_ns < 0.0 // not inited
+                    || local_table_scan_detail.time_detail.min_stream_cost_ns > this_execution_time)
+                    local_table_scan_detail.time_detail.min_stream_cost_ns = this_execution_time;
+            }
+            else
+            {
+                updateTableScanDetail(profile_info.connection_profile_infos);
+                const double this_execution_time = profile_info.operator_info->execution_time * 1.0;
+                // collect the avg rows_per_second and bytes_per_second of remote read
+                const double this_execution_time_sec = this_execution_time / 1'000'000'000.0;
+                double bytes_per_second = profile_info.operator_info->bytes / this_execution_time_sec;
+                double rows_per_second = profile_info.operator_info->rows / this_execution_time_sec;
+                remote_table_scan_detail.time_detail.num_streams += 1;
+                remote_table_scan_detail.time_detail.total_speed_bytes_per_sec += bytes_per_second;
+                remote_table_scan_detail.time_detail.total_speed_rows_per_sec += rows_per_second;
+                LOG_INFO(
+                    dag_context.log,
+                    "TableScan remote stream details, rows={} bytes={} cost={:.3f}s rows_speed={:.3f}/s "
+                    "bytes_speed={}/s",
+                    profile_info.operator_info->rows,
+                    ReadableSize(profile_info.operator_info->bytes),
+                    this_execution_time_sec,
+                    rows_per_second,
+                    ReadableSize(bytes_per_second));
+                if (remote_table_scan_detail.time_detail.max_stream_cost_ns < 0.0 // not inited
+                    || remote_table_scan_detail.time_detail.max_stream_cost_ns < this_execution_time)
+                    remote_table_scan_detail.time_detail.max_stream_cost_ns = this_execution_time;
+                if (remote_table_scan_detail.time_detail.min_stream_cost_ns < 0.0 // not inited
+                    || remote_table_scan_detail.time_detail.min_stream_cost_ns > this_execution_time)
+                    remote_table_scan_detail.time_detail.min_stream_cost_ns = this_execution_time;
+            }
+        });
+        break;
+    }
+
+    if (auto it = dag_context.scan_context_map.find(executor_id); it != dag_context.scan_context_map.end())
+    {
+        it->second->setStreamCost(
+            std::max(local_table_scan_detail.time_detail.min_stream_cost_ns, 0.0),
+            std::max(local_table_scan_detail.time_detail.max_stream_cost_ns, 0.0),
+            std::max(remote_table_scan_detail.time_detail.min_stream_cost_ns, 0.0),
+            std::max(remote_table_scan_detail.time_detail.max_stream_cost_ns, 0.0));
+    }
+}
+
+TableScanStatistics::TableScanStatistics(const tipb::Executor * executor, DAGContext & dag_context_)
+    : TableScanStatisticsBase(executor, dag_context_)
+{}
+} // namespace DB

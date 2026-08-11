@@ -1,0 +1,59 @@
+# syntax=docker/dockerfile:1
+# Copyright 2025 PingCAP, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ===========================
+# Base
+FROM quay.io/rockylinux/rockylinux:8.10.20240528-ubi AS base
+
+ARG arch
+RUN mkdir /misc
+# Do not copy misc/* here, otherwise modifying unnecessary files will cause cache invalidation
+COPY misc/_bake_include.sh /misc/
+COPY misc/bake_base.sh /misc/
+RUN sh /misc/bake_base.sh
+
+# ===========================
+# Base + LLVM
+FROM base AS llvm
+
+ARG arch
+# Do not copy misc/* here, otherwise modifying unnecessary files will cause cache invalidation
+COPY misc/bake_llvm.sh /misc/
+RUN sh /misc/bake_llvm.sh
+
+ENV PATH="/opt/cmake/bin:/usr/local/bin/:${PATH}:/usr/local/go/bin:/root/.cargo/bin" \
+    LIBRARY_PATH="/usr/local/lib/${arch}-unknown-linux-gnu/:${LIBRARY_PATH}" \
+    LD_LIBRARY_PATH="/usr/local/lib/${arch}-unknown-linux-gnu/:${LD_LIBRARY_PATH}" \
+    CPLUS_INCLUDE_PATH="/usr/local/include/${arch}-unknown-linux-gnu/c++/v1/:${CPLUS_INCLUDE_PATH}" \
+    CC=clang \
+    CXX=clang++ \
+    LD=ld.lld
+
+# ===========================
+# Base + LLVM + Rest (OpenSSL, Rust, etc)
+FROM llvm
+
+ARG arch
+
+COPY misc/* /misc/
+RUN sh /misc/bake_rest.sh
+
+ENV OPENSSL_ROOT_DIR="/usr/local/opt/openssl"
+
+USER root
+WORKDIR /root/
+ENV HOME /root/
+ENV TZ Asia/Shanghai
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone

@@ -1,0 +1,182 @@
+# Copyright 2023 PingCAP, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Preparation.
+=> DBGInvoke __enable_schema_sync_service('false')
+
+=> DBGInvoke __drop_tidb_table(default, test)
+
+
+
+# Sync add column by reading.
+=> DBGInvoke __mock_tidb_table(default, test, 'col_1 String')
+=> DBGInvoke __refresh_mapped_table_schema(default, test)
+=> DBGInvoke __put_region(4, 0, 100, default, test)
+=> DBGInvoke __add_column_to_tidb_table(default, test, 'col_2 Nullable(Int8)')
+=> DBGInvoke __raft_insert_row(default, test, 4, 50, 'test1', 1)
+# Data in region cache with tso greater than read tso will be ignored.
+
+>> DBGInvoke query_mapped('select * from \$d.\$t', default, test) " --read_tso "1500000000000000
+
+# Data in region cache with tso less than read tso will be force decoded (extra column will be discarded), even under an out-of-date schema.
+>> DBGInvoke query_mapped('select col_1 from \$d.\$t', default, test)
+┌─col_1─┐
+│ test1 │
+└───────┘
+
+>> DBGInvoke query_mapped('select col_2 from \$d.\$t', default, test)
+┌─col_2─┐
+│     1 │
+└───────┘
+
+# Sync drop column by reading.
+=> DBGInvoke __try_flush_region(4)
+=> DBGInvoke __drop_column_from_tidb_table(default, test, col_1)
+=> DBGInvoke __raft_insert_row(default, test, 4, 51, 2)
+
+>> DBGInvoke query_mapped('select col_1 from \$d.\$t', default, test)
+Received exception from server (version {#WORD}):
+Code: 47. DB::Exception: Received from {#WORD} DB::Exception: Unknown identifier: col_1.
+
+# Sync type change by checking sign overflow in CH when flushing.
+=> DBGInvoke __try_flush_region(4)
+=> DBGInvoke __modify_column_in_tidb_table(default, test, 'col_2 Nullable(Int16)')
+=> DBGInvoke __raft_insert_row(default, test, 4, 52, -128)
+>> DBGInvoke query_mapped('select col_2 from \$d.\$t', default, test)
+┌─col_2─┐
+│     1 │
+│     2 │
+│  -128 │
+└───────┘
+=> DBGInvoke query_mapped('desc \$d.\$t', default, test)
+┌─name────────┬─type───────────┬─default_type─┬─default_expression─┐
+│ _tidb_rowid │ Int64          │              │                    │
+│ col_2       │ Nullable(Int16)│              │                    │
+└─────────────┴────────────────┴──────────────┴────────────────────┘
+=> DBGInvoke __raft_insert_row(default, test, 4, 53, 128)
+
+# Read with specified bigger schema version will trigger schema sync.
+=> DBGInvoke query_mapped('select col_2 from \$d.\$t', default, test)
+┌─col_2─┐
+│     1 │
+│     2 │
+│  -128 │
+│   128 │
+└───────┘
+
+# Sync type change by checking value overflow in CH when flushing.
+=> DBGInvoke __try_flush_region(4)
+=> DBGInvoke __modify_column_in_tidb_table(default, test, 'col_2 Nullable(Int64)')
+=> DBGInvoke __raft_insert_row(default, test, 4, 54, 65536)
+
+# Read with specified bigger schema version will trigger schema sync.
+=> DBGInvoke query_mapped('select col_2 from \$d.\$t', default, test)
+┌─col_2─┐
+│     1 │
+│     2 │
+│  -128 │
+│   128 │
+│ 65536 │
+└───────┘
+
+# Sync add column and type change together by checking value overflow in CH when flushing.
+=> DBGInvoke __try_flush_region(4)
+=> DBGInvoke __add_column_to_tidb_table(default, test, 'col_3 UInt8')
+=> DBGInvoke __refresh_mapped_table_schema(default, test)
+=> DBGInvoke __modify_column_in_tidb_table(default, test, 'col_3 UInt64')
+=> DBGInvoke __raft_insert_row(default, test, 4, 55, 0, 256)
+=> DBGInvoke __add_column_to_tidb_table(default, test, 'col_4 Nullable(UInt8)')
+
+# Read with specified bigger schema version will trigger schema sync.
+=> DBGInvoke query_mapped('select col_3,col_4 from \$d.\$t', default, test)
+┌─col_3─┬─col_4─┐
+│     0 │    \N │
+│     0 │    \N │
+│     0 │    \N │
+│     0 │    \N │
+│     0 │    \N │
+│   256 │    \N │
+└───────┴───────┘
+
+# Edge values not overflowing.
+=> DBGInvoke __try_flush_region(4)
+=> DBGInvoke __raft_insert_row(default, test, 4, 56, -9223372036854775807, 18446744073709551615, 1)
+=> DBGInvoke __raft_insert_row(default, test, 4, 57, 9223372036854775807, 18446744073709551615, 1)
+=> DBGInvoke __drop_column_from_tidb_table(default, test, col_3)
+# Here engine DeltaTree don't trigger schema sync too
+
+=> DBGInvoke query_mapped('select col_3,col_4 from \$d.\$t', default, test)
+Received exception from server (version {#WORD}):
+Code: 47. DB::Exception: Received from {#WORD} DB::Exception: Unknown identifier: col_3.
+
+# Sync drop column and type change together by checking value overflow in CH when flushing.
+=> DBGInvoke __try_flush_region(4)
+=> DBGInvoke __modify_column_in_tidb_table(default, test, 'col_4 Nullable(UInt64)')
+=> DBGInvoke __raft_insert_row(default, test, 4, 58, 0, 256)
+=> DBGInvoke __drop_column_from_tidb_table(default, test, col_2)
+
+# Read with specified bigger schema version will trigger schema sync.
+=> DBGInvoke query_mapped('select col_4 from \$d.\$t', default, test)
+┌─col_4─┐
+│    \N │
+│    \N │
+│    \N │
+│    \N │
+│    \N │
+│    \N │
+│     1 │
+│     1 │
+│   256 │
+└───────┘
+=> DBGInvoke query_mapped('select col_2 from \$d.\$t', default, test)
+Received exception from server (version {#WORD}):
+Code: 47. DB::Exception: Received from {#WORD} DB::Exception: Unknown identifier: col_2.
+=> DBGInvoke __add_column_to_tidb_table(default, test, 'col_2 Nullable(Int8)')
+=> DBGInvoke __refresh_mapped_table_schema(default, test)
+=> DBGInvoke query_mapped('select col_2 from \$d.\$t', default, test)
+┌─col_2─┐
+│    \N │
+│    \N │
+│    \N │
+│    \N │
+│    \N │
+│    \N │
+│    \N │
+│    \N │
+│    \N │
+└───────┘
+
+=> DBGInvoke __drop_column_from_tidb_table(default, test, col_2)
+
+=> DBGInvoke __add_column_to_tidb_table(default, test, 'col_2 Int8')
+
+=> DBGInvoke __refresh_mapped_table_schema(default, test)
+
+=> DBGInvoke query_mapped('select col_2 from \$d.\$t', default, test)
+┌─col_2─┐
+│     0 │
+│     0 │
+│     0 │
+│     0 │
+│     0 │
+│     0 │
+│     0 │
+│     0 │
+│     0 │
+└───────┘
+# Clean up.
+=> DBGInvoke __drop_tidb_table(default, test)
+=> DBGInvoke __refresh_schemas()
+=> DBGInvoke __enable_schema_sync_service('true')
+

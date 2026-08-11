@@ -1,0 +1,62 @@
+// Modified from: https://github.com/ClickHouse/ClickHouse/blob/30fcaeb2a3fff1bf894aae9c776bed7fd83f783f/dbms/src/DataStreams/ExpressionBlockInputStream.cpp
+//
+// Copyright 2023 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <DataStreams/ExpressionBlockInputStream.h>
+#include <Interpreters/ExpressionActions.h>
+
+namespace DB
+{
+ExpressionBlockInputStream::ExpressionBlockInputStream(
+    const BlockInputStreamPtr & input,
+    const ExpressionActionsPtr & expression_,
+    const String & req_id)
+    : expression(expression_)
+    , log(Logger::get(req_id))
+{
+    children.push_back(input);
+}
+
+Block ExpressionBlockInputStream::getHeader() const
+{
+    Block res = children.back()->getHeader();
+    expression->execute(res);
+    return res;
+}
+
+Block ExpressionBlockInputStream::readImpl()
+{
+    Block res = children.back()->read();
+    if (!res)
+        return res;
+
+    if (res.info.selective)
+    {
+        const auto ori_rows = res.rows();
+        auto ori_info = res.info;
+        expression->execute(res);
+        res.info = ori_info;
+        // When block.info.selective is not null, the expression action should be cast/project.
+        // So the rows should not change.
+        RUNTIME_CHECK(ori_rows == res.rows());
+    }
+    else
+    {
+        expression->execute(res);
+    }
+    return res;
+}
+
+} // namespace DB

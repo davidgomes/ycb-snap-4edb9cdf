@@ -1,0 +1,52 @@
+header:
+  license:
+    spdx-id: Apache-2.0
+    copyright-owner: PingCAP, Inc.
+  # Allow the "Modified from" declaration at the top of the file
+  license-location-threshold: 1024
+  paths-ignore:
+    - '.gitignore'
+    - '.gitattributes'
+    - '.gitmodules'
+    - '.clang-format'
+    - '.clang-tidy'
+    - '.clangd'
+    - '.env'
+    - 'Jenkinsfile'
+    - 'LICENSE'
+    - 'NOTICE'
+    - 'tiflash-architecture.png'
+    - 'contrib/'
+    - 'libs/libclara-prebuilt/'
+    - 'libs/libclara/target/'
+    - 'build/'
+    - '.github/'
+    - 'docs/'
+    - 'tests/testsdata/'
+    - 'release-linux-llvm/dockerfiles/'
+    - '**/.gitignore'
+    - '**/*.md'
+    - '**/*.json'
+    - '**/*.h.in'
+    - '**/*.cpp.in'
+    - '**/LICENSE.TXT'
+    - '**/cipher-file-256'
+    - '**/asan.suppression'
+    - '**/tsan.suppression'
+    - '**/LICENSE.TXT'
+    - '**/LICENSE'
+    - '**/README'
+    - '**/COPYRIGHT'
+    - '**/NOTICE'
+    - 'dbms/src/Flash/tests/gtest_*.out'
+    - 'Cargo.lock'
+    - 'Cargo.toml'
+    - 'rust-toolchain'
+    - 'rust-toolchain.toml'
+    - '.devcontainer/'
+    - '**/OWNERS'
+    - 'OWNERS_ALIASES'
+    - '**/*.sql'
+    - 'dbms/src/Common/tests/tls/'
+
+  comment: on-failure

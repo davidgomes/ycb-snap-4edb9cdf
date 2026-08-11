@@ -1,0 +1,62 @@
+# Copyright 2023 PingCAP, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+mysql> drop table if exists test.t
+mysql> create table test.t(ld decimal(10,2), bd decimal(50, 25), f float, i integer)
+mysql> alter table test.t set tiflash replica 1
+mysql> insert into test.t values(1.2, 2.3, 3.4, 4)
+
+func> wait_table test t
+
+
+mysql> select /*+ AGG_TO_COP(), READ_FROM_STORAGE(TIFLASH[t]) */ sum(ceil(ld)), sum(ceil(bd)), sum(ceil(f)), sum(ceil(i)) from test.t;
++---------------+---------------+--------------+--------------+
+| sum(ceil(ld)) | sum(ceil(bd)) | sum(ceil(f)) | sum(ceil(i)) |
++---------------+---------------+--------------+--------------+
+|             2 |             3 |            4 |            4 |
++---------------+---------------+--------------+--------------+
+
+mysql> select /*+ AGG_TO_COP(), READ_FROM_STORAGE(TIFLASH[t]) */ sum(floor(ld)), sum(floor(bd)), sum(floor(f)), sum(ceil(i)) from test.t;
++----------------+----------------+---------------+--------------+
+| sum(floor(ld)) | sum(floor(bd)) | sum(floor(f)) | sum(ceil(i)) |
++----------------+----------------+---------------+--------------+
+|              1 |              2 |             3 |            4 |
++----------------+----------------+---------------+--------------+
+
+mysql> drop table if exists test.t
+
+mysql> drop table if exists test.t
+mysql> create table test.t(a decimal(8,2), b decimal(15,0), c decimal(19,1), d decimal(38,2), e decimal(38,30), f decimal(40,30), g decimal(52, 30), h decimal(65,30), ff float, ii integer)
+mysql> alter table test.t set tiflash replica 1
+mysql> insert into test.t values(2.5, 2, 2.5, 2.5, 2.5, 2.5, 2.5, 2.5, 2.5, 2)
+mysql> insert into test.t values(2, 2, 2, 2, 2, 2, 2, 2, 2, 2)
+mysql> insert into test.t values(-2, -2, -2, -2, -2, -2, -2, -2, -2, -2)
+mysql> insert into test.t values(999, 999, 999, 999, 999, 999, 999, 999, 999, 999)
+mysql> insert into test.t values(-999, -999, -999, -999, -999, -999, -999, -999, -999, -999)
+
+func> wait_table test t
+
+
+mysql> select floor(a),ceil(a),floor(b),ceil(b),floor(c),ceil(c),floor(d),ceil(d),floor(e),ceil(e),floor(f),ceil(f),floor(g),ceil(g),floor(h),ceil(h),floor(ii),ceil(ii) from test.t;
++----------+---------+----------+---------+----------+---------+----------+---------+----------+---------+----------+---------+----------+---------+----------+---------+-----------+----------+
+| floor(a) | ceil(a) | floor(b) | ceil(b) | floor(c) | ceil(c) | floor(d) | ceil(d) | floor(e) | ceil(e) | floor(f) | ceil(f) | floor(g) | ceil(g) | floor(h) | ceil(h) | floor(ii) | ceil(ii) |
++----------+---------+----------+---------+----------+---------+----------+---------+----------+---------+----------+---------+----------+---------+----------+---------+-----------+----------+
+|        2 |       3 |        2 |       2 |        2 |       3 |        2 |       3 |        2 |       3 |        2 |       3 |        2 |       3 |        2 |       3 |         2 |        2 |
+|        2 |       2 |        2 |       2 |        2 |       2 |        2 |       2 |        2 |       2 |        2 |       2 |        2 |       2 |        2 |       2 |         2 |        2 |
+|       -2 |      -2 |       -2 |      -2 |       -2 |      -2 |       -2 |      -2 |       -2 |      -2 |       -2 |      -2 |       -2 |      -2 |       -2 |      -2 |        -2 |       -2 |
+|      999 |     999 |      999 |     999 |      999 |     999 |      999 |     999 |      999 |     999 |      999 |     999 |      999 |     999 |      999 |     999 |       999 |      999 |
+|     -999 |    -999 |     -999 |    -999 |     -999 |    -999 |     -999 |    -999 |     -999 |    -999 |     -999 |    -999 |     -999 |    -999 |     -999 |    -999 |      -999 |     -999 |
++----------+---------+----------+---------+----------+---------+----------+---------+----------+---------+----------+---------+----------+---------+----------+---------+-----------+----------+
+
+mysql> drop table if exists test.t

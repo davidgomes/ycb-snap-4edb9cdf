@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# Copyright 2023 PingCAP, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+CMAKE_BUILD_TYPE=$1
+CMAKE_PREFIX_PATH=$2
+
+if [[ -z ${CMAKE_BUILD_TYPE} ]]; then
+  CMAKE_BUILD_TYPE="RELWITHDEBINFO"
+fi
+
+if [ $CMAKE_BUILD_TYPE == "TSAN" ] || [ $CMAKE_BUILD_TYPE == "ASAN" ]; then
+  ENABLE_TESTS=ON
+else
+  ENABLE_TESTS=OFF
+fi
+
+if [[ -n "$ENABLE_NEXT_GEN" && "$ENABLE_NEXT_GEN" != "false" && "$ENABLE_NEXT_GEN" != "0" ]]; then
+  CMAKE_ENABLE_NEXT_GEN="ON"
+  echo "Building TiFlash with next-gen features enabled"
+else
+  CMAKE_ENABLE_NEXT_GEN="OFF"
+  echo "Building TiFlash"
+fi
+
+DEFAULT_CMAKE_PREFIX_PATH="/usr/local/"
+DEFINE_CMAKE_PREFIX_PATH="-DCMAKE_PREFIX_PATH=${DEFAULT_CMAKE_PREFIX_PATH}"
+
+# https://cmake.org/cmake/help/latest/variable/CMAKE_PREFIX_PATH.html
+# CMAKE_PREFIX_PATH should be semicolon-separated list
+if [[ ${CMAKE_PREFIX_PATH} ]]; then
+  DEFINE_CMAKE_PREFIX_PATH="-DCMAKE_PREFIX_PATH=\"${DEFAULT_CMAKE_PREFIX_PATH};${CMAKE_PREFIX_PATH}\""
+  echo "CMAKE_PREFIX_PATH is \"${DEFAULT_CMAKE_PREFIX_PATH};${CMAKE_PREFIX_PATH}\""
+fi
+
+set -ueox pipefail
+
+# workaround git ownership check
+git config --global --add safe.directory "/build/tics"
+
+SCRIPTPATH="$(
+  cd "$(dirname "$0")"
+  pwd -P
+)"
+SRCPATH=$(
+  cd "${SCRIPTPATH}/../.."
+  pwd -P
+)
+NPROC=${NPROC:-$(nproc || grep -c ^processor /proc/cpuinfo)}
+ENABLE_THINLTO=${ENABLE_THINLTO:-ON}
+ENABLE_PCH=${ENABLE_PCH:-ON}
+if [ $CMAKE_BUILD_TYPE == "RELWITHDEBINFO" ]; then
+  ENABLE_FAILPOINTS="OFF"
+  JEMALLOC_NARENAS="-1"
+else
+  ENABLE_FAILPOINTS="ON"
+  JEMALLOC_NARENAS="40"
+fi
+
+# If CMAKE_ENABLE_NEXT_GEN is enabled, build another binary with next-gen columnar features enabled and install to a different directory to avoid conflict with the non-columnar binary.
+if [ "${CMAKE_ENABLE_NEXT_GEN}" = "ON" ]; then
+  CMAKE_ENABLE_NEXT_GEN_COLUMNAR="ON"
+  echo "Building TiFlash columnar (ENABLE_NEXT_GEN=${CMAKE_ENABLE_NEXT_GEN})"
+
+  # workaround compile issue of cloud-storage-engine dependency
+  export CARGO_NET_GIT_FETCH_WITH_CLI=true
+
+  # prepare build dir and install dir for columnar
+  if [ $CMAKE_BUILD_TYPE == "RELWITHDEBINFO" ]; then
+    BUILD_DIR="${SRCPATH}/release-linux-llvm/build-release-columnar"
+  else
+    BUILD_DIR="${SRCPATH}/release-linux-llvm/build-debug-columnar"
+  fi
+  rm -rf ${BUILD_DIR} && mkdir -p ${BUILD_DIR}
+  cd ${BUILD_DIR}
+
+  INSTALL_DIR="${SRCPATH}/release-linux-llvm/tiflash-columnar"
+  rm -rf ${INSTALL_DIR} && mkdir -p ${INSTALL_DIR}
+
+  # build binary with next-gen columnar features enabled
+  cmake -S "${SRCPATH}" \
+    ${DEFINE_CMAKE_PREFIX_PATH} \
+    -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
+    -DENABLE_TESTING=OFF \
+    -DENABLE_TESTS=${ENABLE_TESTS} \
+    -DENABLE_FAILPOINTS=${ENABLE_FAILPOINTS} \
+    -DENABLE_NEXT_GEN=${CMAKE_ENABLE_NEXT_GEN} \
+    -DENABLE_NEXT_GEN_COLUMNAR=${CMAKE_ENABLE_NEXT_GEN_COLUMNAR} \
+    -DJEMALLOC_NARENAS=${JEMALLOC_NARENAS} \
+    -Wno-dev \
+    -DUSE_CCACHE=OFF \
+    -DUSE_INTERNAL_SSL_LIBRARY=ON \
+    -DRUN_HAVE_STD_REGEX=0 \
+    -DENABLE_THINLTO=${ENABLE_THINLTO} \
+    -DTHINLTO_JOBS=${NPROC} \
+    -DENABLE_PCH=${ENABLE_PCH} \
+    -GNinja
+
+  cmake --build . --target tiflash --parallel ${NPROC}
+  cmake --install . --component=tiflash-release --prefix="${INSTALL_DIR}"
+  
+  # unset LD_LIBRARY_PATH before test
+  unset LD_LIBRARY_PATH
+  readelf -d "${INSTALL_DIR}/tiflash"
+  ldd "${INSTALL_DIR}/tiflash"
+  
+  # show version
+  ${INSTALL_DIR}/tiflash version
+fi
+
+INSTALL_DIR="${SRCPATH}/release-linux-llvm/tiflash"
+rm -rf ${INSTALL_DIR} && mkdir -p ${INSTALL_DIR}
+# prepare build_dir
+if [ $CMAKE_BUILD_TYPE == "RELWITHDEBINFO" ]; then
+  BUILD_DIR="${SRCPATH}/release-linux-llvm/build-release"
+else
+  BUILD_DIR="${SRCPATH}/release-linux-llvm/build-debug"
+fi
+rm -rf ${BUILD_DIR} && mkdir -p ${BUILD_DIR}
+cd ${BUILD_DIR}
+
+cmake -S "${SRCPATH}" \
+  ${DEFINE_CMAKE_PREFIX_PATH} \
+  -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
+  -DENABLE_TESTING=OFF \
+  -DENABLE_TESTS=${ENABLE_TESTS} \
+  -DENABLE_FAILPOINTS=${ENABLE_FAILPOINTS} \
+  -DENABLE_NEXT_GEN=${CMAKE_ENABLE_NEXT_GEN} \
+  -DJEMALLOC_NARENAS=${JEMALLOC_NARENAS} \
+  -Wno-dev \
+  -DUSE_CCACHE=OFF \
+  -DUSE_INTERNAL_SSL_LIBRARY=ON \
+  -DRUN_HAVE_STD_REGEX=0 \
+  -DENABLE_THINLTO=${ENABLE_THINLTO} \
+  -DTHINLTO_JOBS=${NPROC} \
+  -DENABLE_PCH=${ENABLE_PCH} \
+  -GNinja
+
+if [ $CMAKE_BUILD_TYPE == "TSAN" ] || [ $CMAKE_BUILD_TYPE == "ASAN" ]; then
+  cmake --build . --target gtests_dbms gtests_libcommon --parallel ${NPROC}
+  cmake --build . --target tiflash --parallel ${NPROC}
+  cmake --install . --component=tiflash-release --prefix="${INSTALL_DIR}"
+else
+  cmake --build . --target tiflash --parallel ${NPROC}
+  cmake --install . --component=tiflash-release --prefix="${INSTALL_DIR}"
+  
+  # unset LD_LIBRARY_PATH before test
+  unset LD_LIBRARY_PATH
+  readelf -d "${INSTALL_DIR}/tiflash"
+  ldd "${INSTALL_DIR}/tiflash"
+  
+  # show version
+  ${INSTALL_DIR}/tiflash version
+fi
