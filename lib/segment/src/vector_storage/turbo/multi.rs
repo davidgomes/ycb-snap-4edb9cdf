@@ -289,7 +289,9 @@ impl TurboMultiVectorStorage {
         }
         let next_chunk = start + left as PointOffsetType;
         if count as usize > self.storage.get_remaining_chunk_keys(next_chunk) {
-            return Err(OperationError::service_error(format!(
+            // Ingest path: user/input error so WAL replay skips the op.
+            // `update_from` remaps this to a service error (stored-data corruption).
+            return Err(OperationError::wrong_vector_bytes_size(format!(
                 "Multivector of {count} subvectors exceeds the chunk capacity",
             )));
         }
@@ -687,7 +689,13 @@ impl MultiTQVectorStorage for TurboMultiVectorStorage {
 
             let count = (blob.len() / record_size) as u32;
             let key = self.offsets.len() as PointOffsetType;
-            let inner_start = self.fresh_range_start(count)?;
+            let inner_start = self.fresh_range_start(count).map_err(|err| match err {
+                // Merge of already-stored data: genuine corruption stays a service error.
+                OperationError::WrongVectorBytesSize { description } => {
+                    OperationError::service_error(description)
+                }
+                err => err,
+            })?;
             for (i, record) in blob.chunks_exact(record_size).enumerate() {
                 self.storage.upsert_vector(
                     inner_start + i as PointOffsetType,
@@ -1327,18 +1335,24 @@ mod tests {
         // One subvector more cannot fit any chunk: rejected via `update_from`...
         let oversized_blob = vec![0u8; (records_per_chunk + 1) * record_size];
         let mut it = std::iter::once((Cow::from(oversized_blob.as_slice()), false));
-        assert!(storage.update_from(&mut it, &stopped).is_err());
+        let update_err = storage.update_from(&mut it, &stopped).unwrap_err();
+        assert!(
+            matches!(update_err, OperationError::ServiceError { .. }),
+            "merge of already-stored over-capacity data stays a service error, got {update_err:?}",
+        );
 
         // ...and via `insert_vector`, before any record is written.
         let oversized = multi_of(DIM, records_per_chunk + 1, 11);
+        let insert_err = storage
+            .insert_vector(
+                1,
+                TypedMultiDenseVectorRef::from(&oversized).into(),
+                &hw_counter,
+            )
+            .unwrap_err();
         assert!(
-            storage
-                .insert_vector(
-                    1,
-                    TypedMultiDenseVectorRef::from(&oversized).into(),
-                    &hw_counter,
-                )
-                .is_err()
+            matches!(insert_err, OperationError::WrongVectorBytesSize { .. }),
+            "ingest over-capacity must be WrongVectorBytesSize (skipped on WAL replay), got {insert_err:?}",
         );
 
         // The rejected points left no trace; the accepted one is intact.

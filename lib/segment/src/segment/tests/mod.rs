@@ -1405,6 +1405,48 @@ fn test_upsert_raw_malformed_blob_rejected() {
     );
 }
 
+/// A raw sparse blob that does not decode as `StoredSparseVector` must be
+/// rejected as a user error, not a `ServiceError`.
+#[test]
+fn test_upsert_raw_malformed_sparse_blob_rejected() {
+    init_logger();
+    let sparse_name = "sparse";
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let (mut segment, _) = build_segment(
+        dir.path(),
+        &SegmentConfig {
+            vector_data: HashMap::new(),
+            sparse_vector_data: HashMap::from_iter([(
+                sparse_name.to_string(),
+                SparseVectorDataConfig {
+                    index: SparseIndexConfig::new(Some(1), SparseIndexType::MutableRam, None, None),
+                    storage_type: SparseVectorStorageType::Mmap,
+                    modifier: None,
+                },
+            )]),
+            payload_storage_type: Default::default(),
+        },
+        None,
+        true,
+    )
+    .unwrap();
+    let hw_counter = HardwareCounterCell::new();
+
+    let result = segment.upsert_point_raw(
+        100,
+        7.into(),
+        &[(sparse_name.to_string(), vec![0_u8, 1, 2, 3, 4])],
+        &hw_counter,
+    );
+    assert!(
+        matches!(
+            result,
+            Err(crate::common::operation_error::OperationError::WrongVectorBytesSize { .. })
+        ),
+        "malformed sparse blob must be rejected as WrongVectorBytesSize, got {result:?}",
+    );
+}
+
 /// TurboQuant dense raw round-trip: the encoded TQ blob must be ingested
 /// verbatim — byte-identical after `upsert_point_raw` → `retrieve_raw`, with
 /// no dequantize/requantize drift (destination decodes exactly like the

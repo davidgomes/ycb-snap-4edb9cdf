@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, HashMap};
+use std::mem::size_of;
 use std::sync::Arc;
 
 use common::budget::ResourceBudget;
@@ -5,20 +7,29 @@ use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::save_on_disk::SaveOnDisk;
 use common::types::DeferredBehavior;
 use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, VectorStructInternal};
-use segment::types::{PayloadFieldSchema, PayloadSchemaType, WithPayload, WithVector};
+use segment::types::{
+    Distance, MultiVectorConfig, PayloadFieldSchema, PayloadSchemaType, WithPayload, WithVector,
+};
+use segment::vector_storage::common::CHUNK_SIZE;
 use shard::operations::CollectionUpdateOperations;
 use shard::operations::point_ops::{
     PointInsertOperationsInternal, PointOperations, PointStructPersisted, PointStructRawPersisted,
+    VectorPersisted, VectorStructPersisted,
 };
 use shard::segment_holder::FlushMode;
 use shard::wal::{SerdeWal, WalRawRecord};
+use sparse::common::sparse_vector::SparseVector;
 use tempfile::Builder;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 
 use crate::common::adaptive_handle::AdaptiveSearchHandle;
+use crate::config::CollectionParams;
 use crate::operations::shared_storage_config::SharedStorageConfig;
-use crate::operations::types::{CollectionError, PointRequestInternal};
+use crate::operations::types::{
+    CollectionError, Datatype, PointRequestInternal, SparseVectorParams, VectorsConfig,
+};
+use crate::operations::vector_params_builder::VectorParamsBuilder;
 use crate::shards::local_shard::LocalShard;
 use crate::shards::shard_trait::{ShardOperation, WaitUntil};
 use crate::tests::fixtures::*;
@@ -1460,6 +1471,264 @@ async fn test_malformed_raw_upsert_is_skipped_on_wal_replay() {
         present,
         vec![1.into()],
         "only the valid point should survive; the malformed raw op must be skipped on replay",
+    );
+
+    shard.stop_gracefully().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_malformed_sparse_raw_upsert_is_skipped_on_wal_replay() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let collection_dir = Builder::new().prefix("test_collection").tempdir().unwrap();
+
+    let sparse_name = "sparse";
+    let mut config = create_collection_config();
+    config.params = CollectionParams {
+        vectors: VectorsConfig::empty(),
+        sparse_vectors: Some(BTreeMap::from([(
+            sparse_name.to_string(),
+            SparseVectorParams {
+                index: None,
+                modifier: None,
+            },
+        )])),
+        ..CollectionParams::empty()
+    };
+
+    let collection_name = "test".to_string();
+
+    let update_runtime = Handle::current();
+    let current_runtime: AdaptiveSearchHandle = AdaptiveSearchHandle::current_for_tests();
+
+    let payload_index_schema_dir = Builder::new().prefix("qdrant-test").tempdir().unwrap();
+    let payload_index_schema_file = payload_index_schema_dir.path().join("payload-schema.json");
+    let payload_index_schema =
+        Arc::new(SaveOnDisk::load_or_init_default(payload_index_schema_file).unwrap());
+
+    let shard = LocalShard::build(
+        0,
+        collection_name.clone(),
+        collection_dir.path(),
+        Arc::new(RwLock::new(config.clone())),
+        Arc::new(Default::default()),
+        payload_index_schema.clone(),
+        update_runtime.clone(),
+        current_runtime.clone(),
+        ResourceBudget::default(),
+        config.optimizer_config.clone(),
+    )
+    .await
+    .unwrap();
+
+    let hw_acc = HwMeasurementAcc::new();
+
+    let good = CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
+        PointInsertOperationsInternal::PointsList(vec![PointStructPersisted {
+            id: 1.into(),
+            vector: VectorStructPersisted::Named(HashMap::from([(
+                sparse_name.to_string(),
+                VectorPersisted::Sparse(SparseVector::new(vec![1, 5], vec![0.5, 1.5]).unwrap()),
+            )])),
+            payload: None,
+        }]),
+    ));
+
+    shard
+        .update(good.into(), WaitUntil::Visible, None, hw_acc.clone())
+        .await
+        .expect("valid sparse upsert should succeed");
+
+    // Garbage bytes do not decode as `StoredSparseVector`. `submit_update`
+    // writes to the WAL before applying, so replay must skip this as BadInput.
+    let bad = CollectionUpdateOperations::PointOperation(PointOperations::UpsertPointsRaw(vec![
+        PointStructRawPersisted {
+            id: 2.into(),
+            vectors: std::iter::once((sparse_name.to_owned(), vec![0_u8, 1, 2, 3, 4])).collect(),
+            payload: None,
+        },
+    ]));
+    let err = shard
+        .update(bad.into(), WaitUntil::Visible, None, hw_acc.clone())
+        .await
+        .expect_err("malformed sparse raw upsert must be rejected");
+    assert!(
+        matches!(err, CollectionError::BadInput { .. }),
+        "malformed sparse blob must be a BadInput user error (skipped on replay), got {err:?}",
+    );
+
+    shard.stop_gracefully().await;
+
+    let shard = LocalShard::load(
+        0,
+        collection_name,
+        collection_dir.path(),
+        Arc::new(RwLock::new(config.clone())),
+        config.optimizer_config.clone(),
+        Arc::new(Default::default()),
+        payload_index_schema,
+        true,
+        update_runtime,
+        current_runtime.clone(),
+        ResourceBudget::default(),
+    )
+    .await
+    .expect("shard must recover: the malformed sparse op is skipped, not crash-looped");
+
+    let request = Arc::new(PointRequestInternal {
+        ids: vec![1.into(), 2.into()],
+        with_payload: None,
+        with_vector: WithVector::Bool(false),
+    });
+    let retrieved = shard
+        .retrieve(
+            request,
+            &WithPayload::from(false),
+            &WithVector::Bool(false),
+            &current_runtime,
+            None,
+            hw_acc,
+            DeferredBehavior::VisibleOnly,
+        )
+        .await
+        .unwrap();
+
+    let present: Vec<_> = retrieved.iter().map(|record| record.id).collect();
+    assert_eq!(
+        present,
+        vec![1.into()],
+        "only the valid point should survive; the malformed sparse op must be skipped on replay",
+    );
+
+    shard.stop_gracefully().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_over_capacity_multivector_upsert_is_skipped_on_wal_replay() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let collection_dir = Builder::new().prefix("test_collection").tempdir().unwrap();
+
+    // TurboQuant multivector: public APIs cap flattened length, but the internal
+    // update path can still apply an over-capacity upsert after the WAL write.
+    const DIM: usize = 128;
+    // TQ datatype record: 4-bit codes (`DIM/2` bytes) + Dot scaling factor.
+    // Must match `TurboQuantizer::quantized_size` for TQDT (Bits4, Normal).
+    const TQDT_RECORD_SIZE: usize = DIM / 2 + size_of::<f32>();
+    let records_per_chunk = CHUNK_SIZE / TQDT_RECORD_SIZE;
+
+    let mut params = VectorParamsBuilder::new(DIM as u64, Distance::Dot)
+        .with_datatype(Datatype::Turbo4)
+        .build();
+    params.multivector_config = Some(MultiVectorConfig::default());
+    let mut config = create_collection_config();
+    config.params.vectors = VectorsConfig::Single(params);
+
+    let collection_name = "test".to_string();
+
+    let update_runtime = Handle::current();
+    let current_runtime: AdaptiveSearchHandle = AdaptiveSearchHandle::current_for_tests();
+
+    let payload_index_schema_dir = Builder::new().prefix("qdrant-test").tempdir().unwrap();
+    let payload_index_schema_file = payload_index_schema_dir.path().join("payload-schema.json");
+    let payload_index_schema =
+        Arc::new(SaveOnDisk::load_or_init_default(payload_index_schema_file).unwrap());
+
+    let shard = LocalShard::build(
+        0,
+        collection_name.clone(),
+        collection_dir.path(),
+        Arc::new(RwLock::new(config.clone())),
+        Arc::new(Default::default()),
+        payload_index_schema.clone(),
+        update_runtime.clone(),
+        current_runtime.clone(),
+        ResourceBudget::default(),
+        config.optimizer_config.clone(),
+    )
+    .await
+    .unwrap();
+
+    let hw_acc = HwMeasurementAcc::new();
+
+    let raw_upsert = |id: u64, bytes: Vec<u8>| {
+        CollectionUpdateOperations::PointOperation(PointOperations::UpsertPointsRaw(vec![
+            PointStructRawPersisted {
+                id: id.into(),
+                vectors: std::iter::once((DEFAULT_VECTOR_NAME.to_owned(), bytes)).collect(),
+                payload: None,
+            },
+        ]))
+    };
+
+    // One encoded inner vector — fits a chunk with room to spare.
+    let good_bytes = vec![0u8; TQDT_RECORD_SIZE];
+    shard
+        .update(
+            raw_upsert(1, good_bytes).into(),
+            WaitUntil::Visible,
+            None,
+            hw_acc.clone(),
+        )
+        .await
+        .expect("valid multi TQ upsert should succeed");
+
+    // One more subvector than a whole chunk can hold. Public APIs cannot
+    // produce this, but the internal/raw path writes it to the WAL first.
+    let bad_bytes = vec![0u8; (records_per_chunk + 1) * TQDT_RECORD_SIZE];
+    let err = shard
+        .update(
+            raw_upsert(2, bad_bytes).into(),
+            WaitUntil::Visible,
+            None,
+            hw_acc.clone(),
+        )
+        .await
+        .expect_err("over-capacity multi TQ upsert must be rejected");
+    assert!(
+        matches!(err, CollectionError::BadInput { .. }),
+        "over-capacity multivector must be a BadInput user error (skipped on replay), got {err:?}",
+    );
+
+    shard.stop_gracefully().await;
+
+    let shard = LocalShard::load(
+        0,
+        collection_name,
+        collection_dir.path(),
+        Arc::new(RwLock::new(config.clone())),
+        config.optimizer_config.clone(),
+        Arc::new(Default::default()),
+        payload_index_schema,
+        true,
+        update_runtime,
+        current_runtime.clone(),
+        ResourceBudget::default(),
+    )
+    .await
+    .expect("shard must recover: the over-capacity multi op is skipped, not crash-looped");
+
+    let request = Arc::new(PointRequestInternal {
+        ids: vec![1.into(), 2.into()],
+        with_payload: None,
+        with_vector: WithVector::Bool(false),
+    });
+    let retrieved = shard
+        .retrieve(
+            request,
+            &WithPayload::from(false),
+            &WithVector::Bool(false),
+            &current_runtime,
+            None,
+            hw_acc,
+            DeferredBehavior::VisibleOnly,
+        )
+        .await
+        .unwrap();
+
+    let present: Vec<_> = retrieved.iter().map(|record| record.id).collect();
+    assert_eq!(
+        present,
+        vec![1.into()],
+        "only the valid point should survive; the over-capacity multi op must be skipped on replay",
     );
 
     shard.stop_gracefully().await;

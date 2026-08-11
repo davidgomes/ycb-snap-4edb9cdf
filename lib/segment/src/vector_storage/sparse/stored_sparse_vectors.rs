@@ -17,9 +17,16 @@ pub struct StoredSparseVector {
 impl StoredSparseVector {
     /// Fallible counterpart of [`Blob::from_bytes`], for deserializing bytes
     /// that arrive from outside this storage (e.g. raw point relocation).
+    ///
+    /// Decode failures are [`OperationError::WrongVectorBytesSize`] (user error)
+    /// so a malformed blob that reached the WAL is skipped on replay instead of
+    /// crash-looping recovery. Already-stored data still uses [`Blob::from_bytes`],
+    /// which treats corruption as a storage invariant.
     pub(crate) fn try_from_bytes(data: &[u8]) -> Result<Self, OperationError> {
         bincode::deserialize(data).map_err(|err| {
-            OperationError::service_error(format!("Failed to decode sparse vector bytes: {err}"))
+            OperationError::wrong_vector_bytes_size(format!(
+                "Failed to decode sparse vector bytes: {err}"
+            ))
         })
     }
 

@@ -25,10 +25,11 @@ pub enum OperationError {
         expected_dim: usize,
         received_dim: usize,
     },
-    /// A storage-native (raw byte) vector blob whose length is incompatible with
-    /// the target storage. Classified as user error (maps to `BadInput`), not
-    /// `ServiceError`, so a malformed blob that reached the WAL is skipped on
-    /// replay instead of crash-looping recovery.
+    /// Untrusted ingest that is incompatible with the target storage: a
+    /// storage-native blob whose length/encoding is wrong, or a multivector
+    /// whose subvector count exceeds one storage chunk. Classified as user
+    /// error (maps to `BadInput`), not `ServiceError`, so a malformed op that
+    /// reached the WAL is skipped on replay instead of crash-looping recovery.
     #[error("{description}")]
     WrongVectorBytesSize { description: String },
     #[error("Not existing vector name error: {received_name}")]
