@@ -1,0 +1,1118 @@
+/*
+Copyright 2022 The Vitess Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package vdiff
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"vitess.io/vitess/go/mysql/collations"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/vt/binlog/binlogplayer"
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/vtgate/engine"
+	"vitess.io/vitess/go/vt/vtgate/engine/opcode"
+
+	binlogdatapb "vitess.io/vitess/go/vt/proto/binlogdata"
+	tabletmanagerdatapb "vitess.io/vitess/go/vt/proto/tabletmanagerdata"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
+)
+
+// TestReconcileExtraRows tests reconcileExtraRows() by providing different types of source and target slices and validating
+// that the matching rows are correctly identified and removed.
+func TestReconcileExtraRows(t *testing.T) {
+	vdenv := newTestVDiffEnv(t)
+	defer vdenv.close()
+	UUID := uuid.New()
+	controllerQR := sqltypes.MakeTestResult(sqltypes.MakeTestFields(
+		vdiffTestCols,
+		vdiffTestColTypes,
+	),
+		fmt.Sprintf("1|%s|%s|%s|%s|%s|%s|%s|", UUID, vdiffenv.workflow, tstenv.KeyspaceName, tstenv.ShardName, vdiffDBName, PendingState, optionsJS),
+	)
+
+	vdiffenv.dbClient.ExpectRequest("select * from _vt.vdiff where id = 1 and db_name = "+encodeString(vdiffDBName), noResults, nil)
+	ct := vdenv.newController(t, controllerQR)
+	wd, err := newWorkflowDiffer(ct, vdiffenv.opts, collations.MySQL8())
+	require.NoError(t, err)
+
+	type testCase struct {
+		name             string
+		maxExtras        int64
+		extraDiffsSource []*RowDiff
+		extraDiffsTarget []*RowDiff
+
+		wantExtraSource []*RowDiff
+		wantExtraTarget []*RowDiff
+
+		wantProcessedCount  int64
+		wantMatchingCount   int64
+		wantMismatchedCount int64
+	}
+
+	testCases := []testCase{
+		{
+			name: "no extra rows, same order",
+			extraDiffsSource: []*RowDiff{
+				{Row: map[string]string{"1": "c1"}},
+				{Row: map[string]string{"2": "c2"}},
+			},
+			extraDiffsTarget: []*RowDiff{
+				{Row: map[string]string{"1": "c1"}},
+				{Row: map[string]string{"2": "c2"}},
+			},
+			wantExtraSource: []*RowDiff{},
+			wantExtraTarget: []*RowDiff{},
+		},
+		{
+			name: "no extra rows, different order",
+			extraDiffsSource: []*RowDiff{
+				{Row: map[string]string{"1": "c1"}},
+				{Row: map[string]string{"2": "c2"}},
+			},
+			extraDiffsTarget: []*RowDiff{
+				{Row: map[string]string{"2": "c2"}},
+				{Row: map[string]string{"1": "c1"}},
+			},
+			wantExtraSource: []*RowDiff{},
+			wantExtraTarget: []*RowDiff{},
+		},
+		{
+			name: "extra rows, same count of extras on both",
+			extraDiffsSource: []*RowDiff{
+				{Row: map[string]string{"1": "c1"}},
+				{Row: map[string]string{"3a": "c3a"}},
+				{Row: map[string]string{"2": "c2"}},
+				{Row: map[string]string{"3b": "c3b"}},
+			},
+			extraDiffsTarget: []*RowDiff{
+				{Row: map[string]string{"2": "c2"}},
+				{Row: map[string]string{"4a": "c4a"}},
+				{Row: map[string]string{"4b": "c4b"}},
+				{Row: map[string]string{"1": "c1"}},
+			},
+			wantExtraSource: []*RowDiff{
+				{Row: map[string]string{"3a": "c3a"}},
+				{Row: map[string]string{"3b": "c3b"}},
+			},
+			wantExtraTarget: []*RowDiff{
+				{Row: map[string]string{"4a": "c4a"}},
+				{Row: map[string]string{"4b": "c4b"}},
+			},
+		},
+		{
+			name: "extra rows, less extras on target",
+			extraDiffsSource: []*RowDiff{
+				{Row: map[string]string{"3a": "c3a"}},
+				{Row: map[string]string{"1": "c1"}},
+				{Row: map[string]string{"2": "c2"}},
+				{Row: map[string]string{"3b": "c3b"}},
+			},
+			extraDiffsTarget: []*RowDiff{
+				{Row: map[string]string{"4a": "c4a"}},
+				{Row: map[string]string{"2": "c2"}},
+				{Row: map[string]string{"1": "c1"}},
+			},
+			wantExtraSource: []*RowDiff{
+				{Row: map[string]string{"3a": "c3a"}},
+				{Row: map[string]string{"3b": "c3b"}},
+			},
+			wantExtraTarget: []*RowDiff{
+				{Row: map[string]string{"4a": "c4a"}},
+			},
+		},
+		{
+			name: "extra rows, no matching rows",
+			extraDiffsSource: []*RowDiff{
+				{Row: map[string]string{"1": "c1"}},
+				{Row: map[string]string{"2": "c2"}},
+				{Row: map[string]string{"3a": "c3a"}},
+				{Row: map[string]string{"3b": "c3b"}},
+			},
+			extraDiffsTarget: []*RowDiff{
+				{Row: map[string]string{"4a": "c4a"}},
+				{Row: map[string]string{"5": "c5"}},
+				{Row: map[string]string{"6": "c6"}},
+			},
+			wantExtraSource: []*RowDiff{
+				{Row: map[string]string{"1": "c1"}},
+				{Row: map[string]string{"2": "c2"}},
+				{Row: map[string]string{"3a": "c3a"}},
+				{Row: map[string]string{"3b": "c3b"}},
+			},
+			wantExtraTarget: []*RowDiff{
+				{Row: map[string]string{"4a": "c4a"}},
+				{Row: map[string]string{"5": "c5"}},
+				{Row: map[string]string{"6": "c6"}},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			dr := &DiffReport{
+				TableName: "t1",
+
+				ProcessedRows: 10 + max(int64(len(tc.extraDiffsSource)), int64(len(tc.extraDiffsTarget))),
+
+				MatchingRows: 10,
+
+				MismatchedRows:      0,
+				MismatchedRowsDiffs: nil,
+
+				ExtraRowsSource:      int64(len(tc.extraDiffsSource)),
+				ExtraRowsSourceDiffs: tc.extraDiffsSource,
+
+				ExtraRowsTarget:      int64(len(tc.extraDiffsTarget)),
+				ExtraRowsTargetDiffs: tc.extraDiffsTarget,
+			}
+
+			maxExtras := int64(10)
+			if tc.maxExtras != 0 {
+				maxExtras = tc.maxExtras
+			}
+
+			origExtraRowsSource := dr.ExtraRowsSource
+
+			require.NoError(t, wd.doReconcileExtraRows(dr, maxExtras, maxExtras))
+
+			// Matching rows should increase by the number of rows that we could reconcile
+			require.Equal(t, 10+origExtraRowsSource-dr.ExtraRowsSource, dr.MatchingRows)
+
+			// Processed rows should not change from the original value
+			require.Equal(t, 10+max(int64(len(tc.extraDiffsSource)), int64(len(tc.extraDiffsTarget))), dr.ProcessedRows)
+
+			// Mismatched rows should remain the same
+			require.Equal(t, int64(0), dr.MismatchedRows)
+
+			// Check other counts
+			require.Equal(t, int64(len(tc.wantExtraSource)), dr.ExtraRowsSource)
+			require.Equal(t, int64(len(tc.wantExtraTarget)), dr.ExtraRowsTarget)
+
+			// check actual extra rows
+			require.EqualValues(t, dr.ExtraRowsSourceDiffs, tc.wantExtraSource)
+			require.EqualValues(t, dr.ExtraRowsTargetDiffs, tc.wantExtraTarget)
+		})
+	}
+
+	t.Run("with `ExtraRowsSource` larger than `extraDiffsSource`", func(t *testing.T) {
+		dr := &DiffReport{
+			TableName: "t1",
+
+			// The max number of rows loaded on the source or the target
+			ProcessedRows: 6,
+
+			MismatchedRows:      0,
+			MismatchedRowsDiffs: nil,
+
+			// Simulate having hit `maxExtraRowsToCompare` / having found more rows on the source
+			ExtraRowsSource: 6,
+			ExtraRowsSourceDiffs: []*RowDiff{
+				{Row: map[string]string{"1": "c1"}},
+				{Row: map[string]string{"3a": "c3a"}},
+				{Row: map[string]string{"2": "c2"}},
+				{Row: map[string]string{"3b": "c3b"}},
+			},
+
+			ExtraRowsTarget: 4,
+			ExtraRowsTargetDiffs: []*RowDiff{
+				{Row: map[string]string{"2": "c2"}},
+				{Row: map[string]string{"4a": "c4a"}},
+				{Row: map[string]string{"4b": "c4b"}},
+				{Row: map[string]string{"1": "c1"}},
+			},
+		}
+
+		maxExtras := int64(4)
+		require.NoError(t, wd.doReconcileExtraRows(dr, maxExtras, maxExtras))
+
+		// Verify that reconciliation does not change the number of processed or mismatched rows
+		require.Equal(t, int64(6), dr.ProcessedRows)
+		require.Equal(t, int64(0), dr.MismatchedRows)
+
+		require.Equal(t, int64(4), dr.ExtraRowsSource)
+		require.Equal(t, int64(2), dr.ExtraRowsTarget)
+
+		require.Equal(t, int64(2), dr.MatchingRows)
+	})
+	t.Run("with `ExtraRowsTarget` larger than `extraDiffsTarget`", func(t *testing.T) {
+		dr := &DiffReport{
+			TableName: "t1",
+
+			// The max number of rows loaded on the source or the target
+			ProcessedRows: 6,
+
+			MismatchedRows:      0,
+			MismatchedRowsDiffs: nil,
+
+			ExtraRowsSource: 4,
+			ExtraRowsSourceDiffs: []*RowDiff{
+				{Row: map[string]string{"1": "c1"}},
+				{Row: map[string]string{"3a": "c3a"}},
+				{Row: map[string]string{"2": "c2"}},
+				{Row: map[string]string{"3b": "c3b"}},
+			},
+
+			// Simulate having hit `maxExtraRowsToCompare` / having found more rows on the target
+			ExtraRowsTarget: 6,
+			ExtraRowsTargetDiffs: []*RowDiff{
+				{Row: map[string]string{"2": "c2"}},
+				{Row: map[string]string{"4a": "c4a"}},
+				{Row: map[string]string{"4b": "c4b"}},
+				{Row: map[string]string{"1": "c1"}},
+			},
+		}
+
+		maxExtras := int64(4)
+		require.NoError(t, wd.doReconcileExtraRows(dr, maxExtras, maxExtras))
+
+		// Verify that reconciliation does not change the number of processed or mismatched rows
+		require.Equal(t, int64(6), dr.ProcessedRows)
+		require.Equal(t, int64(0), dr.MismatchedRows)
+
+		require.Equal(t, int64(2), dr.ExtraRowsSource)
+		require.Equal(t, int64(4), dr.ExtraRowsTarget)
+
+		require.Equal(t, int64(2), dr.MatchingRows)
+	})
+}
+
+func TestReconcileReferenceTables(t *testing.T) {
+	ctx := t.Context()
+	vdenv := newTestVDiffEnv(t)
+	defer vdenv.close()
+	UUID := uuid.New()
+	controllerQR := sqltypes.MakeTestResult(sqltypes.MakeTestFields(
+		vdiffTestCols,
+		vdiffTestColTypes,
+	),
+		fmt.Sprintf("1|%s|%s|%s|%s|%s|%s|%s|", UUID, vdiffenv.workflow, tstenv.KeyspaceName, tstenv.ShardName, vdiffDBName, PendingState, optionsJS),
+	)
+
+	vdiffenv.dbClient.ExpectRequest("select * from _vt.vdiff where id = 1 and db_name = "+encodeString(vdiffDBName), noResults, nil)
+	ct := vdenv.newController(t, controllerQR)
+	ct.sourceKeyspace = tstenv.KeyspaceName
+	wd, err := newWorkflowDiffer(ct, vdiffenv.opts, collations.MySQL8())
+	require.NoError(t, err)
+
+	// Create VSchema for the source keyspace with a reference table.
+	err = tstenv.TopoServ.EnsureVSchema(ctx, tstenv.KeyspaceName)
+	require.NoError(t, err)
+	sourceVS := &vschemapb.Keyspace{
+		Tables: map[string]*vschemapb.Table{
+			"ref_table": {
+				Type: "reference",
+			},
+		},
+	}
+	err = tstenv.TopoServ.SaveVSchema(ctx, &topo.KeyspaceVSchemaInfo{
+		Name:     tstenv.KeyspaceName,
+		Keyspace: sourceVS,
+	})
+	require.NoError(t, err)
+
+	t.Run("division by zero with zero matching rows - source side", func(t *testing.T) {
+		dr := &DiffReport{
+			TableName:            "ref_table",
+			ProcessedRows:        10,
+			MatchingRows:         0,
+			MismatchedRows:       0, // Must be 0 to enter reconciliation logic
+			ExtraRowsSource:      10,
+			ExtraRowsSourceDiffs: []*RowDiff{{Row: map[string]string{"id": "1"}}},
+			ExtraRowsTarget:      0,
+		}
+
+		err := wd.reconcileReferenceTables(dr)
+		require.NoError(t, err)
+
+		// Values should remain unchanged since MatchingRows is 0.
+		require.Equal(t, int64(10), dr.ExtraRowsSource)
+		require.Equal(t, int64(0), dr.ExtraRowsTarget)
+	})
+
+	t.Run("division by zero with zero matching rows - target side", func(t *testing.T) {
+		dr := &DiffReport{
+			TableName:            "ref_table",
+			ProcessedRows:        10,
+			MatchingRows:         0,
+			MismatchedRows:       0, // Must be 0 to enter reconciliation logic
+			ExtraRowsSource:      0,
+			ExtraRowsTarget:      10,
+			ExtraRowsTargetDiffs: []*RowDiff{{Row: map[string]string{"id": "1"}}},
+		}
+
+		err := wd.reconcileReferenceTables(dr)
+		require.NoError(t, err)
+
+		// Values should remain unchanged since MatchingRows is 0.
+		require.Equal(t, int64(0), dr.ExtraRowsSource)
+		require.Equal(t, int64(10), dr.ExtraRowsTarget)
+	})
+
+	t.Run("reference table with positive matching rows - works correctly", func(t *testing.T) {
+		dr := &DiffReport{
+			TableName:            "ref_table",
+			ProcessedRows:        15,
+			MatchingRows:         5,
+			MismatchedRows:       0,
+			ExtraRowsSource:      10, // 10 % 5 = 0, so it's a multiple.
+			ExtraRowsSourceDiffs: []*RowDiff{{Row: map[string]string{"id": "1"}}},
+			ExtraRowsTarget:      0,
+		}
+
+		err := wd.reconcileReferenceTables(dr)
+		require.NoError(t, err)
+
+		// ExtraRowsSource should be cleared since it's a multiple of MatchingRows.
+		require.Equal(t, int64(0), dr.ExtraRowsSource)
+		require.Equal(t, 0, len(dr.ExtraRowsSourceDiffs))
+	})
+
+	t.Run("mismatched rows - reconciliation skipped entirely", func(t *testing.T) {
+		// With mismatched rows, reconciliation is skipped, so no VSchema access.
+		dr := &DiffReport{
+			TableName:            "ref_table",
+			ProcessedRows:        10,
+			MatchingRows:         0,
+			MismatchedRows:       5, // Non-zero means early return, no VSchema access
+			ExtraRowsSource:      10,
+			ExtraRowsSourceDiffs: []*RowDiff{{Row: map[string]string{"id": "1"}}},
+			ExtraRowsTarget:      0,
+		}
+
+		err := wd.reconcileReferenceTables(dr)
+		require.NoError(t, err)
+
+		// Values should remain unchanged.
+		require.Equal(t, int64(10), dr.ExtraRowsSource)
+		require.Equal(t, int64(0), dr.ExtraRowsTarget)
+	})
+}
+
+func TestBuildPlanSuccess(t *testing.T) {
+	vdenv := newTestVDiffEnv(t)
+	defer vdenv.close()
+	UUID := uuid.New()
+	controllerQR := sqltypes.MakeTestResult(sqltypes.MakeTestFields(
+		vdiffTestCols,
+		vdiffTestColTypes,
+	),
+		fmt.Sprintf("1|%s|%s|%s|%s|%s|%s|%s|", UUID, vdiffenv.workflow, tstenv.KeyspaceName, tstenv.ShardName, vdiffDBName, PendingState, optionsJS),
+	)
+
+	vdiffenv.dbClient.ExpectRequest("select * from _vt.vdiff where id = 1 and db_name = "+encodeString(vdiffDBName), noResults, nil)
+	ct := vdenv.newController(t, controllerQR)
+	ct.sources = map[string]*migrationSource{
+		tstenv.ShardName: {
+			vrID: 1,
+			shardStreamer: &shardStreamer{
+				tablet: vdenv.vde.thisTablet,
+				shard:  tstenv.ShardName,
+			},
+		},
+	}
+	ct.sourceKeyspace = tstenv.KeyspaceName
+
+	testcases := []struct {
+		input          *binlogdatapb.Rule
+		table          string
+		tablePlan      *tablePlan
+		sourceTimeZone string
+	}{{
+		input: &binlogdatapb.Rule{
+			Match: "t1",
+		},
+		table: "t1",
+		tablePlan: &tablePlan{
+			dbName:       vdiffDBName,
+			table:        testSchema.TableDefinitions[tableDefMap["t1"]],
+			sourceQuery:  "select c1, c2 from t1 order by c1 asc",
+			targetQuery:  "select c1, c2 from t1 order by c1 asc",
+			compareCols:  []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}, {1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), false, "c2"}},
+			comparePKs:   []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}},
+			pkCols:       []int{0},
+			sourcePkCols: []int{0},
+			selectPks:    []int{0},
+			orderBy: sqlparser.OrderBy{&sqlparser.Order{
+				Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("c1")},
+				Direction: sqlparser.AscOrder,
+			}},
+		},
+	}, {
+		input: &binlogdatapb.Rule{
+			Match:  "t1",
+			Filter: "-80",
+		},
+		table: "t1",
+		tablePlan: &tablePlan{
+			dbName:       vdiffDBName,
+			table:        testSchema.TableDefinitions[tableDefMap["t1"]],
+			sourceQuery:  "select c1, c2 from t1 where in_keyrange('-80') order by c1 asc",
+			targetQuery:  "select c1, c2 from t1 order by c1 asc",
+			compareCols:  []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}, {1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), false, "c2"}},
+			comparePKs:   []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}},
+			pkCols:       []int{0},
+			sourcePkCols: []int{0},
+			selectPks:    []int{0},
+			orderBy: sqlparser.OrderBy{&sqlparser.Order{
+				Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("c1")},
+				Direction: sqlparser.AscOrder,
+			}},
+		},
+	}, {
+		input: &binlogdatapb.Rule{
+			Match:  "t1",
+			Filter: "select * from t1",
+		},
+		table: "t1",
+		tablePlan: &tablePlan{
+			dbName:       vdiffDBName,
+			table:        testSchema.TableDefinitions[tableDefMap["t1"]],
+			sourceQuery:  "select c1, c2 from t1 order by c1 asc",
+			targetQuery:  "select c1, c2 from t1 order by c1 asc",
+			compareCols:  []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}, {1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), false, "c2"}},
+			comparePKs:   []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}},
+			pkCols:       []int{0},
+			sourcePkCols: []int{0},
+			selectPks:    []int{0},
+			orderBy: sqlparser.OrderBy{&sqlparser.Order{
+				Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("c1")},
+				Direction: sqlparser.AscOrder,
+			}},
+		},
+	}, {
+		input: &binlogdatapb.Rule{
+			Match:  "t1",
+			Filter: "select c2, c1 from t1",
+		},
+		table: "t1",
+		tablePlan: &tablePlan{
+			dbName:       vdiffDBName,
+			table:        testSchema.TableDefinitions[tableDefMap["t1"]],
+			sourceQuery:  "select c2, c1 from t1 order by c1 asc",
+			targetQuery:  "select c2, c1 from t1 order by c1 asc",
+			compareCols:  []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), false, "c2"}, {1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}},
+			comparePKs:   []compareColInfo{{1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}},
+			pkCols:       []int{1},
+			sourcePkCols: []int{0},
+			selectPks:    []int{1},
+			orderBy: sqlparser.OrderBy{&sqlparser.Order{
+				Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("c1")},
+				Direction: sqlparser.AscOrder,
+			}},
+		},
+	}, {
+		input: &binlogdatapb.Rule{
+			Match:  "t1",
+			Filter: "select c0 as c1, c2 from t2",
+		},
+		table: "t1",
+		tablePlan: &tablePlan{
+			dbName:       vdiffDBName,
+			table:        testSchema.TableDefinitions[tableDefMap["t1"]],
+			sourceQuery:  "select c0 as c1, c2 from t2 order by c1 asc",
+			targetQuery:  "select c1, c2 from t1 order by c1 asc",
+			compareCols:  []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}, {1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), false, "c2"}},
+			comparePKs:   []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}},
+			pkCols:       []int{0},
+			sourcePkCols: []int{0},
+			selectPks:    []int{0},
+			orderBy: sqlparser.OrderBy{&sqlparser.Order{
+				Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("c1")},
+				Direction: sqlparser.AscOrder,
+			}},
+		},
+	}, {
+		// Non-PK text column.
+		input: &binlogdatapb.Rule{
+			Match:  "nonpktext",
+			Filter: "select c1, textcol from nonpktext",
+		},
+		table: "nonpktext",
+		tablePlan: &tablePlan{
+			dbName:       vdiffDBName,
+			table:        testSchema.TableDefinitions[tableDefMap["nonpktext"]],
+			sourceQuery:  "select c1, textcol from nonpktext order by c1 asc",
+			targetQuery:  "select c1, textcol from nonpktext order by c1 asc",
+			compareCols:  []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}, {1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), false, "textcol"}},
+			comparePKs:   []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}},
+			pkCols:       []int{0},
+			sourcePkCols: []int{0},
+			selectPks:    []int{0},
+			orderBy: sqlparser.OrderBy{&sqlparser.Order{
+				Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("c1")},
+				Direction: sqlparser.AscOrder,
+			}},
+		},
+	}, {
+		// Non-PK text column, different order.
+		input: &binlogdatapb.Rule{
+			Match:  "nonpktext",
+			Filter: "select textcol, c1 from nonpktext",
+		},
+		table: "nonpktext",
+		tablePlan: &tablePlan{
+			dbName:       vdiffDBName,
+			table:        testSchema.TableDefinitions[tableDefMap["nonpktext"]],
+			sourceQuery:  "select textcol, c1 from nonpktext order by c1 asc",
+			targetQuery:  "select textcol, c1 from nonpktext order by c1 asc",
+			compareCols:  []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), false, "textcol"}, {1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}},
+			comparePKs:   []compareColInfo{{1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}},
+			pkCols:       []int{1},
+			sourcePkCols: []int{0},
+			selectPks:    []int{1},
+			orderBy: sqlparser.OrderBy{&sqlparser.Order{
+				Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("c1")},
+				Direction: sqlparser.AscOrder,
+			}},
+		},
+	}, {
+		// PK text column.
+		input: &binlogdatapb.Rule{
+			Match:  "pktext",
+			Filter: "select textcol, c2 from pktext",
+		},
+		table: "pktext",
+		tablePlan: &tablePlan{
+			dbName:       vdiffDBName,
+			table:        testSchema.TableDefinitions[tableDefMap["pktext"]],
+			sourceQuery:  "select textcol, c2 from pktext order by textcol asc",
+			targetQuery:  "select textcol, c2 from pktext order by textcol asc",
+			compareCols:  []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "textcol"}, {1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), false, "c2"}},
+			comparePKs:   []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "textcol"}},
+			pkCols:       []int{0},
+			sourcePkCols: []int{},
+			selectPks:    []int{0},
+			orderBy: sqlparser.OrderBy{&sqlparser.Order{
+				Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("textcol")},
+				Direction: sqlparser.AscOrder,
+			}},
+		},
+	}, {
+		// PK text column, different order.
+		input: &binlogdatapb.Rule{
+			Match:  "pktext",
+			Filter: "select c2, textcol from pktext",
+		},
+		table: "pktext",
+		tablePlan: &tablePlan{
+			dbName:       vdiffDBName,
+			table:        testSchema.TableDefinitions[tableDefMap["pktext"]],
+			sourceQuery:  "select c2, textcol from pktext order by textcol asc",
+			targetQuery:  "select c2, textcol from pktext order by textcol asc",
+			compareCols:  []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), false, "c2"}, {1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "textcol"}},
+			comparePKs:   []compareColInfo{{1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "textcol"}},
+			pkCols:       []int{1},
+			sourcePkCols: []int{},
+			selectPks:    []int{1},
+			orderBy: sqlparser.OrderBy{&sqlparser.Order{
+				Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("textcol")},
+				Direction: sqlparser.AscOrder,
+			}},
+		},
+	}, {
+		// No PK. Use all columns as a substitute.
+		input: &binlogdatapb.Rule{
+			Match:  "nopk",
+			Filter: "select * from nopk",
+		},
+		table: "nopk",
+		tablePlan: &tablePlan{
+			dbName:       vdiffDBName,
+			table:        testSchema.TableDefinitions[tableDefMap["nopk"]],
+			sourceQuery:  "select c1, c2, c3 from nopk order by c1 asc, c2 asc, c3 asc",
+			targetQuery:  "select c1, c2, c3 from nopk order by c1 asc, c2 asc, c3 asc",
+			compareCols:  []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}, {1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c2"}, {2, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c3"}},
+			comparePKs:   []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}, {1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c2"}, {2, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c3"}},
+			pkCols:       []int{0, 1, 2},
+			sourcePkCols: []int{0},
+			selectPks:    []int{0, 1, 2},
+			orderBy: sqlparser.OrderBy{
+				&sqlparser.Order{
+					Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("c1")},
+					Direction: sqlparser.AscOrder,
+				},
+				&sqlparser.Order{
+					Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("c2")},
+					Direction: sqlparser.AscOrder,
+				},
+				&sqlparser.Order{
+					Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("c3")},
+					Direction: sqlparser.AscOrder,
+				},
+			},
+		},
+	}, {
+		// No PK, but a PKE on c3.
+		input: &binlogdatapb.Rule{
+			Match:  "nopkwithpke",
+			Filter: "select * from nopkwithpke",
+		},
+		table: "nopkwithpke",
+		tablePlan: &tablePlan{
+			dbName:       vdiffDBName,
+			table:        testSchema.TableDefinitions[tableDefMap["nopkwithpke"]],
+			sourceQuery:  "select c1, c2, c3 from nopkwithpke order by c3 asc",
+			targetQuery:  "select c1, c2, c3 from nopkwithpke order by c3 asc",
+			compareCols:  []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), false, "c1"}, {1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), false, "c2"}, {2, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c3"}},
+			comparePKs:   []compareColInfo{{2, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c3"}},
+			pkCols:       []int{2},
+			sourcePkCols: []int{0},
+			selectPks:    []int{2},
+			orderBy: sqlparser.OrderBy{
+				&sqlparser.Order{
+					Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("c3")},
+					Direction: sqlparser.AscOrder,
+				},
+			},
+		},
+	}, {
+		// Text column as expression.
+		input: &binlogdatapb.Rule{
+			Match:  "pktext",
+			Filter: "select c2, a+b as textcol from pktext",
+		},
+		table: "pktext",
+		tablePlan: &tablePlan{
+			dbName:       vdiffDBName,
+			table:        testSchema.TableDefinitions[tableDefMap["pktext"]],
+			sourceQuery:  "select c2, a + b as textcol from pktext order by textcol asc",
+			targetQuery:  "select c2, textcol from pktext order by textcol asc",
+			compareCols:  []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), false, "c2"}, {1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "textcol"}},
+			comparePKs:   []compareColInfo{{1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "textcol"}},
+			pkCols:       []int{1},
+			sourcePkCols: []int{},
+			selectPks:    []int{1},
+			orderBy: sqlparser.OrderBy{&sqlparser.Order{
+				Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("textcol")},
+				Direction: sqlparser.AscOrder,
+			}},
+		},
+	}, {
+		// Multiple PK columns.
+		input: &binlogdatapb.Rule{
+			Match: "multipk",
+		},
+		table: "multipk",
+		tablePlan: &tablePlan{
+			dbName:       vdiffDBName,
+			table:        testSchema.TableDefinitions[tableDefMap["multipk"]],
+			sourceQuery:  "select c1, c2 from multipk order by c1 asc, c2 asc",
+			targetQuery:  "select c1, c2 from multipk order by c1 asc, c2 asc",
+			compareCols:  []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}, {1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c2"}},
+			comparePKs:   []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}, {1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c2"}},
+			pkCols:       []int{0, 1},
+			sourcePkCols: []int{0},
+			selectPks:    []int{0, 1},
+			orderBy: sqlparser.OrderBy{
+				&sqlparser.Order{
+					Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("c1")},
+					Direction: sqlparser.AscOrder,
+				},
+				&sqlparser.Order{
+					Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("c2")},
+					Direction: sqlparser.AscOrder,
+				},
+			},
+		},
+	}, {
+		// in_keyrange
+		input: &binlogdatapb.Rule{
+			Match:  "t1",
+			Filter: "select * from t1 where in_keyrange('-80')",
+		},
+		table: "t1",
+		tablePlan: &tablePlan{
+			dbName:       vdiffDBName,
+			table:        testSchema.TableDefinitions[tableDefMap["t1"]],
+			sourceQuery:  "select c1, c2 from t1 where in_keyrange('-80') order by c1 asc",
+			targetQuery:  "select c1, c2 from t1 order by c1 asc",
+			compareCols:  []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}, {1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), false, "c2"}},
+			comparePKs:   []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}},
+			pkCols:       []int{0},
+			sourcePkCols: []int{0},
+			selectPks:    []int{0},
+			orderBy: sqlparser.OrderBy{&sqlparser.Order{
+				Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("c1")},
+				Direction: sqlparser.AscOrder,
+			}},
+		},
+	}, {
+		// in_keyrange on RHS of AND.
+		input: &binlogdatapb.Rule{
+			Match:  "t1",
+			Filter: "select * from t1 where c2 = 2 and in_keyrange('-80')",
+		},
+		table: "t1",
+		tablePlan: &tablePlan{
+			dbName:       vdiffDBName,
+			table:        testSchema.TableDefinitions[tableDefMap["t1"]],
+			sourceQuery:  "select c1, c2 from t1 where c2 = 2 and in_keyrange('-80') order by c1 asc",
+			targetQuery:  "select c1, c2 from t1 where c2 = 2 order by c1 asc",
+			compareCols:  []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}, {1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), false, "c2"}},
+			comparePKs:   []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}},
+			pkCols:       []int{0},
+			sourcePkCols: []int{0},
+			selectPks:    []int{0},
+			orderBy: sqlparser.OrderBy{&sqlparser.Order{
+				Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("c1")},
+				Direction: sqlparser.AscOrder,
+			}},
+		},
+	}, {
+		// in_keyrange on LHS of AND.
+		input: &binlogdatapb.Rule{
+			Match:  "t1",
+			Filter: "select * from t1 where in_keyrange('-80') and c2 = 2",
+		},
+		table: "t1",
+		tablePlan: &tablePlan{
+			dbName:       vdiffDBName,
+			table:        testSchema.TableDefinitions[tableDefMap["t1"]],
+			sourceQuery:  "select c1, c2 from t1 where in_keyrange('-80') and c2 = 2 order by c1 asc",
+			targetQuery:  "select c1, c2 from t1 where c2 = 2 order by c1 asc",
+			compareCols:  []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}, {1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), false, "c2"}},
+			comparePKs:   []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}},
+			pkCols:       []int{0},
+			sourcePkCols: []int{0},
+			selectPks:    []int{0},
+			orderBy: sqlparser.OrderBy{&sqlparser.Order{
+				Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("c1")},
+				Direction: sqlparser.AscOrder,
+			}},
+		},
+	}, {
+		// in_keyrange on cascaded AND expression.
+		input: &binlogdatapb.Rule{
+			Match:  "t1",
+			Filter: "select * from t1 where c2 = 2 and c1 = 1 and in_keyrange('-80')",
+		},
+		table: "t1",
+		tablePlan: &tablePlan{
+			dbName:       vdiffDBName,
+			table:        testSchema.TableDefinitions[tableDefMap["t1"]],
+			sourceQuery:  "select c1, c2 from t1 where c2 = 2 and c1 = 1 and in_keyrange('-80') order by c1 asc",
+			targetQuery:  "select c1, c2 from t1 where c2 = 2 and c1 = 1 order by c1 asc",
+			compareCols:  []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}, {1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), false, "c2"}},
+			comparePKs:   []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}},
+			pkCols:       []int{0},
+			sourcePkCols: []int{0},
+			selectPks:    []int{0},
+			orderBy: sqlparser.OrderBy{&sqlparser.Order{
+				Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("c1")},
+				Direction: sqlparser.AscOrder,
+			}},
+		},
+	}, {
+		// in_keyrange parenthesized.
+		input: &binlogdatapb.Rule{
+			Match:  "t1",
+			Filter: "select * from t1 where (c2 = 2 and in_keyrange('-80'))",
+		},
+		table: "t1",
+		tablePlan: &tablePlan{
+			dbName:       vdiffDBName,
+			table:        testSchema.TableDefinitions[tableDefMap["t1"]],
+			sourceQuery:  "select c1, c2 from t1 where c2 = 2 and in_keyrange('-80') order by c1 asc",
+			targetQuery:  "select c1, c2 from t1 where c2 = 2 order by c1 asc",
+			compareCols:  []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}, {1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), false, "c2"}},
+			comparePKs:   []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}},
+			pkCols:       []int{0},
+			sourcePkCols: []int{0},
+			selectPks:    []int{0},
+			orderBy: sqlparser.OrderBy{&sqlparser.Order{
+				Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("c1")},
+				Direction: sqlparser.AscOrder,
+			}},
+		},
+	}, {
+		// Group by.
+		input: &binlogdatapb.Rule{
+			Match:  "t1",
+			Filter: "select * from t1 group by c1",
+		},
+		table: "t1",
+		tablePlan: &tablePlan{
+			dbName:       vdiffDBName,
+			table:        testSchema.TableDefinitions[tableDefMap["t1"]],
+			sourceQuery:  "select c1, c2 from t1 group by c1 order by c1 asc",
+			targetQuery:  "select c1, c2 from t1 order by c1 asc",
+			compareCols:  []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}, {1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), false, "c2"}},
+			comparePKs:   []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}},
+			pkCols:       []int{0},
+			sourcePkCols: []int{0},
+			selectPks:    []int{0},
+			orderBy: sqlparser.OrderBy{&sqlparser.Order{
+				Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("c1")},
+				Direction: sqlparser.AscOrder,
+			}},
+		},
+	}, {
+		// Aggregations.
+		input: &binlogdatapb.Rule{
+			Match:  "aggr",
+			Filter: "select c1, c2, count(*) as c3, sum(c4) as c4 from t1 group by c1",
+		},
+		table: "aggr",
+		tablePlan: &tablePlan{
+			dbName:       vdiffDBName,
+			table:        testSchema.TableDefinitions[tableDefMap["aggr"]],
+			sourceQuery:  "select c1, c2, count(*) as c3, sum(c4) as c4 from t1 group by c1 order by c1 asc",
+			targetQuery:  "select c1, c2, c3, c4 from aggr order by c1 asc",
+			compareCols:  []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}, {1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), false, "c2"}, {2, collations.MySQL8().LookupByName(sqltypes.NULL.String()), false, "c3"}, {3, collations.MySQL8().LookupByName(sqltypes.NULL.String()), false, "c4"}},
+			comparePKs:   []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "c1"}},
+			pkCols:       []int{0},
+			sourcePkCols: []int{0},
+			selectPks:    []int{0},
+			orderBy: sqlparser.OrderBy{&sqlparser.Order{
+				Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("c1")},
+				Direction: sqlparser.AscOrder,
+			}},
+			aggregates: []*engine.AggregateParams{
+				engine.NewAggregateParam(opcode.AggregateSum, 2, nil, "", collations.MySQL8()),
+				engine.NewAggregateParam(opcode.AggregateSum, 3, nil, "", collations.MySQL8()),
+			},
+		},
+	}, {
+		// Date conversion on import.
+		input: &binlogdatapb.Rule{
+			Match: "datze",
+		},
+		sourceTimeZone: "US/Pacific",
+		table:          "datze",
+		tablePlan: &tablePlan{
+			dbName:       vdiffDBName,
+			table:        testSchema.TableDefinitions[tableDefMap["datze"]],
+			sourceQuery:  "select id, dt from datze order by id asc",
+			targetQuery:  "select id, convert_tz(dt, 'UTC', 'US/Pacific') as dt from datze order by id asc",
+			compareCols:  []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "id"}, {1, collations.MySQL8().LookupByName(sqltypes.NULL.String()), false, "dt"}},
+			comparePKs:   []compareColInfo{{0, collations.MySQL8().LookupByName(sqltypes.NULL.String()), true, "id"}},
+			pkCols:       []int{0},
+			sourcePkCols: []int{},
+			selectPks:    []int{0},
+			orderBy: sqlparser.OrderBy{&sqlparser.Order{
+				Expr:      &sqlparser.ColName{Name: sqlparser.NewIdentifierCI("id")},
+				Direction: sqlparser.AscOrder,
+			}},
+		},
+	}}
+
+	for _, tcase := range testcases {
+		t.Run(tcase.input.Filter, func(t *testing.T) {
+			if tcase.sourceTimeZone != "" {
+				ct.targetTimeZone = "UTC"
+				ct.sourceTimeZone = tcase.sourceTimeZone
+				defer func() {
+					ct.targetTimeZone = ""
+					ct.sourceTimeZone = ""
+				}()
+			}
+			dbc := binlogplayer.NewMockDBClient(t)
+			filter := &binlogdatapb.Filter{Rules: []*binlogdatapb.Rule{tcase.input}}
+			vdiffenv.opts.CoreOptions.Tables = tcase.table
+			wd, err := newWorkflowDiffer(ct, vdiffenv.opts, collations.MySQL8())
+			require.NoError(t, err)
+			dbc.ExpectRequestRE("select vdt.lastpk as lastpk, vdt.mismatch as mismatch, vdt.report as report", noResults, nil)
+			if len(tcase.tablePlan.table.PrimaryKeyColumns) == 0 {
+				result := noResults
+				if tcase.table == "nopkwithpke" { // This has a PKE column: c3
+					result = sqltypes.MakeTestResult(
+						sqltypes.MakeTestFields(
+							"column_name|index_name",
+							"varchar|varchar",
+						),
+						"c3|c3",
+					)
+				}
+				dbc.ExpectRequestRE("SELECT index_cols.COLUMN_NAME AS column_name, index_cols.INDEX_NAME as index_name FROM information_schema.STATISTICS", result, nil)
+			}
+			if len(tcase.tablePlan.comparePKs) > 0 {
+				columnList := make([]string, len(tcase.tablePlan.comparePKs))
+				collationList := make([]string, len(tcase.tablePlan.comparePKs))
+				env := collations.MySQL8()
+				for i := range tcase.tablePlan.comparePKs {
+					columnList[i] = tcase.tablePlan.comparePKs[i].colName
+					if tcase.tablePlan.comparePKs[i].collation != collations.Unknown {
+						collationList[i] = env.LookupName(tcase.tablePlan.comparePKs[i].collation)
+					} else {
+						collationList[i] = sqltypes.NULL.String()
+					}
+				}
+				columnBV, err := sqltypes.BuildBindVariable(columnList)
+				require.NoError(t, err)
+				query, err := sqlparser.ParseAndBind(sqlSelectColumnCollations,
+					sqltypes.StringBindVariable(vdiffDBName),
+					sqltypes.StringBindVariable(tcase.tablePlan.table.Name),
+					columnBV,
+				)
+				require.NoError(t, err)
+				dbc.ExpectRequest(query, sqltypes.MakeTestResult(sqltypes.MakeTestFields(
+					"collation_name",
+					"varchar",
+				),
+					collationList...,
+				), nil)
+			}
+			err = wd.buildPlan(dbc, filter, testSchema)
+			require.NoError(t, err, tcase.input)
+			require.Equal(t, 1, len(wd.tableDiffers), tcase.input)
+			wd.tableDiffers[tcase.table].tablePlan.WorkflowConfig = nil
+			assert.Equal(t, tcase.tablePlan, wd.tableDiffers[tcase.table].tablePlan, tcase.input)
+
+			// Confirm that the options are passed through.
+			for _, td := range wd.tableDiffers {
+				require.Equal(t, vdiffenv.opts, td.wd.opts)
+			}
+		})
+	}
+}
+
+func TestBuildPlanInclude(t *testing.T) {
+	vdenv := newTestVDiffEnv(t)
+	defer vdenv.close()
+
+	ct := vdenv.createController(t, 1)
+
+	schm := &tabletmanagerdatapb.SchemaDefinition{
+		TableDefinitions: []*tabletmanagerdatapb.TableDefinition{{
+			Name:              "t1",
+			Columns:           []string{"c1", "c2"},
+			PrimaryKeyColumns: []string{"c1"},
+			Fields:            sqltypes.MakeTestFields("c1|c2", "int64|int64"),
+		}, {
+			Name:              "t2",
+			Columns:           []string{"c1", "c2"},
+			PrimaryKeyColumns: []string{"c1"},
+			Fields:            sqltypes.MakeTestFields("c1|c2", "int64|int64"),
+		}, {
+			Name:              "t3",
+			Columns:           []string{"c1", "c2"},
+			PrimaryKeyColumns: []string{"c1"},
+			Fields:            sqltypes.MakeTestFields("c1|c2", "int64|int64"),
+		}, {
+			Name:              "t4",
+			Columns:           []string{"c1", "c2"},
+			PrimaryKeyColumns: []string{"c1"},
+			Fields:            sqltypes.MakeTestFields("c1|c2", "int64|int64"),
+		}},
+	}
+	vdiffenv.tmc.schema = schm
+	defer func() {
+		vdiffenv.tmc.schema = testSchema
+	}()
+	rule := &binlogdatapb.Rule{
+		Match: "/.*",
+	}
+	filter := &binlogdatapb.Filter{Rules: []*binlogdatapb.Rule{rule}}
+
+	testcases := []struct {
+		tables []string
+	}{
+		{tables: []string{"t2"}},
+		{tables: []string{"t2", "t3"}},
+		{tables: []string{"t1", "t2", "t3", "t4"}},
+		{tables: []string{"t1", "t2", "t3", "t4"}},
+	}
+
+	for _, tcase := range testcases {
+		dbc := binlogplayer.NewMockDBClient(t)
+		vdiffenv.opts.CoreOptions.Tables = strings.Join(tcase.tables, ",")
+		wd, err := newWorkflowDiffer(ct, vdiffenv.opts, collations.MySQL8())
+		require.NoError(t, err)
+		for _, table := range tcase.tables {
+			query := fmt.Sprintf(`select vdt.lastpk as lastpk, vdt.mismatch as mismatch, vdt.report as report
+						from _vt.vdiff as vd inner join _vt.vdiff_table as vdt on (vd.id = vdt.vdiff_id)
+						where vdt.vdiff_id = 1 and vdt.table_name = '%s'`, table)
+			dbc.ExpectRequest(query, noResults, nil)
+			dbc.ExpectRequestRE("select column_name as column_name, collation_name as collation_name from information_schema.columns .*", sqltypes.MakeTestResult(sqltypes.MakeTestFields(
+				"collation_name",
+				"varchar",
+			),
+				"NULL",
+			), nil)
+		}
+		err = wd.buildPlan(dbc, filter, schm)
+		require.NoError(t, err)
+		require.Equal(t, len(tcase.tables), len(wd.tableDiffers))
+	}
+}
+
+func TestBuildPlanFailure(t *testing.T) {
+	vdenv := newTestVDiffEnv(t)
+	defer vdenv.close()
+	UUID := uuid.New()
+
+	controllerQR := sqltypes.MakeTestResult(sqltypes.MakeTestFields(
+		vdiffTestCols,
+		vdiffTestColTypes,
+	),
+		fmt.Sprintf("1|%s|%s|%s|%s|%s|%s|%s|", UUID, vdiffenv.workflow, tstenv.KeyspaceName, tstenv.ShardName, vdiffDBName, PendingState, optionsJS),
+	)
+	vdiffenv.dbClient.ExpectRequest("select * from _vt.vdiff where id = 1 and db_name = "+encodeString(vdiffDBName), noResults, nil)
+	ct := vdenv.newController(t, controllerQR)
+	testcases := []struct {
+		input *binlogdatapb.Rule
+		err   string
+	}{{
+		input: &binlogdatapb.Rule{
+			Match:  "t1",
+			Filter: "bad query",
+		},
+		err: "syntax error at position 4 near 'bad'",
+	}, {
+		input: &binlogdatapb.Rule{
+			Match:  "t1",
+			Filter: "update t1 set c1=2",
+		},
+		err: "unexpected: update t1 set c1 = 2",
+	}, {
+		input: &binlogdatapb.Rule{
+			Match:  "t1",
+			Filter: "select c1+1 from t1",
+		},
+		err: "expression needs an alias: c1 + 1",
+	}, {
+		input: &binlogdatapb.Rule{
+			Match:  "t1",
+			Filter: "select next 2 values from t1",
+		},
+		err: "unexpected: select next 2 values from t1",
+	}, {
+		input: &binlogdatapb.Rule{
+			Match:  "t1",
+			Filter: "select c3 from t1",
+		},
+		err: fmt.Sprintf("column c3 not found in table t1 on tablet %v", &topodatapb.TabletAlias{Cell: "cell1", Uid: 100}),
+	}}
+	for _, tcase := range testcases {
+		dbc := binlogplayer.NewMockDBClient(t)
+		filter := &binlogdatapb.Filter{Rules: []*binlogdatapb.Rule{tcase.input}}
+		vdiffenv.opts.CoreOptions.Tables = tcase.input.Match
+		wd, err := newWorkflowDiffer(ct, vdiffenv.opts, collations.MySQL8())
+		require.NoError(t, err)
+		dbc.ExpectRequestRE("select vdt.lastpk as lastpk, vdt.mismatch as mismatch, vdt.report as report", noResults, nil)
+		err = wd.buildPlan(dbc, filter, testSchema)
+		assert.EqualError(t, err, tcase.err, tcase.input)
+	}
+}

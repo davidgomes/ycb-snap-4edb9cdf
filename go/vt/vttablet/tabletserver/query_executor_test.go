@@ -1,0 +1,2369 @@
+/*
+Copyright 2019 The Vitess Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package tabletserver
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"math/rand/v2"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"vitess.io/vitess/go/streamlog"
+
+	"vitess.io/vitess/go/stats"
+	"vitess.io/vitess/go/vt/sqlparser"
+	"vitess.io/vitess/go/vt/vtenv"
+
+	"vitess.io/vitess/go/mysql"
+	"vitess.io/vitess/go/mysql/fakesqldb"
+	"vitess.io/vitess/go/sqltypes"
+	"vitess.io/vitess/go/sync2"
+	"vitess.io/vitess/go/vt/callerid"
+	"vitess.io/vitess/go/vt/callinfo"
+	"vitess.io/vitess/go/vt/callinfo/fakecallinfo"
+	"vitess.io/vitess/go/vt/sidecardb"
+	"vitess.io/vitess/go/vt/tableacl"
+	"vitess.io/vitess/go/vt/tableacl/simpleacl"
+	"vitess.io/vitess/go/vt/topo/memorytopo"
+	"vitess.io/vitess/go/vt/vterrors"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/planbuilder"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/rules"
+	eschema "vitess.io/vitess/go/vt/vttablet/tabletserver/schema"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/tx"
+	"vitess.io/vitess/go/vt/vttablet/tabletserver/txthrottler"
+
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	tableaclpb "vitess.io/vitess/go/vt/proto/tableacl"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
+)
+
+func TestQueryExecutorPlans(t *testing.T) {
+	type dbResponse struct {
+		query  string
+		result *sqltypes.Result
+	}
+
+	dmlResult := &sqltypes.Result{
+		RowsAffected: 1,
+	}
+	fields := sqltypes.MakeTestFields("a|b", "int64|varchar")
+	selectResult := sqltypes.MakeTestResult(fields, "1|aaa")
+	emptyResult := &sqltypes.Result{}
+
+	// The queries are run both in and outside a transaction.
+	testcases := []struct {
+		// input is the input query.
+		input string
+		// passThrough specifies if planbuilder.PassthroughDML must be set.
+		passThrough bool
+		inDMLExec   bool
+		// dbResponses specifies the list of queries and responses to add to the fake db.
+		dbResponses []dbResponse
+		// resultWant is the result we want.
+		resultWant *sqltypes.Result
+		// planWant is the PlanType we want to see built.
+		planWant string
+		// logWant is the log of queries we expect to be executed.
+		logWant string
+		// inTxWant is the query log we expect if we're in a transation.
+		// If empty, then we should expect the same as logWant.
+		inTxWant string
+		// errorWant is the error we expect to get, if any, and should be nil if no error should be returned
+		errorWant    string
+		onlyInTxErr  bool
+		outsideTxErr bool
+		// TxThrottler allows the test case to override the transaction throttler
+		txThrottler txthrottler.TxThrottler
+	}{
+		{
+			input: "select * from t",
+			dbResponses: []dbResponse{{
+				query:  "select * from t limit 10001",
+				result: selectResult,
+			}},
+			resultWant: selectResult,
+			planWant:   "Select",
+			logWant:    "select * from t limit 10001",
+			inTxWant:   "select * from t limit 10001",
+		}, {
+			input: "select * from t limit 1",
+			dbResponses: []dbResponse{{
+				query:  "select * from t limit 1",
+				result: selectResult,
+			}},
+			resultWant: selectResult,
+			planWant:   "Select",
+			logWant:    "select * from t limit 1",
+			inTxWant:   "select * from t limit 1",
+		}, {
+			input: "show engines",
+			dbResponses: []dbResponse{{
+				query:  "show engines",
+				result: dmlResult,
+			}},
+			resultWant: dmlResult,
+			planWant:   "Show",
+			logWant:    "show engines",
+		}, {
+			input: "repair t",
+			dbResponses: []dbResponse{{
+				query:  "repair t",
+				result: dmlResult,
+			}},
+			resultWant: dmlResult,
+			planWant:   "OtherAdmin",
+			logWant:    "repair t",
+		}, {
+			input: "insert into test_table(a) values(1)",
+			dbResponses: []dbResponse{{
+				query:  "insert into test_table(a) values (1)",
+				result: dmlResult,
+			}},
+			resultWant: dmlResult,
+			planWant:   "Insert",
+			logWant:    "insert into test_table(a) values (1)",
+		}, {
+			input: "replace into test_table(a) values(1)",
+			dbResponses: []dbResponse{{
+				query:  "replace into test_table(a) values (1)",
+				result: dmlResult,
+			}},
+			resultWant: dmlResult,
+			planWant:   "Insert",
+			logWant:    "replace into test_table(a) values (1)",
+		}, {
+			input: "update test_table set a=1",
+			dbResponses: []dbResponse{{
+				query:  "update test_table set a = 1 limit 10001",
+				result: dmlResult,
+			}},
+			resultWant: dmlResult,
+			planWant:   "UpdateLimit",
+			// The UpdateLimit query will not use autocommit because
+			// it needs to roll back on failure.
+			logWant:  "begin; update test_table set a = 1 limit 10001; commit",
+			inTxWant: "update test_table set a = 1 limit 10001",
+		}, {
+			input:       "select a, b from test_table",
+			passThrough: true,
+			inDMLExec:   true,
+			dbResponses: []dbResponse{{
+				query:  "select a, b from test_table",
+				result: selectResult,
+			}},
+			resultWant:   selectResult,
+			planWant:     "SelectNoLimit",
+			logWant:      "select a, b from test_table",
+			outsideTxErr: true,
+			errorWant:    "[BUG] SelectNoLimit unexpected plan type",
+		}, {
+			input:       "update test_table set a=1",
+			passThrough: true,
+			dbResponses: []dbResponse{{
+				query:  "update test_table set a = 1",
+				result: dmlResult,
+			}},
+			resultWant: dmlResult,
+			planWant:   "Update",
+			logWant:    "update test_table set a = 1",
+		}, {
+			input: "delete from test_table",
+			dbResponses: []dbResponse{{
+				query:  "delete from test_table limit 10001",
+				result: dmlResult,
+			}},
+			resultWant: dmlResult,
+			planWant:   "DeleteLimit",
+			// The DeleteLimit query will not use autocommit because
+			// it needs to roll back on failure.
+			logWant:  "begin; delete from test_table limit 10001; commit",
+			inTxWant: "delete from test_table limit 10001",
+		}, {
+			input:       "delete from test_table",
+			passThrough: true,
+			dbResponses: []dbResponse{{
+				query:  "delete from test_table",
+				result: dmlResult,
+			}},
+			resultWant: dmlResult,
+			planWant:   "Delete",
+			logWant:    "delete from test_table",
+		}, {
+			input: "alter table test_table add zipcode int",
+			dbResponses: []dbResponse{{
+				query:  "alter table test_table add column zipcode int",
+				result: dmlResult,
+			}},
+			resultWant:  dmlResult,
+			planWant:    "DDL",
+			logWant:     "alter table test_table add column zipcode int",
+			onlyInTxErr: true,
+			errorWant:   "DDL statement executed inside a transaction",
+		}, {
+			input: "savepoint a",
+			dbResponses: []dbResponse{{
+				query:  "savepoint a",
+				result: emptyResult,
+			}},
+			resultWant: emptyResult,
+			planWant:   "Savepoint",
+			logWant:    "savepoint a",
+			inTxWant:   "savepoint a",
+		}, {
+			input: "create index a on user(id)",
+			dbResponses: []dbResponse{{
+				query:  "alter table `user` add key a (id)",
+				result: emptyResult,
+			}},
+			resultWant:  emptyResult,
+			planWant:    "DDL",
+			logWant:     "alter table `user` add key a (id)",
+			inTxWant:    "alter table `user` add key a (id)",
+			onlyInTxErr: true,
+			errorWant:   "DDL statement executed inside a transaction",
+		}, {
+			input: "create index a on user(id1 + id2)",
+			dbResponses: []dbResponse{{
+				query:  "create index a on user(id1 + id2)",
+				result: emptyResult,
+			}},
+			resultWant:  emptyResult,
+			planWant:    "DDL",
+			logWant:     "create index a on user(id1 + id2)",
+			inTxWant:    "create index a on user(id1 + id2)",
+			onlyInTxErr: true,
+			errorWant:   "DDL statement executed inside a transaction",
+		}, {
+			input: "ROLLBACK work to SAVEPOINT a",
+			dbResponses: []dbResponse{{
+				query:  "ROLLBACK work to SAVEPOINT a",
+				result: emptyResult,
+			}},
+			resultWant: emptyResult,
+			planWant:   "RollbackSavepoint",
+			logWant:    "ROLLBACK work to SAVEPOINT a",
+			inTxWant:   "ROLLBACK work to SAVEPOINT a",
+		}, {
+			input: "RELEASE savepoint a",
+			dbResponses: []dbResponse{{
+				query:  "RELEASE savepoint a",
+				result: emptyResult,
+			}},
+			resultWant: emptyResult,
+			planWant:   "Release",
+			logWant:    "RELEASE savepoint a",
+			inTxWant:   "RELEASE savepoint a",
+		}, {
+			input: "show create database db_name",
+			dbResponses: []dbResponse{{
+				query:  "show create database ks",
+				result: emptyResult,
+			}},
+			resultWant: emptyResult,
+			planWant:   "Show",
+			logWant:    "show create database ks",
+		}, {
+			input: "show create database mysql",
+			dbResponses: []dbResponse{{
+				query:  "show create database mysql",
+				result: emptyResult,
+			}},
+			resultWant: emptyResult,
+			planWant:   "Show",
+			logWant:    "show create database mysql",
+		}, {
+			input: "show create table mysql.user",
+			dbResponses: []dbResponse{{
+				query:  "show create table mysql.`user`",
+				result: emptyResult,
+			}},
+			resultWant: emptyResult,
+			planWant:   "Show",
+			logWant:    "show create table mysql.`user`",
+		}, {
+			input: "update test_table set a=1",
+			dbResponses: []dbResponse{{
+				query:  "update test_table set a = 1 limit 10001",
+				result: dmlResult,
+			}},
+			errorWant:   "Transaction throttled",
+			txThrottler: &mockTxThrottler{true},
+		}, {
+			input:       "update test_table set a=1",
+			passThrough: true,
+			dbResponses: []dbResponse{{
+				query:  "update test_table set a = 1 limit 10001",
+				result: dmlResult,
+			}},
+			errorWant:   "Transaction throttled",
+			txThrottler: &mockTxThrottler{true},
+		},
+	}
+	for _, tcase := range testcases {
+		t.Run(tcase.input, func(t *testing.T) {
+			db := setUpQueryExecutorTest(t)
+			defer db.Close()
+			for _, dbr := range tcase.dbResponses {
+				db.AddQuery(dbr.query, dbr.result)
+			}
+			ctx := t.Context()
+			tsv := newTestTabletServer(ctx, noFlags, db)
+			if tcase.txThrottler != nil {
+				tsv.txThrottler = tcase.txThrottler
+			}
+			tsv.config.DB.DBName = "ks"
+			defer tsv.StopService()
+
+			tsv.SetPassthroughDMLs(tcase.passThrough)
+
+			// Test outside a transaction.
+			qre := newTestQueryExecutorWithRowsLimit(ctx, tsv, tcase.input, 0, tcase.passThrough && tcase.inDMLExec)
+			got, err := qre.Execute()
+			if tcase.outsideTxErr || (tcase.errorWant != "" && !tcase.onlyInTxErr) {
+				assert.EqualError(t, err, tcase.errorWant)
+			} else {
+				require.NoError(t, err, tcase.input)
+				assert.Equal(t, tcase.resultWant, got, tcase.input)
+				assert.Equal(t, tcase.planWant, qre.logStats.PlanType, tcase.input)
+				assert.Equal(t, tcase.logWant, qre.logStats.RewrittenSQL(), tcase.input)
+			}
+			// Wait for the existing query to be processed by the cache
+			time.Sleep(100 * time.Millisecond)
+
+			// Test inside a transaction.
+			target := tsv.sm.Target()
+			state, err := tsv.Begin(ctx, nil, target, nil)
+			if !tcase.outsideTxErr && tcase.errorWant != "" && !tcase.onlyInTxErr {
+				require.EqualError(t, err, tcase.errorWant)
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, state.TabletAlias, "alias should not be nil")
+			assert.Equal(t, tsv.alias, state.TabletAlias, "Wrong alias returned by Begin")
+			defer tsv.Commit(ctx, target, state.TransactionID)
+
+			qre = newTestQueryExecutorWithRowsLimit(ctx, tsv, tcase.input, state.TransactionID, tcase.passThrough && tcase.inDMLExec)
+			got, err = qre.Execute()
+			if tcase.onlyInTxErr {
+				require.EqualError(t, err, tcase.errorWant)
+				return
+			}
+			require.NoError(t, err, tcase.input)
+			assert.Equal(t, tcase.resultWant, got, "in tx: %v", tcase.input)
+			assert.Equal(t, tcase.planWant, qre.logStats.PlanType, "in tx: %v", tcase.input)
+			want := tcase.logWant
+			if tcase.inTxWant != "" {
+				want = tcase.inTxWant
+			}
+			assert.Equal(t, want, qre.logStats.RewrittenSQL(), "in tx: %v", tcase.input)
+		})
+	}
+}
+
+func TestQueryExecutorQueryAnnotation(t *testing.T) {
+	type dbResponse struct {
+		query  string
+		result *sqltypes.Result
+	}
+
+	fields := sqltypes.MakeTestFields("a|b", "int64|varchar")
+	selectResult := sqltypes.MakeTestResult(fields, "1|aaa")
+
+	testcases := []struct {
+		// input is the input query.
+		input string
+		// passThrough specifies if planbuilder.PassthroughDML must be set.
+		passThrough bool
+		// dbResponses specifes the list of queries and responses to add to the fake db.
+		dbResponses []dbResponse
+		// resultWant is the result we want.
+		resultWant *sqltypes.Result
+		// planWant is the PlanType we want to see built.
+		planWant string
+		// logWant is the log of queries we expect to be executed.
+		logWant string
+		// If empty, then we should expect the same as logWant.
+		inTxWant string
+	}{{
+		input: "select * from t",
+		dbResponses: []dbResponse{{
+			query:  "select * from t limit 10001",
+			result: selectResult,
+		}, {
+			query:  "/* u1@PRIMARY */ select * from t limit 10001",
+			result: selectResult,
+		}},
+		resultWant: selectResult,
+		planWant:   "Select",
+		logWant:    "/* u1@PRIMARY */ select * from t limit 10001",
+		inTxWant:   "/* u1@PRIMARY */ select * from t limit 10001",
+	}}
+	for _, tcase := range testcases {
+		t.Run(tcase.input, func(t *testing.T) {
+			db := setUpQueryExecutorTest(t)
+			defer db.Close()
+			for _, dbr := range tcase.dbResponses {
+				db.AddQuery(dbr.query, dbr.result)
+			}
+			callerID := &querypb.VTGateCallerID{
+				Username: "u1",
+			}
+			ctx := callerid.NewContext(t.Context(), nil, callerID)
+			tsv := newTestTabletServer(ctx, noFlags, db)
+			tsv.config.DB.DBName = "ks"
+			tsv.config.AnnotateQueries = true
+			defer tsv.StopService()
+
+			tsv.SetPassthroughDMLs(tcase.passThrough)
+
+			// Test outside a transaction.
+			qre := newTestQueryExecutor(ctx, tsv, tcase.input, 0)
+			got, err := qre.Execute()
+			require.NoError(t, err, tcase.input)
+			assert.Equal(t, tcase.resultWant, got, tcase.input)
+			assert.Equal(t, tcase.planWant, qre.logStats.PlanType, tcase.input)
+			assert.Equal(t, tcase.logWant, qre.logStats.RewrittenSQL(), tcase.input)
+
+			// Wait for the existing query to be processed by the cache
+			time.Sleep(100 * time.Millisecond)
+
+			// Test inside a transaction.
+			target := tsv.sm.Target()
+			state, err := tsv.Begin(ctx, nil, target, nil)
+			require.NoError(t, err)
+			require.NotNil(t, state.TabletAlias, "alias should not be nil")
+			assert.Equal(t, tsv.alias, state.TabletAlias, "Wrong alias returned by Begin")
+			defer tsv.Commit(ctx, target, state.TransactionID)
+
+			qre = newTestQueryExecutor(ctx, tsv, tcase.input, state.TransactionID)
+			got, err = qre.Execute()
+			require.NoError(t, err, tcase.input)
+			assert.Equal(t, tcase.resultWant, got, "in tx: %v", tcase.input)
+			assert.Equal(t, tcase.planWant, qre.logStats.PlanType, "in tx: %v", tcase.input)
+			want := tcase.logWant
+			if tcase.inTxWant != "" {
+				want = tcase.inTxWant
+			}
+			assert.Equal(t, want, qre.logStats.RewrittenSQL(), "in tx: %v", tcase.input)
+		})
+	}
+}
+
+// TestQueryExecutorSelectImpossible is separate because it's a special case
+// because the "in transaction" case is a no-op.
+func TestQueryExecutorSelectImpossible(t *testing.T) {
+	type dbResponse struct {
+		query  string
+		result *sqltypes.Result
+	}
+
+	fields := sqltypes.MakeTestFields("a|b", "int64|varchar")
+	fieldResult := sqltypes.MakeTestResult(fields)
+
+	testcases := []struct {
+		input       string
+		dbResponses []dbResponse
+		resultWant  *sqltypes.Result
+		planWant    string
+		logWant     string
+		inTxWant    string
+	}{{
+		input: "select * from t where 1 != 1",
+		dbResponses: []dbResponse{{
+			query:  "select * from t where 1 != 1 limit 10001",
+			result: fieldResult,
+		}},
+		resultWant: fieldResult,
+		planWant:   "SelectImpossible",
+		logWant:    "select * from t where 1 != 1 limit 10001",
+		inTxWant:   "select * from t where 1 != 1 limit 10001",
+	}}
+	for _, tcase := range testcases {
+		func() {
+			db := setUpQueryExecutorTest(t)
+			defer db.Close()
+			for _, dbr := range tcase.dbResponses {
+				db.AddQuery(dbr.query, dbr.result)
+			}
+			ctx := t.Context()
+			tsv := newTestTabletServer(ctx, noFlags, db)
+			defer tsv.StopService()
+
+			qre := newTestQueryExecutor(ctx, tsv, tcase.input, 0)
+			got, err := qre.Execute()
+			require.NoError(t, err, tcase.input)
+			assert.Equal(t, tcase.resultWant, got, tcase.input)
+			assert.Equal(t, tcase.planWant, qre.logStats.PlanType, tcase.input)
+			assert.Equal(t, tcase.logWant, qre.logStats.RewrittenSQL(), tcase.input)
+			target := tsv.sm.Target()
+			state, err := tsv.Begin(ctx, nil, target, nil)
+			require.NoError(t, err)
+			require.NotNil(t, state.TabletAlias, "alias should not be nil")
+			assert.Equal(t, tsv.alias, state.TabletAlias, "Wrong tablet alias from Begin")
+			defer tsv.Commit(ctx, target, state.TransactionID)
+
+			qre = newTestQueryExecutor(ctx, tsv, tcase.input, state.TransactionID)
+			got, err = qre.Execute()
+			require.NoError(t, err, tcase.input)
+			assert.Equal(t, tcase.resultWant, got, "in tx: %v", tcase.input)
+			assert.Equal(t, tcase.planWant, qre.logStats.PlanType, "in tx: %v", tcase.input)
+			assert.Equal(t, tcase.inTxWant, qre.logStats.RewrittenSQL(), "in tx: %v", tcase.input)
+		}()
+	}
+}
+
+// TestDisableOnlineDDL checks whether disabling online DDLs throws the correct error or not
+func TestDisableOnlineDDL(t *testing.T) {
+	db := setUpQueryExecutorTest(t)
+	defer db.Close()
+	query := "ALTER VITESS_MIGRATION CANCEL ALL"
+
+	db.SetNeverFail(true)
+	defer db.SetNeverFail(false)
+
+	ctx := t.Context()
+	tsv := newTestTabletServer(ctx, noFlags, db)
+
+	qre := newTestQueryExecutor(ctx, tsv, query, 0)
+	_, err := qre.Execute()
+	require.NoError(t, err)
+	tsv.StopService()
+
+	tsv = newTestTabletServer(ctx, disableOnlineDDL, db)
+	defer tsv.StopService()
+
+	qre = newTestQueryExecutor(ctx, tsv, query, 0)
+	_, err = qre.Execute()
+	require.EqualError(t, err, "online DDL is disabled")
+}
+
+func TestExecDDLSchemaTableCountLimit(t *testing.T) {
+	type setup struct {
+		// limit is what we set the dynamic flag to.
+		limit int
+		// preloadedTables are tables we install in the schema engine before
+		// the test runs (representing the "current" set on disk).
+		preloadedTables []string
+		// query is the DDL to execute.
+		query string
+		// wantErrContains is non-empty if we expect a rejection from our gate.
+		// When empty we expect the gate to let the request through.
+		wantErrContains string
+	}
+	cases := []struct {
+		name string
+		setup
+	}{
+		{
+			name: "below_limit_create_passes_gate",
+			setup: setup{
+				limit:           10,
+				preloadedTables: []string{"a", "b"},
+				query:           "create table c (id int primary key)",
+			},
+		},
+		{
+			name: "at_limit_plain_create_rejected",
+			setup: setup{
+				limit:           2,
+				preloadedTables: []string{"a", "b"},
+				query:           "create table c (id int primary key)",
+				wantErrContains: "schema engine table limit of 2 reached",
+			},
+		},
+		{
+			name: "at_limit_create_view_rejected",
+			setup: setup{
+				limit:           2,
+				preloadedTables: []string{"a", "b"},
+				query:           "create view c as select 1 from dual",
+				wantErrContains: "schema engine table limit of 2 reached",
+			},
+		},
+		{
+			name: "at_limit_if_not_exists_on_existing_passes",
+			setup: setup{
+				limit:           2,
+				preloadedTables: []string{"a", "b"},
+				query:           "create table if not exists a (id int primary key)",
+			},
+		},
+		{
+			name: "at_limit_create_on_existing_passes_gate",
+			setup: setup{
+				limit:           2,
+				preloadedTables: []string{"a", "b"},
+				query:           "create table a (id int primary key)",
+			},
+		},
+		{
+			name: "at_limit_temporary_passes",
+			setup: setup{
+				limit:           2,
+				preloadedTables: []string{"a", "b"},
+				query:           "create temporary table c (id int primary key)",
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := setUpQueryExecutorTest(t)
+			defer db.Close()
+			// Register a pattern so any CREATE TABLE DDL that reaches MySQL
+			// returns an empty success result rather than an "unsupported
+			// query" error.  The deferred schema reload may still encounter
+			// errors for unregistered queries (e.g. SHOW CREATE TABLE), but
+			// those errors are only logged – they do not propagate back
+			// through execDDL.
+			db.AddQueryPattern("create.*", &sqltypes.Result{})
+
+			ctx := t.Context()
+			tsv := newTestTabletServer(ctx, noFlags, db)
+			defer tsv.StopService()
+
+			// Reset the engine's table set so TableCount() exactly equals
+			// len(preloadedTables) when the gate runs. The deferred schema reload
+			// after Execute will repopulate the engine — that is fine, it happens
+			// after the gate check.
+			tsv.se.ResetTablesForTests()
+
+			// Override the dynamic flag for this test only, restoring
+			// whatever value was in effect at entry.
+			originalLimit := eschema.MaxTableCount()
+			eschema.SetMaxTableCount(tc.limit)
+			t.Cleanup(func() { eschema.SetMaxTableCount(originalLimit) })
+
+			// Add the preloaded tables into the schema engine.
+			for _, name := range tc.preloadedTables {
+				tsv.se.SetTableForTests(eschema.NewTable(name, eschema.NoType))
+			}
+
+			qre := newTestQueryExecutor(ctx, tsv, tc.query, 0)
+			_, err := qre.Execute()
+
+			if tc.wantErrContains == "" {
+				// Either the request passed our gate (success) or it failed
+				// downstream for unrelated reasons; what matters is that the
+				// error is NOT our limit error.
+				if err != nil {
+					assert.NotContains(t, err.Error(), "schema engine table limit")
+				}
+			} else {
+				require.Error(t, err)
+				assert.ErrorContains(t, err, tc.wantErrContains)
+				assert.Equal(t, vtrpcpb.Code_RESOURCE_EXHAUSTED, vterrors.Code(err))
+			}
+		})
+	}
+}
+
+func TestExecDDLSchemaTableCountLimitIgnoresSyntheticDual(t *testing.T) {
+	db := setUpQueryExecutorTest(t)
+	defer db.Close()
+	db.AddQueryPattern("create.*", &sqltypes.Result{})
+
+	ctx := t.Context()
+	tsv := newTestTabletServer(ctx, noFlags, db)
+	defer tsv.StopService()
+
+	originalLimit := eschema.MaxTableCount()
+	eschema.SetMaxTableCount(4)
+	t.Cleanup(func() { eschema.SetMaxTableCount(originalLimit) })
+
+	// The test schema starts with 3 real tables plus Vitess's synthetic dual.
+	// Creating a fourth real table should be allowed when the limit is 4.
+	qre := newTestQueryExecutor(ctx, tsv, "create table c (id int primary key)", 0)
+	_, err := qre.Execute()
+	if err != nil {
+		assert.NotContains(t, err.Error(), "schema engine table limit")
+	}
+}
+
+func TestQueryExecutorLimitFailure(t *testing.T) {
+	type dbResponse struct {
+		query  string
+		result *sqltypes.Result
+	}
+
+	dmlResult := &sqltypes.Result{
+		RowsAffected: 3,
+	}
+	fields := sqltypes.MakeTestFields("a|b", "int64|varchar")
+	fieldResult := sqltypes.MakeTestResult(fields)
+	selectResult := sqltypes.MakeTestResult(fields, "1|aaa", "2|bbb", "3|ccc")
+
+	// The queries are run both in and outside a transaction.
+	testcases := []struct {
+		input        string
+		dbResponses  []dbResponse
+		err          string
+		logWant      string
+		inTxWant     string
+		testRollback bool
+	}{{
+		input: "select * from t",
+		dbResponses: []dbResponse{{
+			query:  "select * from t where 1 != 1",
+			result: fieldResult,
+		}, {
+			query:  "select * from t limit 3",
+			result: selectResult,
+		}},
+		err:      "count exceeded",
+		logWant:  "select * from t limit 3",
+		inTxWant: "select * from t limit 3",
+	}, {
+		input: "update test_table set a=1",
+		dbResponses: []dbResponse{{
+			query:  "update test_table set a = 1 limit 3",
+			result: dmlResult,
+		}},
+		err:          "count exceeded",
+		logWant:      "begin; update test_table set a = 1 limit 3; rollback",
+		inTxWant:     "update test_table set a = 1 limit 3; rollback",
+		testRollback: true,
+	}, {
+		input: "delete from test_table",
+		dbResponses: []dbResponse{{
+			query:  "delete from test_table limit 3",
+			result: dmlResult,
+		}},
+		err:          "count exceeded",
+		logWant:      "begin; delete from test_table limit 3; rollback",
+		inTxWant:     "delete from test_table limit 3; rollback",
+		testRollback: true,
+	}, {
+		// There should be no rollback on normal failures.
+		input:       "update test_table set a=1",
+		dbResponses: nil,
+		err:         "not supported",
+		logWant:     "begin; update test_table set a = 1 limit 3; rollback",
+		inTxWant:    "update test_table set a = 1 limit 3",
+	}, {
+		// There should be no rollback on normal failures.
+		input:       "delete from test_table",
+		dbResponses: nil,
+		err:         "not supported",
+		logWant:     "begin; delete from test_table limit 3; rollback",
+		inTxWant:    "delete from test_table limit 3",
+	}}
+	for i, tcase := range testcases {
+		t.Run(fmt.Sprintf("%d - %s", i, tcase.input), func(t *testing.T) {
+			db := setUpQueryExecutorTest(t)
+			defer db.Close()
+			for _, dbr := range tcase.dbResponses {
+				db.AddQuery(dbr.query, dbr.result)
+			}
+			ctx := callerid.NewContext(t.Context(), callerid.NewEffectiveCallerID("a", "b", "c"), callerid.NewImmediateCallerID("d"))
+			tsv := newTestTabletServer(ctx, smallResultSize, db)
+			defer tsv.StopService()
+
+			tsv.SetPassthroughDMLs(false)
+
+			// Test outside a transaction.
+			qre := newTestQueryExecutor(ctx, tsv, tcase.input, 0)
+			_, err := qre.Execute()
+			assert.Error(t, err)
+			assert.Contains(t, err.Error(), tcase.err)
+			assert.Equal(t, tcase.logWant, qre.logStats.RewrittenSQL(), tcase.input)
+
+			// Test inside a transaction.
+			target := tsv.sm.Target()
+			state, err := tsv.Begin(ctx, nil, target, nil)
+			require.NoError(t, err)
+			require.NotNil(t, state.TabletAlias, "alias should not be nil")
+			assert.Equal(t, tsv.alias, state.TabletAlias, "Wrong tablet alias from Begin")
+			defer tsv.Commit(ctx, target, state.TransactionID)
+
+			qre = newTestQueryExecutor(ctx, tsv, tcase.input, state.TransactionID)
+			_, err = qre.Execute()
+			assert.Error(t, err)
+			assert.Contains(t, err.Error(), tcase.err)
+
+			want := tcase.logWant
+			if tcase.inTxWant != "" {
+				want = tcase.inTxWant
+			}
+			assert.Equal(t, want, qre.logStats.RewrittenSQL(), "in tx: %v", tcase.input)
+
+			if !tcase.testRollback {
+				return
+			}
+			// Ensure transaction was rolled back.
+			conn, err := tsv.te.txPool.GetAndLock(state.TransactionID, "")
+			require.NoError(t, err)
+			defer conn.Release(tx.TxClose)
+
+			require.False(t, conn.IsInTransaction(), "connection is still in a transaction")
+		})
+	}
+}
+
+func TestQueryExecutorPlanPassSelectWithLockOutsideATransaction(t *testing.T) {
+	db := setUpQueryExecutorTest(t)
+	defer db.Close()
+	query := "select * from test_table for update"
+	want := &sqltypes.Result{
+		Fields: getTestTableFields(),
+		Rows:   [][]sqltypes.Value{},
+	}
+	db.AddQuery(query, want)
+	db.AddQuery("select * from test_table limit 10001 for update", &sqltypes.Result{
+		Fields: getTestTableFields(),
+	})
+	ctx := t.Context()
+	tsv := newTestTabletServer(ctx, noFlags, db)
+	qre := newTestQueryExecutor(ctx, tsv, query, 0)
+	defer tsv.StopService()
+	assert.Equal(t, planbuilder.PlanSelect, qre.plan.PlanID)
+	_, err := qre.Execute()
+	assert.NoError(t, err)
+}
+
+func TestQueryExecutorPlanNextval(t *testing.T) {
+	db := setUpQueryExecutorTest(t)
+	defer db.Close()
+	selQuery := "select next_id, cache from seq where id = 0 for update"
+	db.AddQuery(selQuery, &sqltypes.Result{
+		Fields: []*querypb.Field{
+			{Type: sqltypes.Int64},
+			{Type: sqltypes.Int64},
+		},
+		Rows: [][]sqltypes.Value{{
+			sqltypes.NewInt64(1),
+			sqltypes.NewInt64(3),
+		}},
+	})
+	updateQuery := "update seq set next_id = 4 where id = 0"
+	db.AddQuery(updateQuery, &sqltypes.Result{})
+	ctx := t.Context()
+	tsv := newTestTabletServer(ctx, noFlags, db)
+	defer tsv.StopService()
+	qre := newTestQueryExecutor(ctx, tsv, "select next value from seq", 0)
+	assert.Equal(t, planbuilder.PlanNextval, qre.plan.PlanID)
+	got, err := qre.Execute()
+	require.NoError(t, err)
+	want := &sqltypes.Result{
+		Fields: []*querypb.Field{{
+			Name: "nextval",
+			Type: sqltypes.Int64,
+		}},
+		Rows: [][]sqltypes.Value{{
+			sqltypes.NewInt64(1),
+		}},
+	}
+	assert.Equal(t, want, got)
+
+	// At this point, NextVal==2, LastVal==4.
+	// So, a single value gen should not cause a db access.
+	db.DeleteQuery(selQuery)
+	qre = newTestQueryExecutor(ctx, tsv, "select next 1 values from seq", 0)
+	got, err = qre.Execute()
+	require.NoError(t, err)
+	want = &sqltypes.Result{
+		Fields: []*querypb.Field{{
+			Name: "nextval",
+			Type: sqltypes.Int64,
+		}},
+		Rows: [][]sqltypes.Value{{
+			sqltypes.NewInt64(2),
+		}},
+	}
+	require.Truef(t, got.Equal(want), "qre.Execute() =\n%#v, want:\n%#v", got, want)
+
+	// NextVal==3, LastVal==4
+	// Let's try the next 2 values.
+	db.AddQuery(selQuery, &sqltypes.Result{
+		Fields: []*querypb.Field{
+			{Type: sqltypes.Int64},
+			{Type: sqltypes.Int64},
+		},
+		Rows: [][]sqltypes.Value{{
+			sqltypes.NewInt64(4),
+			sqltypes.NewInt64(3),
+		}},
+	})
+	updateQuery = "update seq set next_id = 7 where id = 0"
+	db.AddQuery(updateQuery, &sqltypes.Result{})
+	qre = newTestQueryExecutor(ctx, tsv, "select next 2 values from seq", 0)
+	got, err = qre.Execute()
+	require.NoError(t, err)
+	want = &sqltypes.Result{
+		Fields: []*querypb.Field{{
+			Name: "nextval",
+			Type: sqltypes.Int64,
+		}},
+		Rows: [][]sqltypes.Value{{
+			sqltypes.NewInt64(3),
+		}},
+	}
+	require.Truef(t, got.Equal(want), "qre.Execute() =\n%#v, want:\n%#v", got, want)
+
+	// NextVal==5, LastVal==7
+	// Let's try jumping a full cache range.
+	db.AddQuery(selQuery, &sqltypes.Result{
+		Fields: []*querypb.Field{
+			{Type: sqltypes.Int64},
+			{Type: sqltypes.Int64},
+		},
+		Rows: [][]sqltypes.Value{{
+			sqltypes.NewInt64(7),
+			sqltypes.NewInt64(3),
+		}},
+	})
+	updateQuery = "update seq set next_id = 13 where id = 0"
+	db.AddQuery(updateQuery, &sqltypes.Result{})
+	qre = newTestQueryExecutor(ctx, tsv, "select next 6 values from seq", 0)
+	got, err = qre.Execute()
+	require.NoError(t, err)
+	want = &sqltypes.Result{
+		Fields: []*querypb.Field{{
+			Name: "nextval",
+			Type: sqltypes.Int64,
+		}},
+		Rows: [][]sqltypes.Value{{
+			sqltypes.NewInt64(5),
+		}},
+	}
+	require.Truef(t, got.Equal(want), "qre.Execute() =\n%#v, want:\n%#v", got, want)
+}
+
+func TestQueryExecutorMessageStreamACL(t *testing.T) {
+	ctx := t.Context()
+	aclName := fmt.Sprintf("simpleacl-test-%d", rand.Int64())
+	tableacl.Register(aclName, &simpleacl.Factory{})
+	tableacl.SetDefaultACL(aclName)
+	config := &tableaclpb.Config{
+		TableGroups: []*tableaclpb.TableGroupSpec{{
+			Name:                 "group02",
+			TableNamesOrPrefixes: []string{"msg"},
+			Readers:              []string{"u2"},
+			Writers:              []string{"u1"},
+		}},
+	}
+	if err := tableacl.InitFromProto(config); err != nil {
+		require.NoError(t, err)
+	}
+
+	db := setUpQueryExecutorTest(t)
+	defer db.Close()
+
+	tsv := newTestTabletServer(ctx, enableStrictTableACL, db)
+	defer tsv.StopService()
+
+	plan, err := tsv.qe.GetMessageStreamPlan("msg")
+	require.NoError(t, err)
+
+	callerID := &querypb.VTGateCallerID{
+		Username: "u1",
+	}
+	ctx = callerid.NewContext(ctx, nil, callerID)
+	qre := &QueryExecutor{
+		ctx:      ctx,
+		query:    "stream from msg",
+		plan:     plan,
+		logStats: tabletenv.NewLogStats(ctx, "TestQueryExecutor", streamlog.NewQueryLogConfigForTest()),
+		tsv:      tsv,
+	}
+
+	// Should not fail because u1 has permission.
+	err = qre.MessageStream(func(qr *sqltypes.Result) error {
+		return io.EOF
+	})
+	require.NoError(t, err)
+
+	callerID = &querypb.VTGateCallerID{
+		Username: "u2",
+		Groups:   []string{"non-admin"},
+	}
+	qre.ctx = callerid.NewContext(t.Context(), nil, callerID)
+	// Should fail because u2 does not have permission.
+	err = qre.MessageStream(func(qr *sqltypes.Result) error {
+		return io.EOF
+	})
+
+	assert.EqualError(t, err, `MessageStream command denied to user 'u2', in groups [non-admin], for table 'msg' (ACL check error)`)
+	require.Equalf(t, vtrpcpb.Code_PERMISSION_DENIED, vterrors.Code(err), "qre.Execute: %v, want %v", vterrors.Code(err), vtrpcpb.Code_PERMISSION_DENIED)
+}
+
+func TestQueryExecutorTableAcl(t *testing.T) {
+	aclName := fmt.Sprintf("simpleacl-test-%d", rand.Int64())
+	tableacl.Register(aclName, &simpleacl.Factory{})
+	tableacl.SetDefaultACL(aclName)
+	db := setUpQueryExecutorTest(t)
+	defer db.Close()
+	query := "select * from test_table limit 1000"
+	want := &sqltypes.Result{
+		Fields: getTestTableFields(),
+	}
+	db.AddQuery(query, want)
+	db.AddQuery("select * from test_table where 1 != 1", &sqltypes.Result{
+		Fields: getTestTableFields(),
+	})
+
+	username := "u2"
+	callerID := &querypb.VTGateCallerID{
+		Username: username,
+	}
+	ctx := callerid.NewContext(t.Context(), nil, callerID)
+	config := &tableaclpb.Config{
+		TableGroups: []*tableaclpb.TableGroupSpec{{
+			Name:                 "group01",
+			TableNamesOrPrefixes: []string{"test_table"},
+			Readers:              []string{username},
+		}},
+	}
+	if err := tableacl.InitFromProto(config); err != nil {
+		require.NoError(t, err)
+	}
+
+	tsv := newTestTabletServer(ctx, noFlags, db)
+	qre := newTestQueryExecutor(ctx, tsv, query, 0)
+	defer tsv.StopService()
+	assert.Equal(t, planbuilder.PlanSelect, qre.plan.PlanID)
+	got, err := qre.Execute()
+	require.NoError(t, err)
+	require.Truef(t, got.Equal(want), "qre.Execute() = %v, want: %v", got, want)
+}
+
+func TestQueryExecutorTableAclNoPermission(t *testing.T) {
+	aclName := fmt.Sprintf("simpleacl-test-%d", rand.Int64())
+	tableacl.Register(aclName, &simpleacl.Factory{})
+	tableacl.SetDefaultACL(aclName)
+	db := setUpQueryExecutorTest(t)
+	defer db.Close()
+	query := "select * from test_table limit 1000"
+	want := &sqltypes.Result{
+		Fields: getTestTableFields(),
+	}
+	db.AddQuery(query, want)
+	db.AddQuery("select * from test_table where 1 != 1", &sqltypes.Result{
+		Fields: getTestTableFields(),
+	})
+
+	username := "u2"
+	callerID := &querypb.VTGateCallerID{
+		Username: username,
+	}
+	ctx := callerid.NewContext(t.Context(), nil, callerID)
+	config := &tableaclpb.Config{
+		TableGroups: []*tableaclpb.TableGroupSpec{{
+			Name:                 "group02",
+			TableNamesOrPrefixes: []string{"test_table"},
+			Readers:              []string{"superuser"},
+		}},
+	}
+
+	if err := tableacl.InitFromProto(config); err != nil {
+		require.NoError(t, err)
+	}
+	// without enabling Config.StrictTableAcl
+	tsv := newTestTabletServer(ctx, noFlags, db)
+	qre := newTestQueryExecutor(ctx, tsv, query, 0)
+	assert.Equal(t, planbuilder.PlanSelect, qre.plan.PlanID)
+	got, err := qre.Execute()
+	require.NoError(t, err)
+	require.Truef(t, got.Equal(want), "qre.Execute() = %v, want: %v", got, want)
+	tsv.StopService()
+
+	// enable Config.StrictTableAcl
+	tsv = newTestTabletServer(ctx, enableStrictTableACL, db)
+	qre = newTestQueryExecutor(ctx, tsv, query, 0)
+	defer tsv.StopService()
+	assert.Equal(t, planbuilder.PlanSelect, qre.plan.PlanID)
+	// query should fail because current user do not have read permissions
+	_, err = qre.Execute()
+	require.Error(t, err, "got: nil, want: error")
+	require.Equalf(t, vtrpcpb.Code_PERMISSION_DENIED, vterrors.Code(err), "qre.Execute: %v, want %v", vterrors.Code(err), vtrpcpb.Code_PERMISSION_DENIED)
+}
+
+func TestQueryExecutorTableAclDualTableExempt(t *testing.T) {
+	aclName := fmt.Sprintf("simpleacl-test-%d", rand.Int64())
+	tableacl.Register(aclName, &simpleacl.Factory{})
+	tableacl.SetDefaultACL(aclName)
+	db := setUpQueryExecutorTest(t)
+	defer db.Close()
+
+	callerID := &querypb.VTGateCallerID{
+		Username: "basic_username",
+	}
+	ctx := callerid.NewContext(t.Context(), nil, callerID)
+
+	config := &tableaclpb.Config{
+		TableGroups: []*tableaclpb.TableGroupSpec{},
+	}
+
+	if err := tableacl.InitFromProto(config); err != nil {
+		require.NoError(t, err)
+	}
+
+	// enable Config.StrictTableAcl
+	tsv := newTestTabletServer(ctx, enableStrictTableACL, db)
+	query := "select * from test_table where 1 != 1"
+	qre := newTestQueryExecutor(ctx, tsv, query, 0)
+	defer tsv.StopService()
+	assert.Equal(t, planbuilder.PlanSelectImpossible, qre.plan.PlanID)
+	// query should fail because nobody has read access to test_table
+	_, err := qre.Execute()
+	require.Equalf(t, vtrpcpb.Code_PERMISSION_DENIED, vterrors.Code(err), "qre.Execute: %v, want %v", vterrors.Code(err), vtrpcpb.Code_PERMISSION_DENIED)
+
+	assert.EqualError(t, err, `SelectImpossible command denied to user 'basic_username' for table 'test_table' (ACL check error)`)
+
+	// table acl should be ignored when querying against dual table
+	query = "select @@version_comment from dual limit 1"
+	ctx = callerid.NewContext(t.Context(), nil, callerID)
+	qre = newTestQueryExecutor(ctx, tsv, query, 0)
+	_, err = qre.Execute()
+	require.NoError(t, err)
+
+	query = "(select 0 as x from dual where 1 != 1) union (select 1 as y from dual where 1 != 1)"
+	ctx = callerid.NewContext(t.Context(), nil, callerID)
+	qre = newTestQueryExecutor(ctx, tsv, query, 0)
+	_, err = qre.Execute()
+	require.NoError(t, err)
+}
+
+// TestQueryExecutorTableAclUserTableNamedDual verifies that a real user table
+// named `dual` (referenced via backticks per the parser) is subject to ACL like
+// any other table — it does NOT inherit the placeholder-dual ACL bypass.
+func TestQueryExecutorTableAclUserTableNamedDual(t *testing.T) {
+	aclName := fmt.Sprintf("simpleacl-test-%d", rand.Int64())
+	tableacl.Register(aclName, &simpleacl.Factory{})
+	tableacl.SetDefaultACL(aclName)
+	db := setUpQueryExecutorTest(t)
+	defer db.Close()
+
+	// Add a real user table named `dual` to the schema fixtures. The default
+	// setUpQueryExecutorTest doesn't include it; we layer it on top.
+	db.AddQuery(mysql.BaseShowTables, &sqltypes.Result{
+		Fields: mysql.BaseShowTablesFields,
+		Rows: [][]sqltypes.Value{
+			mysql.BaseShowTablesRow("test_table", false, ""),
+			mysql.BaseShowTablesRow("seq", false, "vitess_sequence"),
+			mysql.BaseShowTablesRow("msg", false, "vitess_message,vt_ack_wait=30,vt_purge_after=120,vt_batch_size=1,vt_cache_size=10,vt_poller_interval=30"),
+			mysql.BaseShowTablesRow("dual", false, ""),
+		},
+	})
+	db.AddQuery(mysql.BaseShowPrimary, &sqltypes.Result{
+		Fields: mysql.ShowPrimaryFields,
+		Rows: [][]sqltypes.Value{
+			mysql.ShowPrimaryRow("test_table", "pk"),
+			mysql.ShowPrimaryRow("seq", "id"),
+			mysql.ShowPrimaryRow("msg", "id"),
+			mysql.ShowPrimaryRow("dual", "pk"),
+		},
+	})
+	db.MockQueriesForTable("dual", &sqltypes.Result{
+		Fields: []*querypb.Field{{
+			Name: "pk",
+			Type: sqltypes.Int32,
+		}},
+	})
+
+	username := "basic_username"
+	callerID := &querypb.VTGateCallerID{Username: username}
+	ctx := callerid.NewContext(context.Background(), nil, callerID)
+
+	// ACL config exists but does not authorize this caller for the `dual` table.
+	config := &tableaclpb.Config{
+		TableGroups: []*tableaclpb.TableGroupSpec{{
+			Name:                 "group01",
+			TableNamesOrPrefixes: []string{"test_table"},
+			Readers:              []string{username},
+		}},
+	}
+	require.NoErrorf(t, tableacl.InitFromProto(config), "unable to load tableacl config")
+
+	tsv := newTestTabletServer(ctx, enableStrictTableACL, db)
+	defer tsv.StopService()
+
+	// Backtick-quoted form references the user table (post-#19579), not the
+	// placeholder. ACL must apply.
+	query := "select * from `dual` limit 1000"
+	qre := newTestQueryExecutor(ctx, tsv, query, 0)
+	_, err := qre.Execute()
+	require.Error(t, err, "ACL should deny access to user table `dual`")
+	require.Equalf(t, vtrpcpb.Code_PERMISSION_DENIED, vterrors.Code(err), "qre.Execute: %v, want %v", vterrors.Code(err), vtrpcpb.Code_PERMISSION_DENIED)
+	assert.EqualError(t, err, `Select command denied to user 'basic_username' for table 'dual' (ACL check error)`)
+}
+
+func TestQueryExecutorTableAclExemptACL(t *testing.T) {
+	aclName := fmt.Sprintf("simpleacl-test-%d", rand.Int64())
+	tableacl.Register(aclName, &simpleacl.Factory{})
+	tableacl.SetDefaultACL(aclName)
+	db := setUpQueryExecutorTest(t)
+	defer db.Close()
+	query := "select * from test_table limit 1000"
+	want := &sqltypes.Result{
+		Fields: getTestTableFields(),
+		Rows:   [][]sqltypes.Value{},
+	}
+	db.AddQuery(query, want)
+	db.AddQuery("select * from test_table where 1 != 1", &sqltypes.Result{
+		Fields: getTestTableFields(),
+	})
+
+	username := "u2"
+	callerID := &querypb.VTGateCallerID{
+		Username: username,
+		Groups:   []string{"eng", "beta"},
+	}
+	ctx := callerid.NewContext(t.Context(), nil, callerID)
+
+	config := &tableaclpb.Config{
+		TableGroups: []*tableaclpb.TableGroupSpec{{
+			Name:                 "group02",
+			TableNamesOrPrefixes: []string{"test_table"},
+			Readers:              []string{"u1"},
+		}},
+	}
+
+	if err := tableacl.InitFromProto(config); err != nil {
+		require.NoError(t, err)
+	}
+
+	// enable Config.StrictTableAcl
+	tsv := newTestTabletServer(ctx, enableStrictTableACL, db)
+	qre := newTestQueryExecutor(ctx, tsv, query, 0)
+	defer tsv.StopService()
+	assert.Equal(t, planbuilder.PlanSelect, qre.plan.PlanID)
+	// query should fail because current user do not have read permissions
+	_, err := qre.Execute()
+	require.Equalf(t, vtrpcpb.Code_PERMISSION_DENIED, vterrors.Code(err), "qre.Execute: %v, want %v", vterrors.Code(err), vtrpcpb.Code_PERMISSION_DENIED)
+	assert.EqualError(t, err, `Select command denied to user 'u2', in groups [eng, beta], for table 'test_table' (ACL check error)`)
+
+	// table acl should be ignored since this is an exempt user.
+	username = "exempt-acl"
+	f, _ := tableacl.GetCurrentACLFactory()
+	if tsv.qe.exemptACL, err = f.New([]string{username}); err != nil {
+		require.NoError(t, err)
+	}
+	callerID = &querypb.VTGateCallerID{
+		Username: username,
+	}
+	ctx = callerid.NewContext(t.Context(), nil, callerID)
+
+	qre = newTestQueryExecutor(ctx, tsv, query, 0)
+	_, err = qre.Execute()
+	require.NoError(t, err, "qre.Execute: nil, want: error")
+}
+
+func TestQueryExecutorTableAclDryRun(t *testing.T) {
+	aclName := fmt.Sprintf("simpleacl-test-%d", rand.Int64())
+	tableacl.Register(aclName, &simpleacl.Factory{})
+	tableacl.SetDefaultACL(aclName)
+	db := setUpQueryExecutorTest(t)
+	defer db.Close()
+	query := "select * from test_table limit 1000"
+	want := &sqltypes.Result{
+		Fields: getTestTableFields(),
+		Rows:   [][]sqltypes.Value{},
+	}
+	db.AddQuery(query, want)
+	db.AddQuery("select * from test_table where 1 != 1", &sqltypes.Result{
+		Fields: getTestTableFields(),
+	})
+
+	username := "u2"
+	callerID := &querypb.VTGateCallerID{
+		Username: username,
+	}
+	ctx := callerid.NewContext(t.Context(), nil, callerID)
+
+	config := &tableaclpb.Config{
+		TableGroups: []*tableaclpb.TableGroupSpec{{
+			Name:                 "group02",
+			TableNamesOrPrefixes: []string{"test_table"},
+			Readers:              []string{"u1"},
+		}},
+	}
+
+	if err := tableacl.InitFromProto(config); err != nil {
+		require.NoError(t, err)
+	}
+
+	tableACLStatsKey := strings.Join([]string{
+		"test_table",
+		"group02",
+		planbuilder.PlanSelect.String(),
+		username,
+	}, ".")
+	// enable Config.StrictTableAcl
+	tsv := newTestTabletServer(ctx, enableStrictTableACL, db)
+	tsv.qe.enableTableACLDryRun = true
+	qre := newTestQueryExecutor(ctx, tsv, query, 0)
+	defer tsv.StopService()
+	assert.Equal(t, planbuilder.PlanSelect, qre.plan.PlanID)
+	beforeCount := tsv.stats.TableaclPseudoDenied.Counts()[tableACLStatsKey]
+	// query should fail because current user do not have read permissions
+	_, err := qre.Execute()
+	require.NoError(t, err)
+	afterCount := tsv.stats.TableaclPseudoDenied.Counts()[tableACLStatsKey]
+	require.Equalf(t, beforeCount+1, afterCount, "table acl pseudo denied count should increase by one. got: %d, want: %d", afterCount, beforeCount+1)
+}
+
+func TestQueryExecutorDenyListQRFail(t *testing.T) {
+	db := setUpQueryExecutorTest(t)
+	defer db.Close()
+	query := "select * from test_table where name = 1 limit 1000"
+	expandedQuery := "select pk from test_table use index (`index`) where name = 1 limit 1000"
+	expected := &sqltypes.Result{
+		Fields: getTestTableFields(),
+	}
+	db.AddQuery(query, expected)
+	db.AddQuery(expandedQuery, expected)
+
+	db.AddQuery("select * from test_table where 1 != 1", &sqltypes.Result{
+		Fields: getTestTableFields(),
+	})
+
+	bannedAddr := "127.0.0.1"
+	bannedUser := "u2"
+
+	alterRule := rules.NewQueryRule("disable update", "disable update", rules.QRFail)
+	alterRule.SetIPCond(bannedAddr)
+	alterRule.SetUserCond(bannedUser)
+	alterRule.SetQueryCond("select.*")
+	alterRule.AddPlanCond(planbuilder.PlanSelect)
+	alterRule.AddTableCond("test_table")
+
+	rulesName := "denyListRulesQRFail"
+	rules := rules.New()
+	rules.Add(alterRule)
+
+	callInfo := &fakecallinfo.FakeCallInfo{
+		Remote: bannedAddr,
+		User:   bannedUser,
+	}
+	ctx := callinfo.NewContext(t.Context(), callInfo)
+	tsv := newTestTabletServer(ctx, noFlags, db)
+	tsv.qe.queryRuleSources.UnRegisterSource(rulesName)
+	tsv.qe.queryRuleSources.RegisterSource(rulesName)
+	defer tsv.qe.queryRuleSources.UnRegisterSource(rulesName)
+
+	if err := tsv.qe.queryRuleSources.SetRules(rulesName, rules); err != nil {
+		require.NoError(t, err)
+	}
+
+	qre := newTestQueryExecutor(ctx, tsv, query, 0)
+	defer tsv.StopService()
+
+	assert.Equal(t, planbuilder.PlanSelect, qre.plan.PlanID)
+	// execute should fail because query has a table which is part of the denylist
+	_, err := qre.Execute()
+	require.Equalf(t, vtrpcpb.Code_INVALID_ARGUMENT, vterrors.Code(err), "qre.Execute: %v, want %v", vterrors.Code(err), vtrpcpb.Code_INVALID_ARGUMENT)
+}
+
+func TestQueryExecutorDenyListQRRetry(t *testing.T) {
+	db := setUpQueryExecutorTest(t)
+	defer db.Close()
+	query := "select * from test_table where name = 1 limit 1000"
+	expandedQuery := "select pk from test_table use index (`index`) where name = 1 limit 1000"
+	expected := &sqltypes.Result{
+		Fields: getTestTableFields(),
+	}
+	db.AddQuery(query, expected)
+	db.AddQuery(expandedQuery, expected)
+
+	db.AddQuery("select * from test_table where 1 != 1", &sqltypes.Result{
+		Fields: getTestTableFields(),
+	})
+
+	bannedAddr := "127.0.0.1"
+	bannedUser := "x"
+
+	alterRule := rules.NewQueryRule("disable update", "disable update", rules.QRFailRetry)
+	alterRule.SetIPCond(bannedAddr)
+	alterRule.SetUserCond(bannedUser)
+	alterRule.SetQueryCond("select.*")
+	alterRule.AddPlanCond(planbuilder.PlanSelect)
+	alterRule.AddTableCond("test_table")
+
+	rulesName := "denyListRulesQRRetry"
+	rules := rules.New()
+	rules.Add(alterRule)
+
+	callInfo := &fakecallinfo.FakeCallInfo{
+		Remote: bannedAddr,
+		User:   bannedUser,
+	}
+	ctx := callinfo.NewContext(t.Context(), callInfo)
+	tsv := newTestTabletServer(ctx, noFlags, db)
+	tsv.qe.queryRuleSources.UnRegisterSource(rulesName)
+	tsv.qe.queryRuleSources.RegisterSource(rulesName)
+	defer tsv.qe.queryRuleSources.UnRegisterSource(rulesName)
+
+	if err := tsv.qe.queryRuleSources.SetRules(rulesName, rules); err != nil {
+		require.NoError(t, err)
+	}
+
+	qre := newTestQueryExecutor(ctx, tsv, query, 0)
+	defer tsv.StopService()
+
+	assert.Equal(t, planbuilder.PlanSelect, qre.plan.PlanID)
+	_, err := qre.Execute()
+	require.Equalf(t, vtrpcpb.Code_FAILED_PRECONDITION, vterrors.Code(err), "tsv.qe.queryRuleSources.SetRules: %v, want %v", vterrors.Code(err), vtrpcpb.Code_FAILED_PRECONDITION)
+}
+
+func TestReplaceSchemaName(t *testing.T) {
+	db := setUpQueryExecutorTest(t)
+	defer db.Close()
+
+	queryFmt := "select * from information_schema.`schema_name` where `schema_name` = %s"
+	inQuery := fmt.Sprintf(queryFmt, ":"+sqltypes.BvSchemaName)
+	wantQuery := fmt.Sprintf(queryFmt, fmt.Sprintf(
+		"'%s' limit %d",
+		db.Name(),
+		10001,
+	))
+	wantQueryStream := fmt.Sprintf(queryFmt, fmt.Sprintf(
+		"'%s'",
+		db.Name(),
+	))
+
+	ctx := t.Context()
+	tsv := newTestTabletServer(ctx, noFlags, db)
+	defer tsv.StopService()
+
+	db.AddQuery(wantQuery, &sqltypes.Result{
+		Fields: getTestTableFields(),
+	})
+
+	db.AddQuery(wantQueryStream, &sqltypes.Result{
+		Fields: getTestTableFields(),
+	})
+
+	// Test non streaming execute.
+	{
+		qre := newTestQueryExecutor(ctx, tsv, inQuery, 0)
+		assert.Equal(t, planbuilder.PlanSelect, qre.plan.PlanID)
+		// Any value other than nil should cause QueryExecutor to replace the
+		// schema name.
+		qre.bindVars[sqltypes.BvReplaceSchemaName] = sqltypes.NullBindVariable
+		_, err := qre.Execute()
+		require.NoError(t, err)
+		_, ok := qre.bindVars[sqltypes.BvSchemaName]
+		require.True(t, ok)
+	}
+
+	// Test streaming execute.
+	{
+		qre := newTestQueryExecutorStreaming(ctx, tsv, inQuery, 0)
+		// Stream only replaces schema name when plan is PlanSelectStream.
+		assert.Equal(t, planbuilder.PlanSelectStream, qre.plan.PlanID)
+		// Any value other than nil should cause QueryExecutor to replace the
+		// schema name.
+		qre.bindVars[sqltypes.BvReplaceSchemaName] = sqltypes.NullBindVariable
+		err := qre.Stream(func(_ *sqltypes.Result) error {
+			_, ok := qre.bindVars[sqltypes.BvSchemaName]
+			require.True(t, ok)
+			return nil
+		})
+		require.NoError(t, err)
+	}
+}
+
+// TestQueryExecutorStreamDML verifies that DML executed on the streaming path
+// (StreamExecute) runs through the same transactional machinery as Execute and
+// delivers its single result through the callback. Before the fix for #19561
+// and #19564, BuildStreaming rejected DML outright and Stream had no DML
+// handling, so DML in OLAP mode could not start an implicit transaction.
+func TestQueryExecutorStreamDML(t *testing.T) {
+	dmlResult := &sqltypes.Result{RowsAffected: 1}
+
+	testcases := []struct {
+		input     string
+		dbQuery   string
+		planWant  planbuilder.PlanType
+		inTxQuery string
+	}{
+		{
+			input:    "insert into test_table(a) values(1)",
+			dbQuery:  "insert into test_table(a) values (1)",
+			planWant: planbuilder.PlanInsert,
+		},
+		{
+			input:    "update test_table set a=1",
+			dbQuery:  "update test_table set a = 1 limit 10001",
+			planWant: planbuilder.PlanUpdateLimit,
+		},
+		{
+			input:    "delete from test_table where pk = 1",
+			dbQuery:  "delete from test_table where pk = 1 limit 10001",
+			planWant: planbuilder.PlanDeleteLimit,
+		},
+	}
+
+	for _, tcase := range testcases {
+		t.Run(tcase.input, func(t *testing.T) {
+			db := setUpQueryExecutorTest(t)
+			defer db.Close()
+			db.AddQuery(tcase.dbQuery, dmlResult)
+			ctx := t.Context()
+			tsv := newTestTabletServer(ctx, noFlags, db)
+			defer tsv.StopService()
+
+			// Run the DML outside a transaction (autocommit).
+			qre := newTestQueryExecutorStreaming(ctx, tsv, tcase.input, 0)
+			require.Equal(t, tcase.planWant, qre.plan.PlanID)
+
+			var got *sqltypes.Result
+			err := qre.Stream(func(result *sqltypes.Result) error {
+				got = result
+				return nil
+			})
+			require.NoError(t, err)
+			require.Equal(t, dmlResult, got)
+			// The streamed DML result must be reflected in the query log,
+			// just like the non-streaming Execute path.
+			assert.Equal(t, int(dmlResult.RowsAffected), qre.logStats.RowsAffected)
+
+			// Run the DML inside an existing transaction.
+			target := tsv.sm.Target()
+			state, err := tsv.Begin(ctx, nil, target, nil)
+			require.NoError(t, err)
+			defer tsv.Commit(ctx, target, state.TransactionID)
+
+			qre = newTestQueryExecutorStreaming(ctx, tsv, tcase.input, state.TransactionID)
+			got = nil
+			err = qre.Stream(func(result *sqltypes.Result) error {
+				got = result
+				return nil
+			})
+			require.NoError(t, err)
+			require.Equal(t, dmlResult, got)
+		})
+	}
+}
+
+// TestQueryExecutorStreamDMLErrorStatsOnPermissionDenied verifies that a streamed
+// DML rejected by checkPermissions (a QRFail query rule) still records per-table
+// error stats, matching the non-streaming Execute path. The permission and request
+// throttler checks run early, before the DML reaches the database, so streamDML's
+// stats defer must be registered ahead of them to record these rejections.
+func TestQueryExecutorStreamDMLErrorStatsOnPermissionDenied(t *testing.T) {
+	db := setUpQueryExecutorTest(t)
+	defer db.Close()
+
+	query := "insert into test_table(a) values(1)"
+
+	bannedAddr := "127.0.0.1"
+	bannedUser := "u2"
+
+	denyRule := rules.NewQueryRule("disable insert", "disable insert", rules.QRFail)
+	denyRule.SetIPCond(bannedAddr)
+	denyRule.SetUserCond(bannedUser)
+	denyRule.AddPlanCond(planbuilder.PlanInsert)
+	denyRule.AddTableCond("test_table")
+
+	rulesName := "denyListStreamDMLQRFail"
+	qrs := rules.New()
+	qrs.Add(denyRule)
+
+	callInfo := &fakecallinfo.FakeCallInfo{
+		Remote: bannedAddr,
+		User:   bannedUser,
+	}
+	ctx := callinfo.NewContext(t.Context(), callInfo)
+	tsv := newTestTabletServer(ctx, noFlags, db)
+	defer tsv.StopService()
+	tsv.qe.queryRuleSources.UnRegisterSource(rulesName)
+	tsv.qe.queryRuleSources.RegisterSource(rulesName)
+	defer tsv.qe.queryRuleSources.UnRegisterSource(rulesName)
+	require.NoError(t, tsv.qe.queryRuleSources.SetRules(rulesName, qrs))
+
+	qre := newTestQueryExecutorStreaming(ctx, tsv, query, 0)
+	require.Equal(t, planbuilder.PlanInsert, qre.plan.PlanID)
+
+	errCountBefore := tsv.qe.queryErrorCounts.Counts()["test_table.Insert"]
+	err := qre.Stream(func(*sqltypes.Result) error { return nil })
+	require.Equal(t, vtrpcpb.Code_INVALID_ARGUMENT, vterrors.Code(err))
+
+	errCountAfter := tsv.qe.queryErrorCounts.Counts()["test_table.Insert"]
+	assert.Equal(t, errCountBefore+1, errCountAfter,
+		"streamed DML rejected by checkPermissions must record per-table error stats like Execute")
+}
+
+// TestQueryExecutorStreamDMLAppliesQueryTimeout verifies that autocommit DML on
+// the streaming path runs under the query timeout, like the non-streaming
+// Execute path. StreamExecute leaves the request timeout unset when there is no
+// transaction (transactionID == 0), so without applying it for DML a stuck
+// INSERT/UPDATE/DELETE would run without a query deadline.
+func TestQueryExecutorStreamDMLAppliesQueryTimeout(t *testing.T) {
+	db := setUpQueryExecutorTest(t)
+	defer db.Close()
+
+	query := "insert into test_table(a) values(1)"
+	db.AddQuery("insert into test_table(a) values (1)", &sqltypes.Result{RowsAffected: 1})
+
+	ctx := t.Context()
+	tsv := newTestTabletServer(ctx, noFlags, db)
+	defer tsv.StopService()
+
+	qre := newTestQueryExecutorStreaming(ctx, tsv, query, 0)
+	require.Equal(t, planbuilder.PlanInsert, qre.plan.PlanID)
+
+	// Precondition: the executor context starts without a deadline. The unit test
+	// bypasses StreamExecute, which is where a transaction's timeout is set.
+	_, ok := qre.ctx.Deadline()
+	require.False(t, ok)
+
+	err := qre.Stream(func(*sqltypes.Result) error { return nil })
+	require.NoError(t, err)
+
+	// streamDML must have bounded the autocommit DML with the query timeout,
+	// mirroring Execute's loadQueryTimeoutWithTxAndOptions(0, options).
+	deadline, ok := qre.ctx.Deadline()
+	require.True(t, ok, "autocommit streamed DML must run under the query timeout, like Execute")
+	assert.LessOrEqual(t, time.Until(deadline), tsv.loadQueryTimeout(),
+		"the deadline must come from the query timeout")
+}
+
+func TestQueryExecutorShouldConsolidate(t *testing.T) {
+	testCases := []struct {
+		// whether or not the consolidator is enabled by default on the tablet
+		consolidatorEnabledByDefault bool
+		// query-specific consolidator override, unspecified by default
+		consolidatorExecuteOption querypb.ExecuteOptions_Consolidator
+		// whether or not the consolidator is waiting on the results of an
+		// identical running query
+		consolidatorHasIdenticalQuery bool
+		// whether or not the query should be consolidated
+		expectConsolidate bool
+		// whether or not the query should be exec'd (= sent to db)
+		expectExec bool
+		// query to run
+		input string
+	}{
+		{
+			consolidatorEnabledByDefault:  true,
+			consolidatorExecuteOption:     querypb.ExecuteOptions_CONSOLIDATOR_UNSPECIFIED,
+			consolidatorHasIdenticalQuery: false,
+			expectConsolidate:             true,
+			expectExec:                    true,
+			input:                         "select * from t limit 10001",
+		},
+		{
+			consolidatorEnabledByDefault:  true,
+			consolidatorExecuteOption:     querypb.ExecuteOptions_CONSOLIDATOR_UNSPECIFIED,
+			consolidatorHasIdenticalQuery: true,
+			expectConsolidate:             true,
+			expectExec:                    false,
+			input:                         "select * from t limit 10001",
+		},
+		{
+			consolidatorEnabledByDefault:  true,
+			consolidatorExecuteOption:     querypb.ExecuteOptions_CONSOLIDATOR_DISABLED,
+			consolidatorHasIdenticalQuery: true,
+			expectConsolidate:             false,
+			expectExec:                    true,
+			input:                         "select * from t limit 10001",
+		},
+		{
+			consolidatorEnabledByDefault:  false,
+			consolidatorExecuteOption:     querypb.ExecuteOptions_CONSOLIDATOR_DISABLED,
+			consolidatorHasIdenticalQuery: true,
+			expectConsolidate:             false,
+			expectExec:                    true,
+			input:                         "select * from t limit 10001",
+		},
+		{
+			consolidatorEnabledByDefault:  false,
+			consolidatorExecuteOption:     querypb.ExecuteOptions_CONSOLIDATOR_ENABLED,
+			consolidatorHasIdenticalQuery: false,
+			expectConsolidate:             true,
+			expectExec:                    true,
+			input:                         "select * from t limit 10001",
+		},
+		{
+			consolidatorEnabledByDefault:  false,
+			consolidatorExecuteOption:     querypb.ExecuteOptions_CONSOLIDATOR_ENABLED,
+			consolidatorHasIdenticalQuery: true,
+			expectConsolidate:             true,
+			expectExec:                    false,
+			input:                         "select * from t limit 10001",
+		},
+	}
+	for _, tcase := range testCases {
+		name := fmt.Sprintf("table-consolidator:%t;query-consolidator:%v;identical-query:%t",
+			tcase.consolidatorEnabledByDefault, tcase.consolidatorExecuteOption, tcase.consolidatorHasIdenticalQuery)
+		t.Run(name, func(t *testing.T) {
+			// Set up fake db, tablet server (with fake consolidator), and executor.
+
+			db := setUpQueryExecutorTest(t)
+			defer db.Close()
+
+			ctx := t.Context()
+			flags := noFlags
+			if tcase.consolidatorEnabledByDefault {
+				flags = enableConsolidator
+			}
+
+			tsv := newTestTabletServer(ctx, flags, db)
+			defer tsv.StopService()
+
+			fakeConsolidator := sync2.NewFakeConsolidator()
+			tsv.qe.consolidator = fakeConsolidator
+
+			qre := newTestQueryExecutor(t.Context(), tsv, tcase.input, 0)
+			qre.options = &querypb.ExecuteOptions{Consolidator: tcase.consolidatorExecuteOption}
+
+			result := &sqltypes.Result{
+				Fields: getTestTableFields(),
+			}
+
+			// Set up consolidator pre-conditions.
+
+			fakePendingResult := &sync2.FakePendingResult{Consolidator: fakeConsolidator}
+			fakePendingResult.SetResult(result)
+			fakeConsolidator.CreateReturn = &sync2.FakeConsolidatorCreateReturn{
+				Created:       !tcase.consolidatorHasIdenticalQuery,
+				PendingResult: fakePendingResult,
+			}
+
+			// Set up database query/response.
+
+			db.AddQuery(tcase.input, result)
+
+			// Execute query.
+
+			_, err := qre.Execute()
+			require.Nil(t, err)
+
+			// Verify expectations.
+
+			if tcase.expectConsolidate {
+				require.Len(t, fakeConsolidator.CreateCalls, 1)
+				require.Len(t, fakeConsolidator.CreateReturns, 1)
+				if tcase.consolidatorHasIdenticalQuery {
+					require.Equal(t, 0, fakePendingResult.BroadcastCalls)
+					require.Equal(t, 1, fakePendingResult.WaitCalls)
+				} else {
+					require.Equal(t, 1, fakePendingResult.BroadcastCalls)
+					require.Equal(t, 0, fakePendingResult.WaitCalls)
+				}
+			} else {
+				require.Len(t, fakeConsolidator.CreateCalls, 0)
+			}
+
+			if tcase.expectExec {
+				require.Equal(t, 1, db.GetQueryCalledNum(tcase.input))
+			} else {
+				require.Equal(t, 0, db.GetQueryCalledNum(tcase.input))
+			}
+
+			db.VerifyAllExecutedOrFail()
+		})
+	}
+}
+
+func TestQueryExecutorConsolidatorWaiterCapFallback(t *testing.T) {
+	// Test that when the consolidator waiter cap is reached, queries fall back
+	// to independent execution instead of returning empty results.
+
+	db := setUpQueryExecutorTest(t)
+	defer db.Close()
+
+	ctx := t.Context()
+	tsv := newTestTabletServer(ctx, enableConsolidator, db)
+	defer tsv.StopService()
+
+	// Set a waiter cap of 1
+	tsv.config.ConsolidatorQueryWaiterCap = 1
+
+	fakeConsolidator := sync2.NewFakeConsolidator()
+	tsv.qe.consolidator = fakeConsolidator
+
+	input := "select * from t limit 10001"
+	result := &sqltypes.Result{
+		Fields: getTestTableFields(),
+		Rows: [][]sqltypes.Value{{
+			sqltypes.NewInt32(1),   // pk
+			sqltypes.NewInt32(100), // name
+			sqltypes.NewInt32(200), // addr
+		}},
+	}
+
+	// Set up consolidator to simulate an identical query already running (Created=false)
+	fakePendingResult := &sync2.FakePendingResult{Consolidator: fakeConsolidator}
+	fakePendingResult.SetResult(result)
+	// Start with waiter count above the cap (2 > 1), so the condition fails
+	fakePendingResult.WaiterCount = 2
+	fakeConsolidator.SetTotalWaiterCount(2)
+
+	fakeConsolidator.CreateReturn = &sync2.FakeConsolidatorCreateReturn{
+		Created:       false, // Simulate identical query already running
+		PendingResult: fakePendingResult,
+	}
+
+	// Set up database query/response for fallback execution
+	db.AddQuery(input, result)
+
+	qre := newTestQueryExecutor(t.Context(), tsv, input, 0)
+	qre.options = &querypb.ExecuteOptions{Consolidator: querypb.ExecuteOptions_CONSOLIDATOR_ENABLED}
+
+	// Execute query
+	actualResult, err := qre.Execute()
+	require.NoError(t, err)
+	require.NotNil(t, actualResult)
+
+	// Verify we got the correct result (not empty)
+	require.Equal(t, result.Fields, actualResult.Fields)
+	require.Equal(t, result.Rows, actualResult.Rows)
+
+	// Verify consolidator was attempted
+	require.Len(t, fakeConsolidator.CreateCalls, 1)
+
+	// Verify we did NOT wait (because waiter cap was exceeded)
+	require.Equal(t, 0, fakePendingResult.WaitCalls)
+
+	// Verify we did NOT broadcast (because we're not the original)
+	require.Equal(t, 0, fakePendingResult.BroadcastCalls)
+
+	// Verify AddWaiterCounter was called once with -1 (cleanup)
+	require.Len(t, fakePendingResult.AddWaiterCounterCalls, 1)
+	require.Equal(t, int64(-1), fakePendingResult.AddWaiterCounterCalls[0])
+
+	// Verify fallback executed the query independently
+	require.Equal(t, 1, db.GetQueryCalledNum(input))
+
+	db.VerifyAllExecutedOrFail()
+}
+
+func TestQueryExecutorConsolidatorRejectOnCap(t *testing.T) {
+	tests := []struct {
+		name            string
+		rejectOnCap     bool
+		wantErr         bool
+		wantErrCode     vtrpcpb.Code
+		wantErrMsg      string
+		wantDBQueries   int
+		wantWaitCalls   int
+		wantCounterArgs []int64
+	}{
+		{
+			name:            "reject enabled",
+			rejectOnCap:     true,
+			wantErr:         true,
+			wantErrCode:     vtrpcpb.Code_RESOURCE_EXHAUSTED,
+			wantErrMsg:      "consolidator waiter cap exceeded",
+			wantDBQueries:   0,
+			wantWaitCalls:   0,
+			wantCounterArgs: []int64{-1},
+		},
+		{
+			name:            "reject disabled falls back to independent execution",
+			rejectOnCap:     false,
+			wantErr:         false,
+			wantDBQueries:   1,
+			wantWaitCalls:   0,
+			wantCounterArgs: []int64{-1},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db := setUpQueryExecutorTest(t)
+			defer db.Close()
+
+			ctx := context.Background()
+			tsv := newTestTabletServer(ctx, enableConsolidator, db)
+			defer tsv.StopService()
+
+			tsv.config.ConsolidatorQueryWaiterCap = 1
+			tsv.config.ConsolidatorRejectOnCap = tc.rejectOnCap
+
+			fakeConsolidator := sync2.NewFakeConsolidator()
+			tsv.qe.consolidator = fakeConsolidator
+
+			input := "select * from t limit 10001"
+			result := &sqltypes.Result{
+				Fields: getTestTableFields(),
+				Rows: [][]sqltypes.Value{{
+					sqltypes.NewInt32(1),
+					sqltypes.NewInt32(100),
+					sqltypes.NewInt32(200),
+				}},
+			}
+
+			fakePendingResult := &sync2.FakePendingResult{Consolidator: fakeConsolidator}
+			fakePendingResult.SetResult(result)
+			fakePendingResult.WaiterCount = 2
+			fakeConsolidator.SetTotalWaiterCount(2)
+
+			fakeConsolidator.CreateReturn = &sync2.FakeConsolidatorCreateReturn{
+				Created:       false,
+				PendingResult: fakePendingResult,
+			}
+
+			db.AddQuery(input, result)
+
+			qre := newTestQueryExecutor(context.Background(), tsv, input, 0)
+			qre.options = &querypb.ExecuteOptions{Consolidator: querypb.ExecuteOptions_CONSOLIDATOR_ENABLED}
+
+			got, err := qre.Execute()
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Equal(t, tc.wantErrCode, vterrors.Code(err))
+				assert.ErrorContains(t, err, tc.wantErrMsg)
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, got)
+			}
+
+			require.Len(t, fakeConsolidator.CreateCalls, 1)
+			require.Equal(t, tc.wantWaitCalls, fakePendingResult.WaitCalls)
+			require.Equal(t, 0, fakePendingResult.BroadcastCalls)
+
+			require.Len(t, fakePendingResult.AddWaiterCounterCalls, len(tc.wantCounterArgs))
+			for i, wantArg := range tc.wantCounterArgs {
+				require.Equal(t, wantArg, fakePendingResult.AddWaiterCounterCalls[i])
+			}
+
+			require.Equal(t, tc.wantDBQueries, db.GetQueryCalledNum(input))
+		})
+	}
+}
+
+func TestGetConnectionLogStats(t *testing.T) {
+	db := setUpQueryExecutorTest(t)
+	defer db.Close()
+
+	ctx := t.Context()
+	tsv := newTestTabletServer(ctx, noFlags, db)
+	input := "select * from test_table limit 1"
+
+	// getConn() happy path
+	qre := newTestQueryExecutor(ctx, tsv, input, 0)
+	conn, err := qre.getConn()
+	assert.NoError(t, err)
+	assert.NotNil(t, conn)
+	assert.True(t, qre.logStats.WaitingForConnection > 0)
+
+	// getStreamConn() happy path
+	qre = newTestQueryExecutor(ctx, tsv, input, 0)
+	conn, err = qre.getStreamConn()
+	assert.NoError(t, err)
+	assert.NotNil(t, conn)
+	assert.True(t, qre.logStats.WaitingForConnection > 0)
+
+	// Close the db connection to induce connection errors
+	db.Close()
+
+	// getConn() error path
+	qre = newTestQueryExecutor(ctx, tsv, input, 0)
+	_, err = qre.getConn()
+	assert.Error(t, err)
+	assert.True(t, qre.logStats.WaitingForConnection > 0)
+
+	// getStreamConn() error path
+	qre = newTestQueryExecutor(ctx, tsv, input, 0)
+	_, err = qre.getStreamConn()
+	assert.Error(t, err)
+	assert.True(t, qre.logStats.WaitingForConnection > 0)
+}
+
+type executorFlags int64
+
+const (
+	noFlags              executorFlags = 0
+	enableStrictTableACL               = 1 << iota
+	smallTxPool
+	noTwopc
+	shortTwopcAge
+	smallResultSize
+	disableOnlineDDL
+	enableConsolidator
+)
+
+// newTestQueryExecutor uses a package level variable testTabletServer defined in tabletserver_test.go
+func newTestTabletServer(ctx context.Context, flags executorFlags, db *fakesqldb.DB) *TabletServer {
+	cfg := tabletenv.NewDefaultConfig()
+	cfg.OltpReadPool.Size = 100
+	if flags&smallTxPool > 0 {
+		cfg.TxPool.Size = 3
+	} else {
+		cfg.TxPool.Size = 100
+	}
+	if flags&enableStrictTableACL > 0 {
+		cfg.StrictTableACL = true
+	} else {
+		cfg.StrictTableACL = false
+	}
+	if flags&disableOnlineDDL > 0 {
+		cfg.EnableOnlineDDL = false
+	} else {
+		cfg.EnableOnlineDDL = true
+	}
+	if flags&noTwopc > 0 {
+		cfg.TwoPCAbandonAge = 0
+	} else if flags&shortTwopcAge > 0 {
+		cfg.TwoPCAbandonAge = 500 * time.Millisecond
+	} else {
+		cfg.TwoPCAbandonAge = 10 * time.Second
+	}
+	if flags&smallResultSize > 0 {
+		cfg.Oltp.MaxRows = 2
+	}
+	if flags&enableConsolidator > 0 {
+		cfg.Consolidator = tabletenv.Enable
+	} else {
+		cfg.Consolidator = tabletenv.Disable
+	}
+	dbconfigs := newDBConfigs(db)
+	cfg.DB = dbconfigs
+	srvTopoCounts := stats.NewCountersWithSingleLabel("", "Resilient srvtopo server operations", "type")
+	tsv := NewTabletServer(ctx, vtenv.NewTestEnv(), "TabletServerTest", cfg, memorytopo.NewServer(ctx, ""), &topodatapb.TabletAlias{}, srvTopoCounts)
+	target := &querypb.Target{TabletType: topodatapb.TabletType_PRIMARY}
+	err := tsv.StartService(target, dbconfigs, nil /* mysqld */)
+	if err != nil {
+		panic(err)
+	}
+	return tsv
+}
+
+func newTransaction(tsv *TabletServer, options *querypb.ExecuteOptions) int64 {
+	target := tsv.sm.Target()
+	state, err := tsv.Begin(context.Background(), nil, target, options)
+	if err != nil {
+		panic(vterrors.Wrap(err, "failed to start a transaction"))
+	}
+	return state.TransactionID
+}
+
+func newTestQueryExecutor(ctx context.Context, tsv *TabletServer, sql string, txID int64) *QueryExecutor {
+	return newTestQueryExecutorWithRowsLimit(ctx, tsv, sql, txID, false)
+}
+
+func newTestQueryExecutorWithRowsLimit(ctx context.Context, tsv *TabletServer, sql string, txID int64, noRowsLimit bool) *QueryExecutor {
+	logStats := tabletenv.NewLogStats(ctx, "TestQueryExecutor", streamlog.NewQueryLogConfigForTest())
+	plan, err := tsv.qe.GetPlan(ctx, logStats, sql, false, noRowsLimit)
+	if err != nil {
+		panic(err)
+	}
+	return newQueryExec(ctx, tsv, sql, txID, plan, logStats)
+}
+
+func newTestQueryExecutorStreaming(ctx context.Context, tsv *TabletServer, sql string, txID int64) *QueryExecutor {
+	logStats := tabletenv.NewLogStats(ctx, "TestQueryExecutorStreaming", streamlog.NewQueryLogConfigForTest())
+	plan, err := tsv.qe.GetStreamPlan(ctx, logStats, sql, false)
+	if err != nil {
+		panic(err)
+	}
+	return newQueryExec(ctx, tsv, sql, txID, plan, logStats)
+}
+
+func newQueryExec(ctx context.Context, tsv *TabletServer, sql string, txID int64, plan *TabletPlan, logStats *tabletenv.LogStats) *QueryExecutor {
+	return &QueryExecutor{
+		ctx:      ctx,
+		query:    sql,
+		bindVars: make(map[string]*querypb.BindVariable),
+		connID:   txID,
+		plan:     plan,
+		logStats: logStats,
+		tsv:      tsv,
+	}
+}
+
+func setUpQueryExecutorTest(t *testing.T) *fakesqldb.DB {
+	db := fakesqldb.New(t)
+	initQueryExecutorTestDB(db)
+	return db
+}
+
+const baseShowTablesWithSizesPattern = `SELECT t\.table_name.*SUM\(i\.file_size\).*`
+
+func initQueryExecutorTestDB(db *fakesqldb.DB) {
+	addQueryExecutorSupportedQueries(db)
+	db.AddQueryPattern(baseShowTablesWithSizesPattern, &sqltypes.Result{
+		Fields: mysql.BaseShowTablesWithSizesFields,
+		Rows: [][]sqltypes.Value{
+			mysql.BaseShowTablesWithSizesRow("test_table", false, ""),
+			mysql.BaseShowTablesWithSizesRow("seq", false, "vitess_sequence"),
+			mysql.BaseShowTablesWithSizesRow("msg", false, "vitess_message,vt_ack_wait=30,vt_purge_after=120,vt_batch_size=1,vt_cache_size=10,vt_poller_interval=30"),
+		},
+	})
+	db.AddQuery(mysql.BaseShowTables,
+		&sqltypes.Result{
+			Fields: mysql.BaseShowTablesFields,
+			Rows: [][]sqltypes.Value{
+				mysql.BaseShowTablesRow("test_table", false, ""),
+				mysql.BaseShowTablesRow("seq", false, "vitess_sequence"),
+				mysql.BaseShowTablesRow("msg", false, "vitess_message,vt_ack_wait=30,vt_purge_after=120,vt_batch_size=1,vt_cache_size=10,vt_poller_interval=30"),
+			},
+		})
+	db.AddQuery("show status like 'Innodb_rows_read'", sqltypes.MakeTestResult(sqltypes.MakeTestFields(
+		"Variable_name|Value",
+		"varchar|int64"),
+		"Innodb_rows_read|0",
+	))
+	sidecardb.AddSchemaInitQueries(db, true, sqlparser.NewTestParser())
+}
+
+func getTestTableFields() []*querypb.Field {
+	return []*querypb.Field{
+		{Name: "pk", Type: sqltypes.Int32},
+		{Name: "name", Type: sqltypes.Int32},
+		{Name: "addr", Type: sqltypes.Int32},
+	}
+}
+
+func addQueryExecutorSupportedQueries(db *fakesqldb.DB) {
+	queryResultMap := map[string]*sqltypes.Result{
+		// queries for schema info
+		"select unix_timestamp()": {
+			Fields: []*querypb.Field{{
+				Type: sqltypes.Uint64,
+			}},
+			Rows: [][]sqltypes.Value{
+				{sqltypes.NewInt32(1427325875)},
+			},
+		},
+		"select @@global.sql_mode": {
+			Fields: []*querypb.Field{{
+				Type: sqltypes.VarChar,
+			}},
+			Rows: [][]sqltypes.Value{
+				{sqltypes.NewVarBinary("STRICT_TRANS_TABLES")},
+			},
+		},
+		"select @@autocommit": {
+			Fields: []*querypb.Field{{
+				Type: sqltypes.Uint64,
+			}},
+			Rows: [][]sqltypes.Value{
+				{sqltypes.NewVarBinary("1")},
+			},
+		},
+		"select @@sql_auto_is_null": {
+			Fields: []*querypb.Field{{
+				Type: sqltypes.Uint64,
+			}},
+			Rows: [][]sqltypes.Value{
+				{sqltypes.NewVarBinary("0")},
+			},
+		},
+		"select @@version_comment from dual where 1 != 1": {
+			Fields: []*querypb.Field{{
+				Type: sqltypes.VarChar,
+			}},
+		},
+		"select @@version_comment from dual limit 1": {
+			Fields: []*querypb.Field{{
+				Type: sqltypes.VarChar,
+			}},
+			Rows: [][]sqltypes.Value{
+				{sqltypes.NewVarBinary("fakedb server")},
+			},
+		},
+		"select 0 as x from dual where 1 != 1 union select 1 as y from dual where 1 != 1": {
+			Fields: []*querypb.Field{{
+				Type: sqltypes.Uint64,
+			}},
+			Rows: [][]sqltypes.Value{},
+		},
+		"select 0 as x from dual where 1 != 1 union select 1 as y from dual where 1 != 1 limit 10001": {
+			Fields: []*querypb.Field{{
+				Type: sqltypes.Uint64,
+			}},
+			Rows: [][]sqltypes.Value{},
+		},
+		"select * from t where 1 != 1 limit 10001": {
+			Fields: []*querypb.Field{{
+				Type: sqltypes.Uint64,
+			}, {
+				Type: sqltypes.VarChar,
+			}},
+			Rows: [][]sqltypes.Value{},
+		},
+		mysql.BaseShowPrimary: {
+			Fields: mysql.ShowPrimaryFields,
+			Rows: [][]sqltypes.Value{
+				mysql.ShowPrimaryRow("test_table", "pk"),
+				mysql.ShowPrimaryRow("seq", "id"),
+				mysql.ShowPrimaryRow("msg", "id"),
+			},
+		},
+		"begin":                                {},
+		"commit":                               {},
+		"rollback":                             {},
+		fmt.Sprintf(readAllRedo, "_vt", "_vt"): {},
+	}
+
+	sidecardb.AddSchemaInitQueries(db, true, sqlparser.NewTestParser())
+	for query, result := range queryResultMap {
+		db.AddQuery(query, result)
+	}
+	db.MockQueriesForTable("test_table", &sqltypes.Result{
+		Fields: []*querypb.Field{{
+			Name: "pk",
+			Type: sqltypes.Int32,
+		}, {
+			Name: "name",
+			Type: sqltypes.Int32,
+		}, {
+			Name: "addr",
+			Type: sqltypes.Int32,
+		}},
+	})
+	db.MockQueriesForTable("seq", &sqltypes.Result{
+		Fields: []*querypb.Field{{
+			Name: "id",
+			Type: sqltypes.Int32,
+		}, {
+			Name: "next_id",
+			Type: sqltypes.Int64,
+		}, {
+			Name: "cache",
+			Type: sqltypes.Int64,
+		}, {
+			Name: "increment",
+			Type: sqltypes.Int64,
+		}},
+	})
+	db.MockQueriesForTable("msg", &sqltypes.Result{
+		Fields: []*querypb.Field{{
+			Name: "id",
+			Type: sqltypes.Int64,
+		}, {
+			Name: "priority",
+			Type: sqltypes.Int64,
+		}, {
+			Name: "time_next",
+			Type: sqltypes.Int64,
+		}, {
+			Name: "epoch",
+			Type: sqltypes.Int64,
+		}, {
+			Name: "time_acked",
+			Type: sqltypes.Int64,
+		}, {
+			Name: "message",
+			Type: sqltypes.Int64,
+		}},
+	})
+}
+
+func TestQueryExecSchemaReloadCount(t *testing.T) {
+	type dbResponse struct {
+		query  string
+		result *sqltypes.Result
+	}
+
+	dmlResult := &sqltypes.Result{
+		RowsAffected: 1,
+	}
+	fields := sqltypes.MakeTestFields("a|b", "int64|varchar")
+	selectResult := sqltypes.MakeTestResult(fields, "1|aaa")
+	emptyResult := &sqltypes.Result{}
+
+	// The queries are run both in and outside a transaction.
+	testcases := []struct {
+		// input is the input query.
+		input string
+		// dbResponses specifies the list of queries and responses to add to the fake db.
+		dbResponses       []dbResponse
+		schemaReloadCount int
+	}{{
+		input: "select * from t",
+		dbResponses: []dbResponse{{
+			query:  `select \* from t.*`,
+			result: selectResult,
+		}},
+	}, {
+		input: "insert into t values(1, 'aaa')",
+		dbResponses: []dbResponse{{
+			query:  "insert.*",
+			result: dmlResult,
+		}},
+	}, {
+		input: "create table t(a int, b varchar(64))",
+		dbResponses: []dbResponse{{
+			query:  "create.*",
+			result: emptyResult,
+		}},
+		schemaReloadCount: 1,
+	}, {
+		input: "drop table t",
+		dbResponses: []dbResponse{{
+			query:  "drop.*",
+			result: dmlResult,
+		}},
+		schemaReloadCount: 1,
+	}, {
+		input: "create table t(a int, b varchar(64))",
+		dbResponses: []dbResponse{{
+			query:  "create.*",
+			result: emptyResult,
+		}},
+		schemaReloadCount: 1,
+	}, {
+		input: "drop table t",
+		dbResponses: []dbResponse{{
+			query:  "drop.*",
+			result: dmlResult,
+		}},
+		schemaReloadCount: 1,
+	}}
+	db := setUpQueryExecutorTest(t)
+	defer db.Close()
+	tsv := newTestTabletServer(t.Context(), noFlags, db)
+	tsv.config.DB.DBName = "ks"
+	defer tsv.StopService()
+	for _, tcase := range testcases {
+		t.Run(tcase.input, func(t *testing.T) {
+			// reset the schema reload metric before running the test.
+			tsv.se.SchemaReloadTimings.Reset()
+			for _, dbr := range tcase.dbResponses {
+				db.AddQueryPattern(dbr.query, dbr.result)
+			}
+
+			qre := newTestQueryExecutor(t.Context(), tsv, tcase.input, 0)
+			_, err := qre.Execute()
+			require.NoError(t, err)
+			assert.EqualValues(t, tcase.schemaReloadCount, qre.tsv.se.SchemaReloadTimings.Counts()["TabletServerTest.SchemaReload"], "got: %v", qre.tsv.se.SchemaReloadTimings.Counts())
+		})
+	}
+}
+
+type mockTxThrottler struct {
+	throttle bool
+}
+
+func (m mockTxThrottler) InitDBConfig(target *querypb.Target) {
+	panic("implement me")
+}
+
+func (m mockTxThrottler) Open() (err error) {
+	return nil
+}
+
+func (m mockTxThrottler) Close() {
+}
+
+func (m mockTxThrottler) Throttle(priority int, workload string) (result bool) {
+	return m.throttle
+}

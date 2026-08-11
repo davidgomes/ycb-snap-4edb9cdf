@@ -1,0 +1,820 @@
+/*
+Copyright 2023 The Vitess Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package discovery
+
+import (
+	"context"
+	"encoding/hex"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"vitess.io/vitess/go/test/utils"
+	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/topo/faketopo"
+
+	querypb "vitess.io/vitess/go/vt/proto/query"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
+)
+
+func TestSrvKeyspaceWithNilNewKeyspace(t *testing.T) {
+	ctx := utils.LeakCheckContext(t)
+	cell := "cell"
+	keyspace := "testks"
+	factory := faketopo.NewFakeTopoFactory()
+	factory.AddCell(cell)
+	ts := faketopo.NewFakeTopoServer(ctx, factory)
+	ts2 := &fakeTopoServer{}
+	hc := NewHealthCheck(ctx, 1*time.Millisecond, time.Hour, ts, cell, "", nil)
+	defer hc.Close()
+	kew := NewKeyspaceEventWatcher(ctx, ts2, hc, cell)
+	kss := &keyspaceState{
+		kew:      kew,
+		keyspace: keyspace,
+		shards:   make(map[string]*shardState),
+	}
+	kss.lastKeyspace = &topodatapb.SrvKeyspace{}
+	require.True(t, kss.onSrvKeyspace(nil, nil))
+}
+
+// TestKeyspaceEventConcurrency confirms that the keyspace event watcher
+// does not fail to broadcast received keyspace events to subscribers.
+// This verifies that no events are lost when there's a high number of
+// concurrent keyspace events.
+func TestKeyspaceEventConcurrency(t *testing.T) {
+	cell := "cell1"
+	factory := faketopo.NewFakeTopoFactory()
+	factory.AddCell(cell)
+	sts := &fakeTopoServer{}
+	hc := NewFakeHealthCheck(make(chan *TabletHealth))
+	defer hc.Close()
+	kew := &KeyspaceEventWatcher{
+		hc:        hc,
+		ts:        sts,
+		localCell: cell,
+		keyspaces: make(map[string]*keyspaceState),
+		subs:      make(map[chan *KeyspaceEvent]struct{}),
+	}
+
+	// Subscribe to the watcher's broadcasted keyspace events.
+	receiver := kew.Subscribe()
+
+	updates := atomic.Uint32{}
+	updates.Store(0)
+	wg := sync.WaitGroup{}
+	concurrency := 100
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-receiver:
+				updates.Add(1)
+			}
+		}
+	}()
+	// Start up concurent go-routines that will broadcast keyspace events.
+	for i := 1; i <= concurrency; i++ {
+		wg.Go(func() {
+			kew.broadcast(&KeyspaceEvent{})
+		})
+	}
+	wg.Wait()
+	for {
+		select {
+		case <-ctx.Done():
+			require.Equal(t, concurrency, int(updates.Load()), "expected %d updates, got %d", concurrency, updates.Load())
+			return
+		default:
+			if int(updates.Load()) == concurrency { // Pass
+				cancel()
+				return
+			}
+		}
+	}
+}
+
+// TestKeyspaceEventTypes confirms that the keyspace event watcher determines
+// that the unavailability event is caused by the correct scenario. We should
+// consider it to be caused by a resharding operation when the following
+// conditions are present:
+// 1. The keyspace is inconsistent (in the middle of an availability event)
+// 2. The target tablet is a primary
+// 3. The keyspace has overlapping shards
+// 4. The overlapping shard's tablet is serving
+// And we should consider the cause to be a primary not serving when the
+// following conditions exist:
+// 1. The keyspace is inconsistent (in the middle of an availability event)
+// 2. The target tablet is a primary
+// 3. The target tablet is not serving
+// 4. The shard's externallyReparented time is not 0
+// 5. The shard's currentPrimary state is not nil
+// We should never consider both as a possible cause given the same
+// keyspace state.
+func TestKeyspaceEventTypes(t *testing.T) {
+	utils.EnsureNoLeaks(t)
+	ctx := t.Context()
+	cell := "cell"
+	keyspace := "testks"
+	factory := faketopo.NewFakeTopoFactory()
+	factory.AddCell(cell)
+	ts := faketopo.NewFakeTopoServer(ctx, factory)
+	ts2 := &fakeTopoServer{}
+	hc := NewHealthCheck(ctx, 1*time.Millisecond, time.Hour, ts, cell, "", nil)
+	defer hc.Close()
+	kew := NewKeyspaceEventWatcher(ctx, ts2, hc, cell)
+
+	type testCase struct {
+		name               string
+		kss                *keyspaceState
+		shardToCheck       string
+		expectResharding   bool
+		expectShouldBuffer bool
+	}
+
+	testCases := []testCase{
+		{
+			name: "one to two resharding in progress",
+			kss: &keyspaceState{
+				kew:      kew,
+				keyspace: keyspace,
+				shards: map[string]*shardState{
+					"-": {
+						target: &querypb.Target{
+							Keyspace:   keyspace,
+							Shard:      "-",
+							TabletType: topodatapb.TabletType_PRIMARY,
+						},
+						serving: false,
+					},
+					"-80": {
+						target: &querypb.Target{
+							Keyspace:   keyspace,
+							Shard:      "-80",
+							TabletType: topodatapb.TabletType_PRIMARY,
+						},
+						serving: true,
+					},
+					"80-": {
+						target: &querypb.Target{
+							Keyspace:   keyspace,
+							Shard:      "80-",
+							TabletType: topodatapb.TabletType_PRIMARY,
+						},
+						serving: false,
+					},
+				},
+				consistent: false,
+			},
+			shardToCheck:       "-",
+			expectResharding:   true,
+			expectShouldBuffer: false,
+		},
+		{
+			name: "two to four resharding in progress",
+			kss: &keyspaceState{
+				kew:      kew,
+				keyspace: keyspace,
+				shards: map[string]*shardState{
+					"-80": {
+						target: &querypb.Target{
+							Keyspace:   keyspace,
+							Shard:      "-80",
+							TabletType: topodatapb.TabletType_PRIMARY,
+						},
+						serving: false,
+					},
+					"80-": {
+						target: &querypb.Target{
+							Keyspace:   keyspace,
+							Shard:      "80-",
+							TabletType: topodatapb.TabletType_PRIMARY,
+						},
+						serving: true,
+					},
+					"-40": {
+						target: &querypb.Target{
+							Keyspace:   keyspace,
+							Shard:      "-40",
+							TabletType: topodatapb.TabletType_PRIMARY,
+						},
+						serving: true,
+					},
+					"40-80": {
+						target: &querypb.Target{
+							Keyspace:   keyspace,
+							Shard:      "40-80",
+							TabletType: topodatapb.TabletType_PRIMARY,
+						},
+						serving: true,
+					},
+					"80-c0": {
+						target: &querypb.Target{
+							Keyspace:   keyspace,
+							Shard:      "80-c0",
+							TabletType: topodatapb.TabletType_PRIMARY,
+						},
+						serving: false,
+					},
+					"c0-": {
+						target: &querypb.Target{
+							Keyspace:   keyspace,
+							Shard:      "c0-",
+							TabletType: topodatapb.TabletType_PRIMARY,
+						},
+						serving: false,
+					},
+				},
+				consistent: false,
+			},
+			shardToCheck:       "-80",
+			expectResharding:   true,
+			expectShouldBuffer: false,
+		},
+		{
+			name: "unsharded primary not serving",
+			kss: &keyspaceState{
+				kew:      kew,
+				keyspace: keyspace,
+				shards: map[string]*shardState{
+					"-": {
+						target: &querypb.Target{
+							Keyspace:   keyspace,
+							Shard:      "-",
+							TabletType: topodatapb.TabletType_PRIMARY,
+						},
+						serving:              false,
+						externallyReparented: time.Now().UnixNano(),
+						currentPrimary: &topodatapb.TabletAlias{
+							Cell: cell,
+							Uid:  100,
+						},
+					},
+				},
+				consistent: false,
+			},
+			shardToCheck:       "-",
+			expectResharding:   false,
+			expectShouldBuffer: true,
+		},
+		{
+			name: "sharded primary not serving",
+			kss: &keyspaceState{
+				kew:      kew,
+				keyspace: keyspace,
+				shards: map[string]*shardState{
+					"-80": {
+						target: &querypb.Target{
+							Keyspace:   keyspace,
+							Shard:      "-80",
+							TabletType: topodatapb.TabletType_PRIMARY,
+						},
+						serving:              false,
+						externallyReparented: time.Now().UnixNano(),
+						currentPrimary: &topodatapb.TabletAlias{
+							Cell: cell,
+							Uid:  100,
+						},
+					},
+					"80-": {
+						target: &querypb.Target{
+							Keyspace:   keyspace,
+							Shard:      "80-",
+							TabletType: topodatapb.TabletType_PRIMARY,
+						},
+						serving: true,
+					},
+				},
+				consistent: false,
+			},
+			shardToCheck:       "-80",
+			expectResharding:   false,
+			expectShouldBuffer: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			kew.mu.Lock()
+			kew.keyspaces[keyspace] = tc.kss
+			kew.mu.Unlock()
+
+			require.NotNil(t, tc.kss.shards[tc.shardToCheck], "the specified shardToCheck of %q does not exist in the shardState", tc.shardToCheck)
+
+			resharding := kew.TargetIsBeingResharded(ctx, tc.kss.shards[tc.shardToCheck].target)
+			require.Equal(t, resharding, tc.expectResharding, "TargetIsBeingResharded should return %t", tc.expectResharding)
+
+			_, shouldBuffer := kew.ShouldStartBufferingForTarget(ctx, tc.kss.shards[tc.shardToCheck].target)
+			require.Equal(t, shouldBuffer, tc.expectShouldBuffer, "ShouldStartBufferingForTarget should return %t", tc.expectShouldBuffer)
+		})
+	}
+}
+
+// TestWaitForConsistentKeyspaces tests the behaviour of WaitForConsistent for different scenarios.
+func TestWaitForConsistentKeyspaces(t *testing.T) {
+	testcases := []struct {
+		name        string
+		ksMap       map[string]*keyspaceState
+		ksList      []string
+		errExpected string
+	}{
+		{
+			name:   "Empty keyspace list",
+			ksList: nil,
+			ksMap: map[string]*keyspaceState{
+				"ks1": {},
+			},
+			errExpected: "",
+		},
+		{
+			name:   "All keyspaces consistent",
+			ksList: []string{"ks1", "ks2"},
+			ksMap: map[string]*keyspaceState{
+				"ks1": {
+					consistent: true,
+				},
+				"ks2": {
+					consistent: true,
+				},
+			},
+			errExpected: "",
+		},
+		{
+			name:   "One keyspace inconsistent",
+			ksList: []string{"ks1", "ks2"},
+			ksMap: map[string]*keyspaceState{
+				"ks1": {
+					consistent: true,
+				},
+				"ks2": {
+					consistent: false,
+				},
+			},
+			errExpected: "context canceled",
+		},
+		{
+			name:   "One deleted keyspace - consistent",
+			ksList: []string{"ks1", "ks2"},
+			ksMap: map[string]*keyspaceState{
+				"ks1": {
+					consistent: true,
+				},
+				"ks2": {
+					deleted: true,
+				},
+			},
+			errExpected: "",
+		},
+	}
+
+	for _, tt := range testcases {
+		t.Run(tt.name, func(t *testing.T) {
+			// We create a cancelable context and immediately cancel it.
+			// We don't want the unit tests to wait, so we only test the first
+			// iteration of whether the keyspace event watcher returns
+			// that the keyspaces are consistent or not.
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			kew := KeyspaceEventWatcher{
+				keyspaces:        tt.ksMap,
+				missingKeyspaces: make(map[string]time.Time),
+				mu:               sync.Mutex{},
+				ts:               &fakeTopoServer{},
+			}
+			err := kew.WaitForConsistentKeyspaces(ctx, tt.ksList)
+			if tt.errExpected != "" {
+				require.ErrorContains(t, err, tt.errExpected)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestOnHealthCheck(t *testing.T) {
+	testcases := []struct {
+		name                     string
+		ss                       *shardState
+		th                       *TabletHealth
+		wantServing              bool
+		wantWaitForReparent      bool
+		wantExternallyReparented int64
+		wantUID                  uint32
+	}{
+		{
+			name: "Non primary tablet health ignored",
+			ss: &shardState{
+				serving:              false,
+				waitForReparent:      false,
+				externallyReparented: 10,
+				currentPrimary: &topodatapb.TabletAlias{
+					Cell: testCell,
+					Uid:  1,
+				},
+			},
+			th: &TabletHealth{
+				Target: &querypb.Target{
+					TabletType: topodatapb.TabletType_REPLICA,
+				},
+				Serving: true,
+			},
+			wantServing:              false,
+			wantWaitForReparent:      false,
+			wantExternallyReparented: 10,
+			wantUID:                  1,
+		}, {
+			name: "Serving primary seen in non-serving shard",
+			ss: &shardState{
+				serving:              false,
+				waitForReparent:      false,
+				externallyReparented: 10,
+				currentPrimary: &topodatapb.TabletAlias{
+					Cell: testCell,
+					Uid:  1,
+				},
+			},
+			th: &TabletHealth{
+				Target: &querypb.Target{
+					TabletType: topodatapb.TabletType_PRIMARY,
+				},
+				Serving:              true,
+				PrimaryTermStartTime: 20,
+				Tablet: &topodatapb.Tablet{
+					Alias: &topodatapb.TabletAlias{
+						Cell: testCell,
+						Uid:  2,
+					},
+				},
+			},
+			wantServing:              true,
+			wantWaitForReparent:      false,
+			wantExternallyReparented: 20,
+			wantUID:                  2,
+		}, {
+			name: "New serving primary seen while waiting for reparent",
+			ss: &shardState{
+				serving:              false,
+				waitForReparent:      true,
+				externallyReparented: 10,
+				currentPrimary: &topodatapb.TabletAlias{
+					Cell: testCell,
+					Uid:  1,
+				},
+			},
+			th: &TabletHealth{
+				Target: &querypb.Target{
+					TabletType: topodatapb.TabletType_PRIMARY,
+				},
+				Serving:              true,
+				PrimaryTermStartTime: 20,
+				Tablet: &topodatapb.Tablet{
+					Alias: &topodatapb.TabletAlias{
+						Cell: testCell,
+						Uid:  2,
+					},
+				},
+			},
+			wantServing:              true,
+			wantWaitForReparent:      false,
+			wantExternallyReparented: 20,
+			wantUID:                  2,
+		}, {
+			name: "Old serving primary seen while waiting for reparent",
+			ss: &shardState{
+				serving:              false,
+				waitForReparent:      true,
+				externallyReparented: 10,
+				currentPrimary: &topodatapb.TabletAlias{
+					Cell: testCell,
+					Uid:  1,
+				},
+			},
+			th: &TabletHealth{
+				Target: &querypb.Target{
+					TabletType: topodatapb.TabletType_PRIMARY,
+				},
+				Serving:              true,
+				PrimaryTermStartTime: 10,
+				Tablet: &topodatapb.Tablet{
+					Alias: &topodatapb.TabletAlias{
+						Cell: testCell,
+						Uid:  1,
+					},
+				},
+			},
+			wantServing:              false,
+			wantWaitForReparent:      true,
+			wantExternallyReparented: 10,
+			wantUID:                  1,
+		}, {
+			name: "Old non-serving primary seen while waiting for reparent",
+			ss: &shardState{
+				serving:              false,
+				waitForReparent:      true,
+				externallyReparented: 10,
+				currentPrimary: &topodatapb.TabletAlias{
+					Cell: testCell,
+					Uid:  1,
+				},
+			},
+			th: &TabletHealth{
+				Target: &querypb.Target{
+					TabletType: topodatapb.TabletType_PRIMARY,
+				},
+				Serving:              false,
+				PrimaryTermStartTime: 10,
+				Tablet: &topodatapb.Tablet{
+					Alias: &topodatapb.TabletAlias{
+						Cell: testCell,
+						Uid:  1,
+					},
+				},
+			},
+			wantServing:              false,
+			wantWaitForReparent:      false,
+			wantExternallyReparented: 10,
+			wantUID:                  1,
+		}, {
+			name: "New serving primary while already serving",
+			ss: &shardState{
+				serving:              true,
+				waitForReparent:      false,
+				externallyReparented: 10,
+				currentPrimary: &topodatapb.TabletAlias{
+					Cell: testCell,
+					Uid:  1,
+				},
+			},
+			th: &TabletHealth{
+				Target: &querypb.Target{
+					TabletType: topodatapb.TabletType_PRIMARY,
+				},
+				Serving:              true,
+				PrimaryTermStartTime: 20,
+				Tablet: &topodatapb.Tablet{
+					Alias: &topodatapb.TabletAlias{
+						Cell: testCell,
+						Uid:  2,
+					},
+				},
+			},
+			wantServing:              true,
+			wantWaitForReparent:      false,
+			wantExternallyReparented: 20,
+			wantUID:                  2,
+		}, {
+			name: "Primary goes non serving",
+			ss: &shardState{
+				serving:              true,
+				waitForReparent:      false,
+				externallyReparented: 10,
+				currentPrimary: &topodatapb.TabletAlias{
+					Cell: testCell,
+					Uid:  1,
+				},
+			},
+			th: &TabletHealth{
+				Target: &querypb.Target{
+					TabletType: topodatapb.TabletType_PRIMARY,
+				},
+				Serving:              false,
+				PrimaryTermStartTime: 10,
+				Tablet: &topodatapb.Tablet{
+					Alias: &topodatapb.TabletAlias{
+						Cell: testCell,
+						Uid:  1,
+					},
+				},
+			},
+			wantServing:              false,
+			wantWaitForReparent:      false,
+			wantExternallyReparented: 10,
+			wantUID:                  1,
+		},
+	}
+
+	ksName := "ks"
+	shard := "-80"
+	kss := &keyspaceState{
+		mu:       sync.Mutex{},
+		keyspace: ksName,
+		shards:   make(map[string]*shardState),
+	}
+	// Adding this so that we don't run any topo calls from ensureConsistentLocked.
+	kss.moveTablesState = &MoveTablesState{
+		Typ:   MoveTablesRegular,
+		State: MoveTablesSwitching,
+	}
+	for _, tt := range testcases {
+		t.Run(tt.name, func(t *testing.T) {
+			kss.shards[shard] = tt.ss
+			tt.th.Target.Keyspace = ksName
+			tt.th.Target.Shard = shard
+			kss.onHealthCheck(tt.th)
+			require.Equal(t, tt.wantServing, tt.ss.serving)
+			require.Equal(t, tt.wantWaitForReparent, tt.ss.waitForReparent)
+			require.Equal(t, tt.wantExternallyReparented, tt.ss.externallyReparented)
+			require.Equal(t, tt.wantUID, tt.ss.currentPrimary.Uid)
+		})
+	}
+}
+
+type fakeTopoServer struct{}
+
+// GetTopoServer returns the full topo.Server instance.
+func (f *fakeTopoServer) GetTopoServer() (*topo.Server, error) {
+	return nil, nil
+}
+
+// GetSrvKeyspaceNames returns the list of keyspaces served in
+// the provided cell.
+func (f *fakeTopoServer) GetSrvKeyspaceNames(ctx context.Context, cell string, staleOK bool) ([]string, error) {
+	return []string{"ks1"}, nil
+}
+
+// GetSrvKeyspace returns the SrvKeyspace for a cell/keyspace.
+func (f *fakeTopoServer) GetSrvKeyspace(ctx context.Context, cell, keyspace string) (*topodatapb.SrvKeyspace, error) {
+	zeroHexBytes, _ := hex.DecodeString("")
+	eightyHexBytes, _ := hex.DecodeString("80")
+	ks := &topodatapb.SrvKeyspace{
+		Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
+			{
+				ServedType: topodatapb.TabletType_PRIMARY,
+				ShardReferences: []*topodatapb.ShardReference{
+					{Name: "-80", KeyRange: &topodatapb.KeyRange{Start: zeroHexBytes, End: eightyHexBytes}},
+					{Name: "80-", KeyRange: &topodatapb.KeyRange{Start: eightyHexBytes, End: zeroHexBytes}},
+				},
+			},
+		},
+	}
+	return ks, nil
+}
+
+// GetSrvVSchema returns the SrvVSchema for a cell.
+func (f *fakeTopoServer) GetSrvVSchema(ctx context.Context, cell string) (*vschemapb.SrvVSchema, error) {
+	vs := &vschemapb.SrvVSchema{
+		Keyspaces: map[string]*vschemapb.Keyspace{
+			"ks1": {
+				Sharded: true,
+			},
+		},
+		RoutingRules: &vschemapb.RoutingRules{
+			Rules: []*vschemapb.RoutingRule{
+				{
+					FromTable: "db1.t1",
+					ToTables:  []string{"db1.t1"},
+				},
+			},
+		},
+	}
+	return vs, nil
+}
+
+func (f *fakeTopoServer) WatchSrvKeyspace(ctx context.Context, cell, keyspace string, callback func(*topodatapb.SrvKeyspace, error) bool) {
+	ks, err := f.GetSrvKeyspace(ctx, cell, keyspace)
+	callback(ks, err)
+}
+
+// WatchSrvVSchema starts watching the SrvVSchema object for
+// the provided cell.  It will call the callback when
+// a new value or an error occurs.
+func (f *fakeTopoServer) WatchSrvVSchema(ctx context.Context, cell string, callback func(*vschemapb.SrvVSchema, error) bool) {
+	sv, err := f.GetSrvVSchema(ctx, cell)
+	callback(sv, err)
+}
+
+// fakeMissingKeyspaceTopoServer is a fakeTopoServer whose WatchSrvKeyspace
+// returns NoNode for keyspaces in the missing set, simulating a keyspace
+// that exists in the cluster but has no SrvKeyspace in the local cell.
+// It also counts how many times each Watch is invoked so tests can assert
+// the negative cache and the SrvVSchema-skip behavior in
+// KeyspaceEventWatcher.
+type fakeMissingKeyspaceTopoServer struct {
+	fakeTopoServer
+	missing               map[string]struct{}
+	watchSrvKeyspaceCalls atomic.Int64
+	watchSrvVSchemaCalls  atomic.Int64
+}
+
+func (f *fakeMissingKeyspaceTopoServer) WatchSrvKeyspace(ctx context.Context, cell, keyspace string, callback func(*topodatapb.SrvKeyspace, error) bool) {
+	f.watchSrvKeyspaceCalls.Add(1)
+	if _, ok := f.missing[keyspace]; ok {
+		callback(nil, topo.NewError(topo.NoNode, keyspace))
+		return
+	}
+	f.fakeTopoServer.WatchSrvKeyspace(ctx, cell, keyspace, callback)
+}
+
+func (f *fakeMissingKeyspaceTopoServer) WatchSrvVSchema(ctx context.Context, cell string, callback func(*vschemapb.SrvVSchema, error) bool) {
+	f.watchSrvVSchemaCalls.Add(1)
+	f.fakeTopoServer.WatchSrvVSchema(ctx, cell, callback)
+}
+
+// TestKeyspaceEventWatcherMissingKeyspaceCache verifies that healthchecks for
+// a keyspace whose SrvKeyspace does not exist in the local cell don't allocate
+// a new keyspaceState (and don't register a SrvVSchema listener) on every
+// event. Without the negative cache and the SrvVSchema-skip, this path used
+// to fire on every healthcheck event and pin orphan keyspaceStates in the
+// SrvVSchema watcher's listeners slice (onSrvVSchema always returns true,
+// so the listener was never reaped).
+func TestKeyspaceEventWatcherMissingKeyspaceCache(t *testing.T) {
+	cell := "cell1"
+	missing := "missing-keyspace"
+
+	sts := &fakeMissingKeyspaceTopoServer{
+		missing: map[string]struct{}{missing: {}},
+	}
+	hc := NewFakeHealthCheck(make(chan *TabletHealth))
+	t.Cleanup(func() { hc.Close() })
+
+	kew := &KeyspaceEventWatcher{
+		hc:               hc,
+		ts:               sts,
+		localCell:        cell,
+		keyspaces:        make(map[string]*keyspaceState),
+		missingKeyspaces: make(map[string]time.Time),
+		subs:             make(map[chan *KeyspaceEvent]struct{}),
+	}
+
+	const lookups = 100
+	for range lookups {
+		require.Nil(t, kew.getKeyspaceStatus(t.Context(), missing),
+			"getKeyspaceStatus must return nil for a keyspace missing from localCell")
+	}
+
+	assert.Equal(t, int64(1), sts.watchSrvKeyspaceCalls.Load(),
+		"WatchSrvKeyspace should be called at most once within missingKeyspaceTTL — the negative cache should short-circuit subsequent lookups")
+	assert.Equal(t, int64(0), sts.watchSrvVSchemaCalls.Load(),
+		"WatchSrvVSchema must never be called when SrvKeyspace returns NoNode synchronously — otherwise onSrvVSchema (always returning true) pins an orphan keyspaceState in the listeners slice")
+
+	// Force expiry of the negative cache and confirm exactly one re-allocation.
+	kew.mu.Lock()
+	for k := range kew.missingKeyspaces {
+		kew.missingKeyspaces[k] = time.Now().Add(-2 * missingKeyspaceTTL)
+	}
+	kew.mu.Unlock()
+
+	require.Nil(t, kew.getKeyspaceStatus(t.Context(), missing))
+	assert.Equal(t, int64(2), sts.watchSrvKeyspaceCalls.Load(),
+		"after the negative-cache TTL elapses, the next lookup should re-probe SrvKeyspace exactly once")
+	assert.Equal(t, int64(0), sts.watchSrvVSchemaCalls.Load(),
+		"WatchSrvVSchema must still not be called after re-probing a missing keyspace")
+}
+
+// TestOnSrvVSchemaUnregistersAfterDelete covers the async-deletion path: a
+// keyspace exists in localCell when newKeyspaceState registers onSrvVSchema,
+// then later disappears. onSrvKeyspace marks the state deleted and returns
+// false (reaping itself), but onSrvVSchema must also return false on its next
+// invocation — for every payload shape, including the nil "server shutting
+// down" case. Otherwise the resilient SrvVSchema watcher keeps the closure
+// (and the orphan keyspaceState it captures) in its listeners slice forever
+// and re-runs the callback's work on every SrvVSchema update.
+func TestOnSrvVSchemaUnregistersAfterDelete(t *testing.T) {
+	cases := []struct {
+		name string
+		vs   *vschemapb.SrvVSchema
+		err  error
+	}{
+		{"non-nil payload", &vschemapb.SrvVSchema{}, nil},
+		{"nil payload (server shutdown)", nil, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			kss := &keyspaceState{
+				keyspace: "ks1",
+				shards:   make(map[string]*shardState),
+			}
+
+			// Simulate the async deletion: SrvKeyspace returns NoNode for localCell.
+			require.False(t, kss.onSrvKeyspace(nil, topo.NewError(topo.NoNode, "ks1")),
+				"onSrvKeyspace must return false on NoNode so the SrvKeyspace watcher reaps it")
+			require.True(t, kss.isDeleted())
+
+			// The next SrvVSchema update must reap the orphan listener
+			// regardless of payload shape.
+			require.False(t, kss.onSrvVSchema(tc.vs, tc.err),
+				"onSrvVSchema must return false once the keyspace is deleted, otherwise the listener pins an orphan keyspaceState")
+		})
+	}
+}
