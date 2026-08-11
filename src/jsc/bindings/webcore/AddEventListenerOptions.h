@@ -32,17 +32,22 @@
 namespace WebCore {
 
 struct AddEventListenerOptions : EventListenerOptions {
-    AddEventListenerOptions(bool capture = false, std::optional<bool> passive = std::nullopt, bool once = false, RefPtr<AbortSignal>&& signal = nullptr)
+    AddEventListenerOptions(bool capture = false, std::optional<bool> passive = std::nullopt, bool once = false, RefPtr<AbortSignal>&& signal = nullptr, bool resistStopPropagation = false)
         : EventListenerOptions(capture)
         , passive(passive)
         , once(once)
         , signal(WTF::move(signal))
+        , resistStopPropagation(resistStopPropagation)
     {
     }
 
     std::optional<bool> passive;
     bool once { false };
     RefPtr<AbortSignal> signal;
+    // Node.js internal kResistStopPropagation: abort listeners that must still
+    // run after stopImmediatePropagation() for resource teardown.
+    // https://github.com/nodejs/node/blob/main/lib/internal/event_target.js
+    bool resistStopPropagation { false };
 };
 
 } // namespace WebCore

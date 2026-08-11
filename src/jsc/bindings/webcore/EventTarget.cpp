@@ -103,7 +103,7 @@ bool EventTarget::addEventListener(const AtomString& eventType, Ref<EventListene
     // if (!passive.has_value() && Quirks::shouldMakeEventListenerPassive(*this, eventType, listener.get()))
     //     passive = true;
 
-    auto* registeredListener = ensureEventTargetData().eventListenerMap.add(eventType, listener.copyRef(), { options.capture, passive.value_or(false), options.once });
+    auto* registeredListener = ensureEventTargetData().eventListenerMap.add(eventType, listener.copyRef(), { options.capture, passive.value_or(false), options.once, options.resistStopPropagation });
     if (!registeredListener)
         return false;
 
@@ -316,10 +316,12 @@ void EventTarget::innerInvokeEventListeners(Event& event, EventListenerVector li
         // if (InspectorInstrumentation::isEventListenerDisabled(*this, event.type(), registeredListener->callback(), registeredListener->useCapture()))
         //     continue;
 
-        // If stopImmediatePropagation has been called, we just break out immediately, without
-        // handling any more events on this target.
-        if (event.immediatePropagationStopped())
-            break;
+        // stopImmediatePropagation skips remaining listeners, except Node's internal
+        // kResistStopPropagation listeners (addAbortListener, timers, util.aborted, …)
+        // which must still run for resource teardown on a shared AbortSignal.
+        // https://github.com/nodejs/node/blob/main/lib/internal/event_target.js
+        if (event.immediatePropagationStopped() && !registeredListener->resistStopPropagation())
+            continue;
 
         // Make sure the JS wrapper and function stay alive until the end of this scope. Otherwise,
         // event listeners with 'once' flag may get collected as soon as they get unregistered below,

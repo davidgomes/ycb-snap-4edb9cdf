@@ -34,6 +34,7 @@ const {
 } = require("internal/validators");
 
 const types = require("node:util/types");
+const { kResistStopPropagation } = require("internal/shared");
 let inspect: typeof import("node:util").inspect | undefined;
 
 const SymbolFor = Symbol.for;
@@ -591,7 +592,12 @@ async function once(emitter, type, options = kEmptyObject) {
     reject($makeAbortError(undefined, { cause: signal?.reason }));
   }
   if (signal != null) {
-    eventTargetAgnosticAddListener(signal, "abort", abortListener, { once: true });
+    // https://github.com/nodejs/node/blob/main/lib/events.js
+    eventTargetAgnosticAddListener(signal, "abort", abortListener, {
+      __proto__: null,
+      once: true,
+      [kResistStopPropagation]: true,
+    });
   }
 
   return promise;
@@ -880,7 +886,8 @@ function addAbortListener(signal, listener) {
   if (signal.aborted) {
     queueMicrotask(() => listener());
   } else {
-    signal.addEventListener("abort", listener, { __proto__: null, once: true });
+    // https://github.com/nodejs/node/blob/main/lib/events.js
+    signal.addEventListener("abort", listener, { __proto__: null, once: true, [kResistStopPropagation]: true });
     removeEventListener = () => {
       signal.removeEventListener("abort", listener);
     };

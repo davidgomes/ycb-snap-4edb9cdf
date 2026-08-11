@@ -24,10 +24,27 @@
 #include "JSAbortSignal.h"
 #include "JSDOMConvertBoolean.h"
 #include "JSDOMConvertInterface.h"
+#include "ZigGlobalObject.h"
 #include <JavaScriptCore/JSCInlines.h>
+#include <JavaScriptCore/PrivateName.h>
+#include <JavaScriptCore/Symbol.h>
 
 namespace WebCore {
 using namespace JSC;
+
+// Unique SymbolImpl shared by jsResistStopPropagationSymbol() and addEventListener
+// options parsing. Not forgeable via string keys, Symbol(), or Symbol.for().
+// https://github.com/nodejs/node/blob/main/lib/internal/event_target.js
+static PrivateName& resistStopPropagationPrivateName()
+{
+    static PrivateName name("kResistStopPropagation"_s);
+    return name;
+}
+
+JSC::JSValue jsResistStopPropagationSymbol(Zig::GlobalObject* globalObject)
+{
+    return Symbol::create(globalObject->vm(), resistStopPropagationPrivateName().uid());
+}
 
 template<> AddEventListenerOptions convertDictionary<AddEventListenerOptions>(JSGlobalObject& lexicalGlobalObject, JSValue value)
 {
@@ -85,6 +102,14 @@ template<> AddEventListenerOptions convertDictionary<AddEventListenerOptions>(JS
     if (!signalValue.isUndefined()) {
         result.signal = convert<IDLInterface<AbortSignal>>(lexicalGlobalObject, signalValue);
         RETURN_IF_EXCEPTION(throwScope, {});
+    }
+    // Own-property lookup only: prototype pollution / string keys / userland
+    // Symbol() / Symbol.for() must not opt into non-suppressible dispatch.
+    if (object) {
+        if (JSValue resistValue = object->getDirect(vm, Identifier::fromUid(vm, &resistStopPropagationPrivateName().uid()))) {
+            result.resistStopPropagation = resistValue.toBoolean(&lexicalGlobalObject);
+            RETURN_IF_EXCEPTION(throwScope, {});
+        }
     }
     return result;
 }

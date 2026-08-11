@@ -883,6 +883,77 @@ test("using addAbortListener", async () => {
   expect(mocked).not.toHaveBeenCalled();
 });
 
+function withAbortStopper(signal: AbortSignal) {
+  signal.addEventListener("abort", e => e.stopImmediatePropagation(), { once: true });
+}
+
+test("addAbortListener runs after stopImmediatePropagation", () => {
+  const controller = new AbortController();
+  withAbortStopper(controller.signal);
+  const ran = mock();
+  EventEmitter.addAbortListener(controller.signal, ran);
+  controller.abort();
+  expect(ran).toHaveBeenCalledTimes(1);
+});
+
+test("addAbortListener registered before stopper still runs", () => {
+  const controller = new AbortController();
+  const ran = mock();
+  EventEmitter.addAbortListener(controller.signal, ran);
+  withAbortStopper(controller.signal);
+  controller.abort();
+  expect(ran).toHaveBeenCalledTimes(1);
+});
+
+test("stopImmediatePropagation still suppresses ordinary addEventListener listeners", () => {
+  const controller = new AbortController();
+  const ordinary = mock();
+  withAbortStopper(controller.signal);
+  controller.signal.addEventListener("abort", ordinary);
+  controller.abort();
+  expect(ordinary).not.toHaveBeenCalled();
+});
+
+test("disposing addAbortListener still prevents it from running after stopImmediatePropagation", () => {
+  const controller = new AbortController();
+  withAbortStopper(controller.signal);
+  const ran = mock();
+  const disposable = EventEmitter.addAbortListener(controller.signal, ran);
+  disposable[Symbol.dispose]();
+  controller.abort();
+  expect(ran).not.toHaveBeenCalled();
+});
+
+test("userland cannot forge kResistStopPropagation via string keys, Symbol(), Symbol.for(), or prototype pollution", () => {
+  const controller = new AbortController();
+  const ran = mock();
+  const ownSymbol = Symbol("kResistStopPropagation");
+  const forSymbol = Symbol.for("kResistStopPropagation");
+  const proto = Object.prototype as typeof Object.prototype & Record<PropertyKey, unknown>;
+  proto.resistStopPropagation = true;
+  proto[forSymbol] = true;
+  try {
+    withAbortStopper(controller.signal);
+    controller.signal.addEventListener("abort", ran, { once: true, resistStopPropagation: true } as AddEventListenerOptions);
+    controller.signal.addEventListener("abort", ran, { once: true, [ownSymbol]: true });
+    controller.signal.addEventListener("abort", ran, { once: true, [forSymbol]: true });
+    controller.abort();
+  } finally {
+    delete proto.resistStopPropagation;
+    delete proto[forSymbol];
+  }
+  expect(ran).not.toHaveBeenCalled();
+});
+
+test("events.once rejects on abort even if stopImmediatePropagation was called", async () => {
+  const et = new EventTarget();
+  const ac = new AbortController();
+  withAbortStopper(ac.signal);
+  const promise = EventEmitter.once(et, "foo", { signal: ac.signal });
+  ac.abort();
+  await expect(promise).rejects.toMatchObject({ name: "AbortError" });
+});
+
 test("getMaxListeners", () => {
   const emitter = new EventEmitter();
   expect(emitter.getMaxListeners()).toBe(10);

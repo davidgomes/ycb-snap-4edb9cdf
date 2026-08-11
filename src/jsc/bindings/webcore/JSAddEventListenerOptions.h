@@ -23,8 +23,16 @@
 #include "AddEventListenerOptions.h"
 #include "JSDOMConvertDictionary.h"
 
+namespace Zig {
+class GlobalObject;
+}
+
 namespace WebCore {
 
 template<> AddEventListenerOptions convertDictionary<AddEventListenerOptions>(JSC::JSGlobalObject&, JSC::JSValue);
+
+// Process-wide unique Symbol wrapping Node's kResistStopPropagation.
+// https://github.com/nodejs/node/blob/main/lib/internal/event_target.js
+JSC::JSValue jsResistStopPropagationSymbol(Zig::GlobalObject* globalObject);
 
 } // namespace WebCore

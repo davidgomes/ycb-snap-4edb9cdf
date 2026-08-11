@@ -2,6 +2,7 @@
 // https://github.com/niksy/isomorphic-timers-promises/blob/master/index.js
 
 const { validateBoolean, validateAbortSignal, validateObject, validateNumber } = require("internal/validators");
+const { kResistStopPropagation } = require("internal/shared");
 
 const symbolAsyncIterator = Symbol.asyncIterator;
 const setImmediateGlobal = globalThis.setImmediate;
@@ -65,7 +66,8 @@ function setTimeout(after = 1, value, options = {}) {
         clearTimeout(timeout);
         reject($makeAbortError(undefined, { cause: signal.reason }));
       };
-      signal.addEventListener("abort", onCancel);
+      // https://github.com/nodejs/node/blob/main/lib/timers/promises.js
+      signal.addEventListener("abort", onCancel, { __proto__: null, [kResistStopPropagation]: true });
     }
   });
   return typeof onCancel !== "undefined"
@@ -104,7 +106,8 @@ function setImmediate(value, options = {}) {
         clearImmediate(immediate);
         reject($makeAbortError(undefined, { cause: signal.reason }));
       };
-      signal.addEventListener("abort", onCancel);
+      // https://github.com/nodejs/node/blob/main/lib/timers/promises.js
+      signal.addEventListener("abort", onCancel, { __proto__: null, [kResistStopPropagation]: true });
     }
   });
   return typeof onCancel !== "undefined"
@@ -187,7 +190,8 @@ function setInterval(after = 1, value, options = {}) {
           callback = undefined;
         }
       };
-      signal.addEventListener("abort", onCancel);
+      // https://github.com/nodejs/node/blob/main/lib/timers/promises.js
+      signal.addEventListener("abort", onCancel, { __proto__: null, once: true, [kResistStopPropagation]: true });
     }
 
     return asyncIterator({

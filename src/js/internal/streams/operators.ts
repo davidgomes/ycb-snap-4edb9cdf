@@ -233,7 +233,7 @@ async function reduce(reducer, initialValue, options) {
   const ac = new AbortController();
   const signal = ac.signal;
   if (options?.signal) {
-    const opts = { once: true, [kWeakHandler]: this, [kResistStopPropagation]: true };
+    const opts = { __proto__: null, once: true, [kWeakHandler]: this, [kResistStopPropagation]: true };
     options.signal.addEventListener("abort", () => ac.abort(), opts);
   }
   let gotAnyItemFromStream = false;

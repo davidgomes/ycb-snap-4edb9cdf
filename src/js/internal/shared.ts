@@ -335,7 +335,9 @@ export default {
 
   kHandle: Symbol("kHandle"),
   kAutoDestroyed: Symbol("kAutoDestroyed"),
-  kResistStopPropagation: Symbol("kResistStopPropagation"),
+  // C++ EventTarget honors only this unforgeable symbol (not Symbol(), Symbol.for(), or string keys).
+  // https://github.com/nodejs/node/blob/main/lib/internal/event_target.js
+  kResistStopPropagation: $cpp("JSAddEventListenerOptions.cpp", "jsResistStopPropagationSymbol"),
   kWeakHandler: Symbol("kWeak"),
   kGetNativeReadableProto: Symbol("kGetNativeReadableProto"),
   kEmptyObject,

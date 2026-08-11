@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { setImmediate, setTimeout } from "node:timers/promises";
+import { setImmediate, setInterval, setTimeout } from "node:timers/promises";
 
 describe("setTimeout", () => {
   it("abort() does not emit global error", async () => {
@@ -37,6 +37,14 @@ describe("setTimeout", () => {
     await expect(promise).rejects.toThrow(expect.objectContaining({ name: "AbortError" }));
     expect(abortController.signal.aborted).toBe(true);
   });
+
+  it("rejects when abort listener calls stopImmediatePropagation", async () => {
+    const abortController = new AbortController();
+    abortController.signal.addEventListener("abort", e => e.stopImmediatePropagation(), { once: true });
+    const promise = setTimeout(60_000, undefined, { signal: abortController.signal });
+    abortController.abort();
+    await expect(promise).rejects.toMatchObject({ name: "AbortError" });
+  });
 });
 
 describe("setImmediate", () => {
@@ -61,5 +69,24 @@ describe("setImmediate", () => {
 
     expect(c.signal.aborted).toBe(true);
     expect(unhandledRejectionCaught).toBe(false);
+  });
+
+  it("rejects when abort listener calls stopImmediatePropagation", async () => {
+    const abortController = new AbortController();
+    abortController.signal.addEventListener("abort", e => e.stopImmediatePropagation(), { once: true });
+    const promise = setImmediate(undefined, { signal: abortController.signal });
+    abortController.abort();
+    await expect(promise).rejects.toMatchObject({ name: "AbortError" });
+  });
+});
+
+describe("setInterval", () => {
+  it("ends with AbortError when abort listener calls stopImmediatePropagation", async () => {
+    const abortController = new AbortController();
+    abortController.signal.addEventListener("abort", e => e.stopImmediatePropagation(), { once: true });
+    const iterator = setInterval(60_000, "tick", { signal: abortController.signal });
+    const nextPromise = iterator.next();
+    abortController.abort();
+    await expect(nextPromise).rejects.toMatchObject({ name: "AbortError" });
   });
 });

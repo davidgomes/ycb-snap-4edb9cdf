@@ -81,3 +81,11 @@ test("fails if not provided a resource", async () => {
     await expect(() => aborted(ac.signal, resource)).toThrow();
   }
 });
+
+test("aborted resolves even if an earlier abort listener calls stopImmediatePropagation", async () => {
+  const ac = new AbortController();
+  ac.signal.addEventListener("abort", e => e.stopImmediatePropagation(), { once: true });
+  const abortedPromise = aborted(ac.signal, {});
+  ac.abort();
+  await expect(abortedPromise).resolves.toBeUndefined();
+});
