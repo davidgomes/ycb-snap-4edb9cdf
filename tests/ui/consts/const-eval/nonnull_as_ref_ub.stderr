@@ -1,0 +1,12 @@
+error[E0080]: reference not dereferenceable: reference must be dereferenceable for 1 byte, but got 0x1[noalloc] which is a dangling pointer (it has no provenance)
+  --> $DIR/nonnull_as_ref_ub.rs:4:39
+   |
+LL | const _: () = assert!(42 == *unsafe { NON_NULL.as_ref() });
+   |                                       ^^^^^^^^^^^^^^^^^ evaluation of `_` failed inside this call
+   |
+note: inside `NonNull::<u8>::as_ref::<'_>`
+  --> $SRC_DIR/core/src/ptr/non_null.rs:LL:COL
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0080`.
