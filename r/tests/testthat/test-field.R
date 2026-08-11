@@ -1,0 +1,120 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+test_that("field() factory", {
+  x <- field("x", int32())
+  expect_equal(x$type, int32())
+  expect_equal(x$name, "x")
+  expect_true(x$nullable)
+  expect_true(x == x)
+  expect_false(x == field("x", int64()))
+})
+
+test_that("Field with nullable values", {
+  x <- field("x", int32(), nullable = FALSE)
+  expect_equal(x$type, int32())
+  expect_false(x$nullable)
+  expect_true(x == x)
+  expect_false(x == field("x", int32()))
+})
+
+test_that("Field validation", {
+  expect_error(schema(b = 32), "b must be a DataType, not numeric")
+})
+
+test_that("Print method for field", {
+  expect_output(print(field("x", int32())), "Field\nx: int32")
+  expect_output(
+    print(field("zz", dictionary())),
+    "Field\nzz: dictionary<values=string, indices=int32>"
+  )
+
+  expect_output(
+    print(field("x", int32(), nullable = FALSE)),
+    "Field\nx: int32 not null"
+  )
+})
+
+test_that("Field to C-interface", {
+  field <- field("x", time32("s"))
+
+  # export the field via the C-interface
+  ptr <- allocate_arrow_schema()
+  field$export_to_c(ptr)
+
+  # then import it and check that the roundtripped value is the same
+  circle <- Field$import_from_c(ptr)
+  expect_equal(circle, field)
+
+  # must clean up the pointer or we leak
+  delete_arrow_schema(ptr)
+})
+
+test_that("Field metadata", {
+  x <- field("x", int32())
+  expect_false(x$HasMetadata)
+  expect_null(x$metadata)
+
+  x_meta <- field("x", int32(), metadata = list(key = "value"))
+  expect_true(x_meta$HasMetadata)
+  expect_identical(x_meta$metadata, list(key = "value"))
+
+  x_meta2 <- x$WithMetadata(list(key = "value"))
+  expect_true(x_meta2$HasMetadata)
+  expect_identical(x_meta2$metadata, list(key = "value"))
+
+  x_no_meta <- x_meta$RemoveMetadata()
+  expect_false(x_no_meta$HasMetadata)
+  expect_null(x_no_meta$metadata)
+})
+
+test_that("Field$Equals with check_metadata", {
+  x <- field("x", int32())
+  x_meta <- field("x", int32(), metadata = list(key = "value"))
+
+  expect_true(x$Equals(x_meta))
+  expect_false(x$Equals(x_meta, check_metadata = TRUE))
+  expect_true(x == x_meta)
+})
+
+test_that("Field WithMetadata(NULL) removes metadata", {
+  x <- field("x", int32(), metadata = list(key = "value"))
+  x_empty <- x$WithMetadata(NULL)
+  expect_false(x_empty$HasMetadata)
+  expect_null(x_empty$metadata)
+})
+
+test_that("Field metadata IPC roundtrip", {
+  x <- field("x", int32(), metadata = list(key = "value"))
+  tab <- Table$create(x = 1L, schema = schema(x))
+  bytes <- write_to_raw(tab)
+  roundtripped <- read_ipc_stream(bytes, as_data_frame = FALSE)
+  expect_true(roundtripped$schema$GetFieldByName("x")$Equals(x, check_metadata = TRUE))
+})
+
+test_that("Field metadata with duplicate keys", {
+  x <- field("x", int32(), metadata = list(a = "1", a = "2"))
+  expect_true(x$HasMetadata)
+  expect_length(x$metadata, 2)
+  expect_equal(x$metadata, list(a = "1", a = "2"))
+})
+
+test_that("Field metadata on nested struct child fields", {
+  inner <- field("y", int32(), metadata = list(inner_key = "inner_value"))
+  outer <- field("outer", struct__(list(inner)))
+  expect_true(outer$type$GetFieldByName("y")$Equals(inner, check_metadata = TRUE))
+})
