@@ -1,0 +1,28 @@
+services:
+  jaeger:
+    image: cr.jaegertracing.io/jaegertracing/jaeger:${JAEGER_VERSION:-2.5.0}
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "4317:4317"    # Collector, OpenTelemetry gRPC
+      - "4318:4318"    # Collector, OpenTelemetry gRPC
+    # We are using the build-in all-in-one configuration to avoid having
+    # to provide an external configuration file for Jaeger. We use the
+    # `--set` flag to override the default configuration of the `jaeger_query`
+    # extension to tell Jaeger that it should run the UI with a given prefix.
+    command: "--set extensions.jaeger_query.base_path=/jaeger/prefix"
+    networks:
+      - proxy-net
+
+  httpd:
+    image: httpd:latest
+    ports:
+      - "18080:80"
+    volumes:
+      - ./httpd.conf:/usr/local/apache2/conf/httpd.conf
+    depends_on:
+      - jaeger
+    networks:
+      - proxy-net
+
+networks:
+  proxy-net:
