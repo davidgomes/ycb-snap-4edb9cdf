@@ -509,6 +509,8 @@ class Cipher final {
     int padding;
     Digest digest;
     const Buffer<const void> label;
+    // When unset, MGF1 follows `digest` (OpenSSL's OAEP default).
+    Digest mgf1_digest;
   };
 
   static DataPointer encrypt(const EVPKeyPointer& key,

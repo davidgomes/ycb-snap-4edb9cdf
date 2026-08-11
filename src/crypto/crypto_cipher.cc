@@ -801,6 +801,7 @@ bool PublicKeyCipher::Cipher(
     const EVPKeyPointer& pkey,
     int padding,
     const Digest& digest,
+    const Digest& mgf1_digest,
     const ArrayBufferOrViewContents<unsigned char>& oaep_label,
     const ArrayBufferOrViewContents<unsigned char>& data,
     std::unique_ptr<BackingStore>* out) {
@@ -811,6 +812,7 @@ bool PublicKeyCipher::Cipher(
       .padding = padding,
       .digest = digest,
       .label = label,
+      .mgf1_digest = mgf1_digest,
   };
 
   auto buf = cipher(pkey, params, in);
@@ -882,8 +884,17 @@ void PublicKeyCipher::Cipher(const FunctionCallbackInfo<Value>& args) {
   if (!oaep_label.CheckSizeInt32()) [[unlikely]] {
     return THROW_ERR_OUT_OF_RANGE(env, "oaepLabel is too big");
   }
+
+  Digest mgf1_digest;
+  if (args[offset + 4]->IsString()) {
+    Utf8Value mgf1_str(env->isolate(), args[offset + 4]);
+    mgf1_digest = Digest::FromName(*mgf1_str);
+    if (!mgf1_digest) return THROW_ERR_OSSL_EVP_INVALID_DIGEST(env);
+  }
+
   std::unique_ptr<BackingStore> out;
-  if (!Cipher<cipher>(env, pkey, padding, digest, oaep_label, buf, &out)) {
+  if (!Cipher<cipher>(
+          env, pkey, padding, digest, mgf1_digest, oaep_label, buf, &out)) {
     return ThrowCryptoError(env, ERR_get_error());
   }
 

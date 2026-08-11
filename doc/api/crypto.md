@@ -5370,8 +5370,10 @@ changes:
 <!--lint disable maximum-line-length remark-lint-->
 
 * `privateKey` {Object|string|ArrayBuffer|Buffer|TypedArray|DataView|KeyObject|URL}
-  * `oaepHash` {string} The hash function to use for OAEP padding and MGF1.
-    **Default:** `'sha1'`
+  * `oaepHash` {string} The hash function to use for OAEP padding. Also used
+    for MGF1 unless `mgf1Hash` is specified. **Default:** `'sha1'`
+  * `mgf1Hash` {string} The hash function to use for MGF1. If not specified,
+    MGF1 uses the same digest as `oaepHash`.
   * `oaepLabel` {string|ArrayBuffer|Buffer|TypedArray|DataView} The label to
     use for OAEP padding. If not specified, no label is used.
   * `padding` {crypto.constants} An optional padding value defined in
@@ -5516,8 +5518,10 @@ changes:
 * `key` {Object|string|ArrayBuffer|Buffer|TypedArray|DataView|KeyObject}
   * `key` {string|ArrayBuffer|Buffer|TypedArray|DataView|KeyObject}
     A PEM encoded public or private key, or {KeyObject}.
-  * `oaepHash` {string} The hash function to use for OAEP padding and MGF1.
-    **Default:** `'sha1'`
+  * `oaepHash` {string} The hash function to use for OAEP padding. Also used
+    for MGF1 unless `mgf1Hash` is specified. **Default:** `'sha1'`
+  * `mgf1Hash` {string} The hash function to use for MGF1. If not specified,
+    MGF1 uses the same digest as `oaepHash`.
   * `oaepLabel` {string|ArrayBuffer|Buffer|TypedArray|DataView} The label to
     use for OAEP padding. If not specified, no label is used.
   * `passphrase` {string|ArrayBuffer|Buffer|TypedArray|DataView} An optional
