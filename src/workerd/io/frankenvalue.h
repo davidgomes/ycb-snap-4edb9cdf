@@ -1,0 +1,251 @@
+// Copyright (c) 2024 Cloudflare, Inc.
+// Licensed under the Apache 2.0 license found in the LICENSE file or at:
+//     https://opensource.org/licenses/Apache-2.0
+
+#pragma once
+
+#include <workerd/io/frankenvalue.capnp.h>
+#include <workerd/jsg/jsg.h>
+
+namespace workerd {
+
+// C++ class mirroring `Frankenvalue` as defined in `frankenvalue.capnp`.
+//
+// Represents a JavaScript value that has been stitched together from multiple sources outside of
+// a JavaScript evaluation context. The Frankevalue can be evaluated down to a JS value as soon
+// as it has a JS execution environment in which to be evaluated.
+//
+// This is used in particular to represent `ctx.props`.
+class Frankenvalue {
+ public:
+  Frankenvalue(): value(EmptyObject()) {}
+
+  bool empty() const {
+    return value.is<EmptyObject>() && properties.empty();
+  }
+
+  // Returns an estimate of the in-memory size of the value, in bytes. This sums the size of the
+  // serialized/JSON content of this value plus, recursively, the sizes of any stitched-in
+  // properties (including their names). Intended for enforcing size limits, not for exact
+  // accounting. The cap table is not included.
+  size_t estimateSize() const;
+
+  Frankenvalue clone();
+
+  // This method only works if the `CapTableEntry`s in this `Frankenvalue` all implement
+  // `threadSafeClone()`.
+  Frankenvalue threadSafeClone() const;
+
+  class CapTableEntry;
+
+  // Convert to/from capnp format.
+  //
+  // The CapTable, if any, is expected to be handled separately, as different use cases call for
+  // very different handling of the cap table.
+  void toCapnp(rpc::Frankenvalue::Builder builder);
+  static Frankenvalue fromCapnp(
+      rpc::Frankenvalue::Reader reader, kj::Vector<kj::Own<CapTableEntry>> capTable = {});
+
+  // Convert to/from JavaScript values. Note that round trips here don't produce the exact same
+  // Frankenvalue representation: toJs() puts all the contents together into a single value, and
+  // fromJs() always returns a Frankenvalue containing a single V8-serialized value.
+  jsg::JsValue toJs(jsg::Lock& js);
+  static Frankenvalue fromJs(jsg::Lock& js, jsg::JsValue value);
+
+  // Like toJs() but add the properties to an existing object. Throws if the `Frankenvalue` does
+  // not represent an object. This is used to populate `env` in particular.
+  void populateJsObject(jsg::Lock& js, jsg::JsObject target);
+
+  // Construct a Frankenvalue from JSON.
+  //
+  // (It's not possible to convert a Frankenvalue back to JSON, except by evaluating it in JS and
+  // then JSON-stringifying from there.)
+  static Frankenvalue fromJson(kj::String json);
+
+  // Construct a Frankenvalue whose value is an `ArrayBuffer` wrapping `data`, without going
+  // through V8 serialization. For placing binary data into `ctx.props` where no JS context exists.
+  static Frankenvalue fromBytes(kj::Array<byte> data);
+
+  // Construct a Frankenvalue whose value is a single capability (cap table entry), without going
+  // through V8 serialization. When converted to JS, the capability is materialized using the
+  // deserializer registered for `tag` (a `workerd::rpc::SerializationTag` value, e.g.
+  // `serviceStub` to produce a Fetcher). This is useful when building a Frankenvalue outside of any
+  // JavaScript context, e.g. to place a service binding (Fetcher) into `ctx.props` from config or a
+  // control plane.
+  static Frankenvalue fromCapability(uint16_t tag, kj::Own<CapTableEntry> entry);
+
+  // Add a property to the value, represented as another Frankenvalue. This is how you "stitch
+  // together" values!
+  //
+  // This is called `set` because the new property will override any existing property with the
+  // same name, but note that this strictly appends content. The replacement happens only when the
+  // Frankenvalue is finally converted to JS.
+  void setProperty(kj::String name, Frankenvalue value);
+
+  // ---------------------------------------------------------------------------
+  // Capability handling
+  //
+  // A Frankenvalue can contain capabilities (typically ServiceStubs). When serializing from
+  // JavaScript, these will be encoded as integer indexes into a separate table -- the CapTable.
+
+  // The Frankenvalue itself doesn't know how these "capabilities" are implemneted, so leaves this
+  // up to a higher layer. It simply maintains a table of `CapTableEntry` objects. `CapTableEntry`
+  // serves as a generic base class for multiple representations which serializers and
+  // deserializers for specific types will need to support through downcasting.
+  //
+  // In particular:
+  // - Typically, the type is `IoChannelFactory::SubrequestChannel`.
+  // - When a Frankenvalue is being used to initialize the `env` of a dynamically-loaded isolate,
+  //   each CapTableEntry may simply contain an I/O channel number.
+  // - In some environments, a CapTableEntry might be some sort of description of how to load a
+  //   Worker that implements the capability.
+  class CapTableEntry {
+   public:
+    // Clone the entry, used when `Frankenvalue::clone()` is called. Many implementations may
+    // implement this using addRef().
+    virtual kj::Own<CapTableEntry> clone() = 0;
+
+    // Like `clone()` but works on const values. Used only when `Frankenvalue::threadSafeClone()`
+    // is called. The default implementation throws an exception.
+    virtual kj::Own<CapTableEntry> threadSafeClone() const;
+  };
+
+  kj::ArrayPtr<kj::Own<CapTableEntry>> getCapTable() {
+    return capTable;
+  }
+
+  // Rewrite all the caps in the table by calling the `rewrite()` callback on each one.
+  template <typename Func>
+  void rewriteCaps(Func&& rewrite) {
+    for (auto& slot: capTable) {
+      slot = rewrite(kj::mv(slot));
+    }
+  }
+
+  // Kind of like `rewriteCaps()`, but the callback returns
+  // kj::OneOf<kj::Own<CapTableEntry>, kj::Promise<kj::Own<CapTableEntry>>>, i.e. it may optionally
+  // decide to be async. If any of the calls return a promise, then `resolveCaps()` returns a
+  // promise created by joining the inner promises -- the Frankenvalue MUST NOT be used until that
+  // promise resolves. (If the promise fails or is canceled, the Frankenvalue must be discarded.)
+  template <typename Func>
+  kj::Maybe<kj::Promise<void>> resolveCaps(Func&& resolve) {
+    kj::Vector<kj::Promise<void>> promises;
+    for (auto& slot: capTable) {
+      KJ_SWITCH_ONEOF(resolve(kj::mv(slot))) {
+        KJ_CASE_ONEOF(replacement, kj::Own<CapTableEntry>) {
+          slot = kj::mv(replacement);
+        }
+        KJ_CASE_ONEOF(promise, kj::Promise<kj::Own<CapTableEntry>>) {
+          promises.add(promise.then(
+              [&slot](kj::Own<CapTableEntry> replacement) { slot = kj::mv(replacement); }));
+        }
+      }
+    }
+    if (promises.empty()) {
+      return kj::none;
+    } else {
+      return kj::joinPromisesFailFast(promises.releaseAsArray());
+    }
+  }
+
+  // When deserializing a JS value, the jsg::Deserializer's ExternalHandler will have this type.
+  class CapTableReader final: public jsg::Deserializer::ExternalHandler {
+   public:
+    kj::Maybe<CapTableEntry&> get(uint index) {
+      if (index < table.size()) {
+        return *table[index];
+      } else {
+        return kj::none;
+      }
+    }
+
+   private:
+    kj::ArrayPtr<kj::Own<CapTableEntry>> table;
+    CapTableReader(kj::ArrayPtr<kj::Own<CapTableEntry>> table): table(table) {}
+    friend class Frankenvalue;
+  };
+
+  // When serializing a JS value, the jsg::Serializer's ExternalHandler will have this type.
+  class CapTableBuilder final: public jsg::Serializer::ExternalHandler {
+   public:
+    uint add(kj::Own<CapTableEntry> entry) {
+      uint result = target.capTable.size();
+      target.capTable.add(kj::mv(entry));
+      return result;
+    }
+
+   private:
+    Frankenvalue& target;
+    CapTableBuilder(Frankenvalue& target): target(target) {}
+    friend class Frankenvalue;
+  };
+
+ private:
+  struct EmptyObject {};
+  struct Json {
+    kj::String json;
+  };
+  struct V8Serialized {
+    kj::Array<byte> data;
+  };
+  struct Bytes {
+    kj::Array<byte> data;
+  };
+  struct Capability {
+    // Index into this value's base cap table (the caps referenced by the union, before property
+    // caps).
+    uint32_t capIndex;
+
+    // The `workerd::rpc::SerializationTag` value describing how to materialize the capability into
+    // a JS value (e.g. `serviceStub` for a Fetcher). Stored as a raw integer so that this header
+    // need not depend on the `SerializationTag` schema.
+    uint16_t tag;
+  };
+  kj::OneOf<EmptyObject, Json, V8Serialized, Bytes, Capability> value;
+
+  struct Property;
+  kj::Vector<Property> properties;
+
+  kj::Vector<kj::Own<CapTableEntry>> capTable;
+
+  Frankenvalue cloneImpl() const;
+  // `capTableTotal` is the real cap table size; `capCount` must never advance past it.
+  size_t fromCapnpImpl(rpc::Frankenvalue::Reader reader, size_t capCount, size_t capTableTotal);
+  void toCapnpImpl(rpc::Frankenvalue::Builder builder, size_t capTableSize);
+  jsg::JsValue toJsImpl(jsg::Lock& js, kj::ArrayPtr<kj::Own<CapTableEntry>> capTable);
+};
+
+// Can't be defined inline since `Frankenvalue` is still incomplete there.
+struct Frankenvalue::Property {
+  kj::String name;
+  Frankenvalue value;
+
+  // `value.capTable` is always empty. Instead, these two values specify the slice of the parent's
+  // capTable which this Frankenvalue refers into.
+  size_t capTableOffset = 0;
+  size_t capTableSize = 0;
+};
+
+// Abstract interface for serializing a `Frankenvalue` -- including the contents of its cap table --
+// to capnp.
+//
+// `Frankenvalue::toCapnp()` deliberately serializes only the *value* and the cap table *size*, not
+// the cap table *contents*, because the meaning of a capability is environment-specific (in the
+// edge runtime, caps are dehydrated channel tokens; in a process sandbox, they are live channel
+// caps; etc.). A `FrankenvalueHandler` knows how to encode the cap table for a particular
+// transport and fills it in. It is passed alongside `HttpOverCapnpFactory` / `ByteStreamFactory`
+// wherever a Frankenvalue may need to cross an RPC boundary.
+//
+// This is intentionally *not* optional at call sites: silently dropping a Frankenvalue's caps (as
+// a bare `Frankenvalue::toCapnp()` would) is always a bug.
+class FrankenvalueHandler {
+ public:
+  // Serialize `value` (including the contents of its cap table) into `builder`.
+  virtual void toCapnp(Frankenvalue& value, rpc::Frankenvalue::Builder builder) = 0;
+};
+
+// Returns a shared `FrankenvalueHandler` for contexts that don't support it. Throws an exception
+// if used.
+FrankenvalueHandler& getUnsupportedFrankenvalueHandler();
+
+}  // namespace workerd

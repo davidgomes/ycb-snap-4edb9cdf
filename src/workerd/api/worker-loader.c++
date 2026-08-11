@@ -1,0 +1,397 @@
+#include "worker-loader.h"
+
+#include <workerd/api/actor.h>
+#include <workerd/api/http.h>
+#include <workerd/io/compatibility-date.h>
+#include <workerd/io/features.h>
+#include <workerd/io/io-context.h>
+
+#include <capnp/message.h>
+
+namespace workerd::api {
+
+namespace {
+
+// Maximum total (uncompressed) size of all module bodies in a dynamically-loaded Worker. This
+// mirrors the documented paid Worker uncompressed size limit (64 MB)
+constexpr size_t MAX_DYNAMIC_WORKER_CODE_SIZE = 64 * 1024 * 1024;
+
+// Maximum serialized size of the `env` object passed to a dynamically-loaded Worker. This is
+// roughly the paid Worker analog of 128 environment variables at 5 KB each
+constexpr size_t MAX_DYNAMIC_WORKER_ENV_SIZE = 1 * 1024 * 1024;
+
+}  // namespace
+
+jsg::Ref<Fetcher> WorkerStub::getEntrypoint(jsg::Lock& js,
+    jsg::Optional<kj::Maybe<kj::String>> name,
+    jsg::Optional<EntrypointOptions> options) {
+  Frankenvalue props;
+  kj::Maybe<ResourceLimits> limits;
+  KJ_IF_SOME(o, options) {
+    KJ_IF_SOME(p, o.props) {
+      props = Frankenvalue::fromJs(js, p.getHandle(js));
+    }
+    limits = o.limits;
+  }
+
+  kj::Maybe<kj::String> entrypointName;
+  KJ_IF_SOME(n, name) {
+    KJ_IF_SOME(n2, n) {
+      if (n2 != "default"_kj) {
+        entrypointName = kj::mv(n2);
+      }
+    }
+  }
+
+  auto subreqChannel = channel->getEntrypoint(kj::mv(entrypointName), kj::mv(props), limits);
+  return js.alloc<Fetcher>(IoContext::current().addObject(kj::mv(subreqChannel)));
+}
+
+jsg::Ref<DurableObjectClass> WorkerStub::getDurableObjectClass(jsg::Lock& js,
+    jsg::Optional<kj::Maybe<kj::String>> name,
+    jsg::Optional<EntrypointOptions> options) {
+  Frankenvalue props;
+  kj::Maybe<ResourceLimits> limits;
+  KJ_IF_SOME(o, options) {
+    KJ_IF_SOME(p, o.props) {
+      props = Frankenvalue::fromJs(js, p.getHandle(js));
+    }
+    limits = o.limits;
+  }
+
+  kj::Maybe<kj::String> entrypointName;
+  KJ_IF_SOME(n, name) {
+    KJ_IF_SOME(n2, n) {
+      if (n2 != "default"_kj) {
+        entrypointName = kj::mv(n2);
+      }
+    }
+  }
+
+  return js.alloc<DurableObjectClass>(IoContext::current().addObject(
+      channel->getActorClass(kj::mv(entrypointName), kj::mv(props), limits)));
+}
+
+jsg::Ref<WorkerStub> WorkerLoader::get(
+    jsg::Lock& js, kj::Maybe<kj::String> name, jsg::Function<jsg::Promise<WorkerCode>()> getCode) {
+  auto& ioctx = IoContext::current();
+
+  // It's important that we use a *weak* reentry callback because this callback will held by the
+  // WorkerStub and any entrypoint stubs in vends until they are GC'd. We don't want to create
+  // a cycle where a request context holds itself open (which would block DO hibernation).
+  auto reenterAndGetCode = ioctx.makeReentryCallbackWeak(
+      [getCode = kj::mv(getCode), compatDateValidation = compatDateValidation](
+          jsg::Lock& js, IoContext& ioctx) mutable {
+    // Note: We reference the original context (the one that initiated the load) via a weak ref
+    // rather than `IoContext::current()`. `getCode` is application-provided and may resolve its
+    // promise from a *different* context, in which case `IoContext::current()` inside this
+    // continuation would not be the context we want. Unlike the outer callback's captures, this
+    // weak ref is created (and destroyed) on the context's own thread as part of the promise
+    // chain, so it does not participate in the cross-thread destruction race.
+    return getCode(js).then(js,
+        [weakIoctx = ioctx.getWeakRef(), compatDateValidation](
+            jsg::Lock& js, WorkerCode code) -> DynamicWorkerSource {
+      auto ioctx = JSG_REQUIRE_NONNULL(weakIoctx, Error,
+          "The request which initiated this dynamic worker load has already completed.");
+      return toDynamicWorkerSource(js, *ioctx, compatDateValidation, kj::mv(code));
+    });
+  });
+
+  auto isolateChannel =
+      ioctx.getIoChannelFactory().loadIsolate(channel, kj::mv(name), kj::mv(reenterAndGetCode));
+
+  return js.alloc<WorkerStub>(ioctx.addObject(kj::mv(isolateChannel)));
+}
+
+jsg::Ref<WorkerStub> WorkerLoader::load(jsg::Lock& js, WorkerCode code) {
+  auto& ioctx = IoContext::current();
+
+  auto source = toDynamicWorkerSource(js, ioctx, compatDateValidation, kj::mv(code));
+
+  // Annoyingly, the callback we pass to `loadIsolate()` technically may be called any number of
+  // times. Yes, even though we aren't providing an ID. The runtime can actually evict the isolate
+  // while a stub still exists, as long as there is no active request on the stub, and then
+  // recreate the isolate on the next request. Moreover, it may ultimately destroy the `ownContent`
+  // in another thread, so we need to use atomic refcounting on it. Ugh!
+  struct OwnContentWrapper: public kj::AtomicRefcounted {
+    kj::Own<void> content;
+    OwnContentWrapper(kj::Own<void> content): content(kj::mv(content)) {}
+  };
+  auto ownContentWrapper = kj::atomicRefcounted<OwnContentWrapper>(kj::mv(source.ownContent));
+
+  auto isolateChannel = ioctx.getIoChannelFactory().loadIsolate(channel, kj::none,
+      [source = kj::mv(source), ownContentWrapper = kj::mv(ownContentWrapper)]() mutable {
+    return source.clone(kj::atomicAddRef(*ownContentWrapper));
+  });
+
+  return js.alloc<WorkerStub>(ioctx.addObject(kj::mv(isolateChannel)));
+}
+
+DynamicWorkerSource WorkerLoader::toDynamicWorkerSource(jsg::Lock& js,
+    IoContext& ioctx,
+    CompatibilityDateValidation compatDateValidation,
+    WorkerCode code) {
+  auto extractedSource = extractSource(js, code);
+  auto ownCompatFlags = extractCompatFlags(js, code, compatDateValidation);
+  CompatibilityFlags::Reader compatFlags = *ownCompatFlags;
+
+  // Set up compat flags for Python Workers so that the caller doesn't have to specify them manually.
+  if (code.mainModule.endsWith(".py"_kj)) {
+    capnp::MallocMessageBuilder flagsMessage;
+    flagsMessage.setRoot(compatFlags);
+    auto flagsBuilder = flagsMessage.getRoot<CompatibilityFlags>();
+    flagsBuilder.setPythonWorkers(true);
+    bool userExplicitlyEnabledExternalSdk = false;
+
+    KJ_IF_SOME(f, code.compatibilityFlags) {
+      for (auto& flag: f) {
+        if (flag == "enable_python_external_sdk") {
+          userExplicitlyEnabledExternalSdk = true;
+          break;
+        }
+      }
+    }
+    if (!userExplicitlyEnabledExternalSdk) {
+      // TODO: We currently need to disable this because we have no way to include the SDK
+      // in dynamic workers. Once RM-28738 is implemented we may be able to get rid of this.
+      flagsBuilder.setPythonExternalSDK(false);
+    }
+    ownCompatFlags = capnp::clone(flagsBuilder.asReader());
+    compatFlags = *ownCompatFlags;
+  }
+
+  Frankenvalue env;
+  KJ_IF_SOME(codeEnv, code.env) {
+    env = Frankenvalue::fromJs(js, codeEnv.getHandle(js));
+    auto estimate = env.estimateSize();
+    JSG_REQUIRE(estimate <= MAX_DYNAMIC_WORKER_ENV_SIZE, Error, "Dynamic Worker env size (",
+        estimate, " bytes) exceeds the maximum allowed size of ", MAX_DYNAMIC_WORKER_ENV_SIZE,
+        " bytes.");
+  }
+
+  kj::Maybe<kj::Own<IoChannelFactory::SubrequestChannel>> globalOutbound;
+  KJ_IF_SOME(maybeOut, code.globalOutbound) {
+    KJ_IF_SOME(out, maybeOut) {
+      auto channel = out->getSubrequestChannel(ioctx);
+      channel->requireAllowsTransfer();
+      globalOutbound = kj::mv(channel);
+    } else {
+      // Application passed `null` to disable internet access. Leave `globalOutbound` as
+      // `kj::none`.
+    }
+  } else {
+    // Inherit the calling worker's global outbound channel.
+    //
+    // Note we don't need to enforce transferrability in this case because if it was the global
+    // outbound of the parent, it must be OK to be the global outbound of the child.
+    globalOutbound =
+        ioctx.getIoChannelFactory().getSubrequestChannel(IoContext::NULL_CLIENT_CHANNEL);
+  }
+
+  kj::Array<kj::Own<IoChannelFactory::SubrequestChannel>> tailChannels;
+  KJ_IF_SOME(tails, code.tails) {
+    tailChannels = KJ_MAP(tail, tails) {
+      auto channel = tail->getSubrequestChannel(ioctx);
+      channel->requireAllowsTransfer();
+      return kj::mv(channel);
+    };
+  }
+
+  kj::Array<kj::Own<IoChannelFactory::SubrequestChannel>> streamingTailChannels;
+  KJ_IF_SOME(streamingTails, code.streamingTails) {
+    JSG_REQUIRE(code.allowExperimental.orDefault(false), Error,
+        "Streaming tail workers are experimental. You must pass the option "
+        "'allowExperimental: true' to the worker loader to use them");
+
+    streamingTailChannels = KJ_MAP(tail, streamingTails) {
+      auto channel = tail->getSubrequestChannel(ioctx);
+      channel->requireAllowsTransfer();
+      return kj::mv(channel);
+    };
+  }
+
+  return {.source = kj::mv(extractedSource),
+    .compatibilityFlags = compatFlags,
+    .limits = code.limits,
+    .env = kj::mv(env),
+    .globalOutbound = kj::mv(globalOutbound),
+    .tails = kj::mv(tailChannels),
+    .streamingTails = kj::mv(streamingTailChannels),
+    .ownContent = ownCompatFlags.attach(kj::mv(code.modules), kj::mv(code.mainModule)),
+    .ownContentIsRpcResponse = false};
+}
+
+Worker::Script::Source WorkerLoader::extractSource(jsg::Lock& js, WorkerCode& code) {
+  JSG_REQUIRE(code.modules.fields.size() > 0, TypeError,
+      "Dynamic Worker code must contain at least one module.");
+
+  auto modules = KJ_MAP(entry, code.modules.fields) -> Worker::Script::Module {
+    KJ_SWITCH_ONEOF(entry.value) {
+      KJ_CASE_ONEOF(text, kj::String) {
+        if (entry.name.endsWith(".py"_kj)) {
+          return {
+            .name = entry.name,
+            .content = Worker::Script::PythonModule{.body = text},
+          };
+        }
+
+        if (entry.name.endsWith(".js"_kj)) {
+          return {
+            .name = entry.name,
+            .content = Worker::Script::EsModule{.body = text},
+          };
+        }
+
+        // Python packages bundled in Workers can have non-code files (METADATA, RECORD, etc),
+        // so we don't limit file extensions for Python workers.
+        if (code.mainModule.endsWith(".py"_kj) && entry.name.startsWith("python_modules/"_kj)) {
+          return {
+            .name = entry.name,
+            .content = Worker::Script::TextModule{.body = text},
+          };
+        }
+
+        if (entry.name.endsWith(".ts"_kj) || entry.name.endsWith(".tsx"_kj) ||
+            entry.name.endsWith(".jsx"_kj)) {
+          JSG_FAIL_REQUIRE(TypeError,
+              "Module name must end with '.js' or '.py' (or the content must be an object ",
+              "indicating the type explicitly). Got: ", entry.name,
+              ". If you're trying to load TypeScript, bundle it first with ",
+              "'@cloudflare/worker-bundler' and pass the generated JavaScript modules.");
+        }
+
+        JSG_FAIL_REQUIRE(TypeError,
+            "Module name must end with '.js' or '.py' (or the content must be an object ",
+            "indicating the type explicitly). Got: ", entry.name);
+      }
+      KJ_CASE_ONEOF(module, Module) {
+        uint fieldCount = (module.js != kj::none) + (module.cjs != kj::none) +
+            (module.text != kj::none) + (module.data != kj::none) + (module.json != kj::none) +
+            (module.py != kj::none) + (module.wasm != kj::none);
+        JSG_REQUIRE(fieldCount == 1, TypeError,
+            "Each module must contain exactly one of 'js', 'cjs', 'text', 'data', 'json', 'py', or 'wasm'. "
+            "Module '",
+            entry.name, "' contained ", fieldCount, " properties.");
+
+        return {.name = entry.name, .content = [&]() -> Worker::Script::ModuleContent {
+          KJ_IF_SOME(js, module.js) {
+            // TODO: this might need typescript transpilation too.
+            return Worker::Script::EsModule{.body = js};
+          } else KJ_IF_SOME(cjs, module.cjs) {
+            return Worker::Script::CommonJsModule{.body = cjs};
+          } else KJ_IF_SOME(text, module.text) {
+            return Worker::Script::TextModule{.body = text};
+          } else KJ_IF_SOME(data, module.data) {
+            // The kj::Array<const byte> produced by jsg::asBytes() points into a V8
+            // BackingStore. If the user passed a *resizable* ArrayBuffer they can call
+            // resize(0) (or transfer/detach) after load() returns but before the child
+            // isolate is compiled asynchronously, leaving us with a (ptr,len) into
+            // PROT_NONE pages. Copy now so the bytes survive until compileDataGlobal().
+            data = kj::heapArray<const kj::byte>(data.asPtr());
+            return Worker::Script::DataModule{.body = data};
+          } else KJ_IF_SOME(json, module.json) {
+            kj::StringPtr serialized =
+                module.serializedJson.emplace(js.serializeJson(kj::mv(json)));
+            // We moved out of `json`, making it an empty V8Ref, explicitly
+            // clear out the field as we don't intend to re-use this
+            module.json = kj::none;
+            return Worker::Script::JsonModule{.body = serialized};
+          } else KJ_IF_SOME(py, module.py) {
+            return Worker::Script::PythonModule{.body = py};
+          } else KJ_IF_SOME(wasm, module.wasm) {
+            // Same as `data` above: copy out of the V8 BackingStore before going async.
+            wasm = kj::heapArray<const kj::byte>(wasm.asPtr());
+            return Worker::Script::WasmModule{.body = wasm};
+          } else {
+            KJ_UNREACHABLE;
+          }
+        }()};
+      }
+    }
+    KJ_UNREACHABLE;
+  };
+
+  bool isPython = code.mainModule.endsWith(".py"_kj);
+  // Disallow Python modules when the main module is a JS module. Also tally up the
+  // total size of all module bodies so we can enforce the worker code size limit.
+  // This behavior is deliberately not replicated for Python main modules since Python packages
+  // can contain arbitrary .js files.
+  size_t totalCodeSize = 0;
+  for (auto& module: modules) {
+    auto isPythonModule = module.content.is<Worker::Script::PythonModule>();
+    if (!isPython && isPythonModule) {
+      JSG_FAIL_REQUIRE(TypeError, "Module \"", module.name,
+          "\" is a Python module, but the main module isn't a Python module.");
+    }
+
+    KJ_SWITCH_ONEOF(module.content) {
+      KJ_CASE_ONEOF(m, Worker::Script::EsModule) {
+        totalCodeSize += m.body.size();
+      }
+      KJ_CASE_ONEOF(m, Worker::Script::CommonJsModule) {
+        totalCodeSize += m.body.size();
+      }
+      KJ_CASE_ONEOF(m, Worker::Script::TextModule) {
+        totalCodeSize += m.body.size();
+      }
+      KJ_CASE_ONEOF(m, Worker::Script::DataModule) {
+        totalCodeSize += m.body.size();
+      }
+      KJ_CASE_ONEOF(m, Worker::Script::WasmModule) {
+        totalCodeSize += m.body.size();
+      }
+      KJ_CASE_ONEOF(m, Worker::Script::JsonModule) {
+        totalCodeSize += m.body.size();
+      }
+      KJ_CASE_ONEOF(m, Worker::Script::PythonModule) {
+        totalCodeSize += m.body.size();
+      }
+      KJ_CASE_ONEOF(m, Worker::Script::ObsoletePythonRequirement) {}
+      KJ_CASE_ONEOF(m, Worker::Script::CapnpModule) {}
+    }
+  }
+
+  JSG_REQUIRE(totalCodeSize <= MAX_DYNAMIC_WORKER_CODE_SIZE, Error, "Dynamic Worker code size (",
+      totalCodeSize, " bytes) exceeds the maximum allowed size of ", MAX_DYNAMIC_WORKER_CODE_SIZE,
+      " bytes.");
+
+  return Worker::Script::ModulesSource{
+    .mainModule = code.mainModule,
+    .modules = kj::mv(modules),
+    .isPython = isPython,
+  };
+}
+
+kj::Own<CompatibilityFlags::Reader> WorkerLoader::extractCompatFlags(
+    jsg::Lock& js, WorkerCode& code, CompatibilityDateValidation compatDateValidation) {
+  bool allowExperimental = code.allowExperimental.orDefault(false);
+  if (!FeatureFlags::get(js).getWorkerdExperimental()) {
+    JSG_REQUIRE(!allowExperimental, Error,
+        "'allowExperimental' is only allowed when the calling worker has the 'experimental' "
+        "compat flag set.");
+  }
+
+  kj::ArrayPtr<const kj::String> compatFlags;
+  KJ_IF_SOME(f, code.compatibilityFlags) {
+    compatFlags = f;
+  }
+
+  capnp::word scratch[capnp::sizeInWords<CompatibilityFlags>() + 4]{};
+  capnp::MallocMessageBuilder compatFlagsMessage(scratch);
+  auto compatFlagsBuilder = compatFlagsMessage.getRoot<CompatibilityFlags>();
+
+  SimpleWorkerErrorReporter errorReporter;
+
+  // allowedExperimentalFlags is nullptr on purpose, a worker loader being trusted with specific
+  // experimental flags should not imply that it can delegate that trust to its dynamic workers.
+  compileCompatibilityFlags(code.compatibilityDate, compatFlags, compatFlagsBuilder, errorReporter,
+      allowExperimental, compatDateValidation, nullptr);
+
+  if (!errorReporter.errors.empty()) {
+    JSG_FAIL_REQUIRE(Error, errorReporter.errors.front());
+  }
+
+  return capnp::clone(compatFlagsBuilder.asReader());
+}
+
+}  // namespace workerd::api

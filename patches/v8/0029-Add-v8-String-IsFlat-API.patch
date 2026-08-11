@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: James M Snell <jsnell@cloudflare.com>
+Date: Thu, 6 Nov 2025 10:58:38 -0800
+Subject: Add v8::String::IsFlat API
+
+Tells us if a string is already flattened or not.
+
+Signed-off-by: James M Snell <jsnell@cloudflare.com>
+
+diff --git a/include/v8-primitive.h b/include/v8-primitive.h
+index 8466df80175de9362dd785d83fa527a20a3be1a6..c28282462218fb5e7c66face4402e39d00130c4d 100644
+--- a/include/v8-primitive.h
++++ b/include/v8-primitive.h
+@@ -165,6 +165,11 @@ class V8_EXPORT String : public Name {
+    */
+   bool ContainsOnlyOneByte() const;
+ 
++  /**
++   * Returns true if this string is flat
++   */
++  bool IsFlat() const;
++
+   struct WriteFlags {
+     enum {
+       kNone = 0,
+diff --git a/src/api/api.cc b/src/api/api.cc
+index 4b9c6a9be83d9bb809a16bf026c45191b3493b7b..ab4f3a21b9c36b9874c8ac61e9862593b6c9fc89 100644
+--- a/src/api/api.cc
++++ b/src/api/api.cc
+@@ -5885,6 +5885,10 @@ bool String::IsOneByte() const {
+   return Utils::OpenDirectHandle(this)->IsOneByteRepresentation();
+ }
+ 
++bool String::IsFlat() const {
++  return Utils::OpenDirectHandle(this)->IsFlat();
++}
++
+ class ContainsOnlyOneByteHelper {
+  public:
+   ContainsOnlyOneByteHelper() : is_one_byte_(true) {}

@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erik Corry <erikcorry@chromium.org>
+Date: Tue, 22 Apr 2025 14:59:14 +0200
+Subject: Disable slow handle check
+
+Signed-off-by: James M Snell <jsnell@cloudflare.com>
+
+diff --git a/src/handles/handles.h b/src/handles/handles.h
+index 1a2f93c37552c489314f7265f6b7d416047d372f..c1c05fbdd597d8f7cd65c937694a3712ae0736ea 100644
+--- a/src/handles/handles.h
++++ b/src/handles/handles.h
+@@ -636,11 +636,7 @@ IndirectHandle<T> indirect_handle(DirectHandle<T> handle,
+ // does not implicitly convert to an IndirectHandle.
+ template <typename T>
+ class V8_TRIVIAL_ABI DirectHandle :
+-#ifdef ENABLE_SLOW_DCHECKS
+-    public api_internal::StackAllocated<true>
+-#else
+     public api_internal::StackAllocated<false>
+-#endif
+ {
+  public:
+   V8_INLINE static const DirectHandle null() {

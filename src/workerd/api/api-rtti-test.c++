@@ -1,0 +1,81 @@
+// Copyright (c) 2017-2022 Cloudflare, Inc.
+// Licensed under the Apache 2.0 license found in the LICENSE file or at:
+//     https://opensource.org/licenses/Apache-2.0
+
+#include <workerd/api/actor-state.h>
+#include <workerd/api/actor.h>
+#include <workerd/api/cache.h>
+#include <workerd/api/crypto/crypto.h>
+#include <workerd/api/encoding.h>
+#include <workerd/api/events.h>
+#include <workerd/api/eventsource.h>
+#include <workerd/api/global-scope.h>
+#include <workerd/api/html-rewriter.h>
+#include <workerd/api/queue.h>
+#include <workerd/api/scheduled.h>
+#include <workerd/api/sockets.h>
+#include <workerd/api/sql.h>
+#include <workerd/api/streams.h>
+#include <workerd/api/streams/standard.h>
+#include <workerd/api/sync-kv.h>
+#include <workerd/api/trace.h>
+#include <workerd/api/url-standard.h>
+#include <workerd/api/urlpattern-standard.h>
+#include <workerd/api/urlpattern.h>
+#include <workerd/io/compatibility-date.h>
+#include <workerd/jsg/rtti.h>
+
+#include <kj/test.h>
+
+// Test building rtti for various APIs.
+
+namespace workerd::api {
+namespace {
+
+KJ_TEST("WorkerGlobalScope") {
+  jsg::rtti::Builder builder((CompatibilityFlags::Reader()));
+  builder.structure<WorkerGlobalScope>();
+  KJ_EXPECT(builder.structure("workerd::api::Event"_kj) != kj::none);
+  KJ_EXPECT(builder.structure("workerd::api::ObviouslyWrongName"_kj) == kj::none);
+}
+
+KJ_TEST("ServiceWorkerGlobalScope") {
+  jsg::rtti::Builder builder((CompatibilityFlags::Reader()));
+  builder.structure<ServiceWorkerGlobalScope>();
+  KJ_EXPECT(builder.structure("workerd::api::DurableObjectId"_kj) != kj::none);
+}
+
+KJ_TEST("JsReadableStream delegates its RTTI to ReadableStream") {
+  // JsReadableStream declares `using JsgRttiDelegate = jsg::Ref<ReadableStream>`, so RTTI (and
+  // therefore generated TypeScript) must describe it exactly as it describes ReadableStream.
+  jsg::rtti::Builder builder((CompatibilityFlags::Reader()));
+  auto type = builder.type<JsReadableStream>();
+  KJ_ASSERT(type.isStructure());
+  KJ_EXPECT(type.getStructure().getFullyQualifiedName() == "workerd::api::ReadableStream"_kj);
+  KJ_EXPECT(builder.structure("workerd::api::ReadableStream"_kj) != kj::none);
+}
+
+KJ_TEST("JsWritableStream delegates its RTTI to WritableStream") {
+  // JsWritableStream declares `using JsgRttiDelegate = jsg::Ref<WritableStream>`, so RTTI (and
+  // therefore generated TypeScript) must describe it exactly as it describes WritableStream.
+  jsg::rtti::Builder builder((CompatibilityFlags::Reader()));
+  auto type = builder.type<JsWritableStream>();
+  KJ_ASSERT(type.isStructure());
+  KJ_EXPECT(type.getStructure().getFullyQualifiedName() == "workerd::api::WritableStream"_kj);
+  KJ_EXPECT(builder.structure("workerd::api::WritableStream"_kj) != kj::none);
+}
+
+KJ_TEST("JsReadableWritablePair delegates its RTTI to ReadableStream::Transform") {
+  // JsReadableWritablePair declares `using JsgRttiDelegate = ReadableStream::Transform`, so RTTI
+  // (and therefore generated TypeScript) must describe it exactly as it describes the
+  // ReadableWritablePair-shaped Transform struct.
+  jsg::rtti::Builder builder((CompatibilityFlags::Reader()));
+  auto type = builder.type<JsReadableWritablePair>();
+  KJ_ASSERT(type.isStructure());
+  KJ_EXPECT(
+      type.getStructure().getFullyQualifiedName() == "workerd::api::ReadableStream::Transform"_kj,
+      type.getStructure().getFullyQualifiedName());
+}
+
+}  // namespace
+}  // namespace workerd::api
