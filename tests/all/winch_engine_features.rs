@@ -1,0 +1,104 @@
+use wasmtime::*;
+use wasmtime_test_macros::wasmtime_test;
+
+#[wasmtime_test(strategies(only(Winch)))]
+#[cfg_attr(miri, ignore)]
+fn ensure_compatibility_between_winch_and_table_lazy_init(config: &mut Config) -> Result<()> {
+    config.table_lazy_init(false);
+    let result = Engine::new(&config);
+    match result {
+        Ok(_) => {
+            wasmtime::bail!(
+                "Expected incompatibility between the `table_lazy_init` option and Winch"
+            )
+        }
+        Err(e) => {
+            assert_eq!(
+                e.to_string(),
+                "Winch requires the table-lazy-init option to be enabled"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[wasmtime_test(strategies(only(Winch)))]
+#[cfg_attr(miri, ignore)]
+fn ensure_compatibility_between_winch_and_signals_based_traps(config: &mut Config) -> Result<()> {
+    config.signals_based_traps(false);
+    let result = Engine::new(&config);
+    match result {
+        Ok(_) => {
+            wasmtime::bail!(
+                "Expected incompatibility between the `signals_based_traps` option and Winch"
+            )
+        }
+        Err(e) => {
+            assert_eq!(
+                e.to_string(),
+                "Winch requires the signals-based-traps option to be enabled"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[wasmtime_test(strategies(only(Winch)))]
+#[cfg_attr(miri, ignore)]
+fn ensure_compatibility_between_winch_and_debug_native(config: &mut Config) -> Result<()> {
+    config.debug_info(true);
+    let result = Engine::new(&config);
+    match result {
+        Ok(_) => {
+            wasmtime::bail!("Expected incompatibility between the `debug_native` option and Winch")
+        }
+        Err(e) => {
+            assert_eq!(
+                e.to_string(),
+                "Winch does not currently support generating native debug information"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[wasmtime_test(strategies(only(Winch)))]
+#[cfg_attr(miri, ignore)]
+fn ensure_compatibility_between_winch_and_drc_collector(config: &mut Config) -> Result<()> {
+    config.collector(Collector::DeferredReferenceCounting);
+    config.gc_support(true);
+    let result = Engine::new(&config);
+    match result {
+        Ok(_) => {
+            wasmtime::bail!(
+                "Expected incompatibility between the deferred reference-counting \
+                 collector and Winch"
+            )
+        }
+        Err(e) => {
+            assert_eq!(
+                e.to_string(),
+                "the wasm_gc_types feature is not supported on this compiler configuration"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[wasmtime_test(strategies(only(Winch)))]
+#[cfg_attr(miri, ignore)]
+fn winch_with_drc_collector_disables_gc_types_by_default(config: &mut Config) -> Result<()> {
+    config.collector(Collector::DeferredReferenceCounting);
+    let engine = Engine::new(&config)?;
+    let result = Module::new(
+        &engine,
+        r#"(module (global (mut externref) (ref.null extern)))"#,
+    );
+    assert!(result.is_err());
+
+    Ok(())
+}
