@@ -10080,8 +10080,12 @@ func (ms *MutableStateImpl) hasInflightWorkToPreventTimeSkipping() (bool, string
 	if ms.HasPendingWorkflowTask() {
 		return true, "has pending workflow task"
 	}
-	if len(ms.GetPendingActivityInfos()) > 0 {
-		return true, "has pending activity"
+	now := ms.Now()
+	for _, ai := range ms.GetPendingActivityInfos() {
+		// Failed activities waiting on a future retry are timer-like, not in-flight.
+		if !activityWaitingOnFutureRetryBackoff(ai, now) {
+			return true, "has pending activity"
+		}
 	}
 	if nexusoperations.MachineCollection(ms.HSM()).Size() > 0 {
 		return true, "has pending nexus operations"
@@ -10167,9 +10171,10 @@ func (d timeSkippingTransition) isValid() bool {
 // 2. disabledAfterBound: a flag indicating whether the time skipping should be flipped off
 // right now the time points considered for target time are:
 // 1. the first expiry time of the pending user timers
-// 2. the start delay of the workflow execution
-// 3. the current elapsed duration bound of the time skipping config
-// 4. the remaining time to skip to the max skipped duration bound
+// 2. the earliest next-attempt time among activities waiting on retry backoff
+// 3. the start delay of the workflow execution
+// 4. the current elapsed duration bound of the time skipping config
+// 5. the remaining time to skip to the max skipped duration bound
 func (ms *MutableStateImpl) calculateTimeSkippingTransition() (timeSkippingTransition, error) {
 	var transition timeSkippingTransition
 	advance := func(candidate time.Time, dueToBound bool) {
@@ -10181,6 +10186,13 @@ func (ms *MutableStateImpl) calculateTimeSkippingTransition() (timeSkippingTrans
 
 	for _, timerInfo := range ms.GetPendingTimerInfos() {
 		advance(timerInfo.ExpiryTime.AsTime(), false)
+	}
+
+	now := ms.Now()
+	for _, ai := range ms.GetPendingActivityInfos() {
+		if activityWaitingOnFutureRetryBackoff(ai, now) {
+			advance(ai.GetScheduledTime().AsTime(), false)
+		}
 	}
 
 	if !ms.HadOrHasWorkflowTask() {

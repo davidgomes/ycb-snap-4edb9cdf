@@ -123,6 +123,71 @@ func (s *activitySuite) TestGetActivityState() {
 	}
 }
 
+func (s *activitySuite) TestActivityRetryBackoffHelpers() {
+	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	future := timestamppb.New(now.Add(time.Hour))
+	past := timestamppb.New(now.Add(-time.Minute))
+
+	newBackoffAI := func() *persistencespb.ActivityInfo {
+		return &persistencespb.ActivityInfo{
+			StartedEventId: common.EmptyEventID,
+			Attempt:        2,
+			HasRetryPolicy: true,
+			ScheduledTime:  future,
+		}
+	}
+
+	s.True(activityInRetryBackoff(newBackoffAI()))
+	s.True(activityWaitingOnFutureRetryBackoff(newBackoffAI(), now))
+
+	s.Run("NilActivity", func() {
+		s.False(activityInRetryBackoff(nil))
+		s.False(activityWaitingOnFutureRetryBackoff(nil, now))
+	})
+	s.Run("Started", func() {
+		ai := newBackoffAI()
+		ai.StartedEventId = 10
+		s.False(activityInRetryBackoff(ai))
+		s.False(activityWaitingOnFutureRetryBackoff(ai, now))
+	})
+	s.Run("Paused", func() {
+		ai := newBackoffAI()
+		ai.Paused = true
+		s.False(activityInRetryBackoff(ai))
+		s.False(activityWaitingOnFutureRetryBackoff(ai, now))
+	})
+	s.Run("FirstAttempt", func() {
+		ai := newBackoffAI()
+		ai.Attempt = 1
+		s.False(activityInRetryBackoff(ai))
+		s.False(activityWaitingOnFutureRetryBackoff(ai, now))
+	})
+	s.Run("NoRetryPolicy", func() {
+		ai := newBackoffAI()
+		ai.HasRetryPolicy = false
+		s.False(activityInRetryBackoff(ai))
+		s.False(activityWaitingOnFutureRetryBackoff(ai, now))
+	})
+	s.Run("CancelRequested", func() {
+		ai := newBackoffAI()
+		ai.CancelRequested = true
+		s.False(activityInRetryBackoff(ai))
+		s.False(activityWaitingOnFutureRetryBackoff(ai, now))
+	})
+	s.Run("NextAttemptDue", func() {
+		ai := newBackoffAI()
+		ai.ScheduledTime = past
+		s.True(activityInRetryBackoff(ai), "due retry is still in backoff for timer regen")
+		s.False(activityWaitingOnFutureRetryBackoff(ai, now), "due retry must block time skipping")
+	})
+	s.Run("ZeroScheduledTime", func() {
+		ai := newBackoffAI()
+		ai.ScheduledTime = nil
+		s.True(activityInRetryBackoff(ai))
+		s.False(activityWaitingOnFutureRetryBackoff(ai, now))
+	})
+}
+
 func (s *activitySuite) TestGetPendingActivityInfoAcceptance() {
 	now := s.mockShard.GetTimeSource().Now().UTC().Round(time.Hour)
 	activityType := commonpb.ActivityType{

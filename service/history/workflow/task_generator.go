@@ -1047,8 +1047,10 @@ func (r *TaskGeneratorImpl) RegenerateTimerTasksForTimeSkipping() error {
 	}
 
 	// Task regeneration: mutableState.AddTask will adapt virtual time to wall time.
-	// WorkflowTask, Activity, HSM(only nexusoperations) timer tasks won't be regenerated
-	// because time skipping pauses when there are in-flight work.
+	// WorkflowTask, started/paused activity, and HSM (nexusoperations) timer tasks
+	// aren't regenerated because time skipping pauses while those are in-flight.
+	// Activity retry backoff timers are regenerated (step 5) so a skip to the next
+	// attempt becomes dispatchable promptly on wall clock.
 
 	// (1) user timers — regenerate one task per pending user timer. User timers
 	// are only one of the task types that may need regeneration, so continue to
@@ -1132,6 +1134,19 @@ func (r *TaskGeneratorImpl) RegenerateTimerTasksForTimeSkipping() error {
 				Version:             startVersion,
 				WorkflowBackoffType: backOffType,
 			})
+		}
+	}
+
+	// (5) activity retry timers — regenerate for activities waiting on retry backoff
+	// so their wall-clock VisibilityTimestamp tracks the new accumulated skip.
+	// Do not require ScheduledTime to still be in the future: after a skip lands on
+	// the next-attempt time, virtual now may already equal ScheduledTime.
+	for _, ai := range r.mutableState.GetPendingActivityInfos() {
+		if !activityInRetryBackoff(ai) || ai.GetScheduledTime().AsTime().IsZero() {
+			continue
+		}
+		if err := r.GenerateActivityRetryTasks(ai); err != nil {
+			return err
 		}
 	}
 	// todo@time-skipping: ChasmTaskPure is not supported yet.

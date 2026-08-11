@@ -60,6 +60,28 @@ func GetActivityState(ai *persistencespb.ActivityInfo) enumspb.PendingActivitySt
 	return enumspb.PENDING_ACTIVITY_STATE_SCHEDULED
 }
 
+// activityInRetryBackoff reports whether the activity has already failed at least
+// once and is only waiting to retry (not started, not paused). This is timer-like
+// wait rather than in-flight worker work, so time skipping may treat it like a
+// user timer / workflow execution retry backoff.
+func activityInRetryBackoff(ai *persistencespb.ActivityInfo) bool {
+	if ai == nil || ai.Paused || !ai.HasRetryPolicy || ai.Attempt <= 1 {
+		return false
+	}
+	return GetActivityState(ai) == enumspb.PENDING_ACTIVITY_STATE_SCHEDULED
+}
+
+// activityWaitingOnFutureRetryBackoff reports whether the activity is in retry
+// backoff and the next attempt is still in the future. Used by the idle check
+// (such activities do not block time skipping) and as skip-target candidates.
+func activityWaitingOnFutureRetryBackoff(ai *persistencespb.ActivityInfo, now time.Time) bool {
+	if !activityInRetryBackoff(ai) {
+		return false
+	}
+	nextAttempt := ai.GetScheduledTime().AsTime()
+	return !nextAttempt.IsZero() && nextAttempt.After(now)
+}
+
 // ClearActivityStartedState resets the per-attempt "started" fields on an ActivityInfo.
 // Called when an activity leaves the started state (retry, pause, etc.) so that stale
 // values from the previous attempt don't leak into the next one.

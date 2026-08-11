@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -496,6 +497,105 @@ func (s *TimeSkippingTestSuite) TestTimeSkipping_TimerAndActivity() {
 	s.True(hasEventType(history, enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_TIME_SKIPPING_TRANSITIONED),
 		"time-skipping transitioned event expected")
 	s.True(hasEventType(history, enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED), "workflow must complete")
+}
+
+// TestTimeSkipping_ActivityRetryBackoff verifies that a failed activity waiting on
+// retry backoff does not block time skipping. After the first attempt fails,
+// closeTransaction skips to the next-attempt time and regenerates the retry timer
+// so the retry is dispatchable promptly on wall clock.
+//
+// Sequence:
+//
+//	WT1 → schedule activity with 1h InitialInterval retry
+//	AT1 → fail (retryable)
+//	Skip to next attempt; regenerate ActivityRetryTimerTask ≈ now
+//	AT2 → complete activity
+//	WT2 → complete workflow
+func (s *TimeSkippingTestSuite) TestTimeSkipping_ActivityRetryBackoff() {
+	env := testcore.NewEnv(s.T())
+	env.OverrideDynamicConfig(dynamicconfig.TimeSkippingEnabled, true)
+	tv := testvars.New(s.T())
+
+	const (
+		retryInterval = time.Hour
+		runTimeout    = 24 * time.Hour
+		wallLimit     = 5 * time.Minute
+		shiftTol      = 30 * time.Second
+	)
+	wallStart := time.Now()
+
+	runID := s.startWorkflowWithTimeSkipping(env, tv, runTimeout)
+	poller := taskpoller.New(s.T(), env.FrontendClient(), env.Namespace().String())
+
+	_, err := poller.PollAndHandleWorkflowTask(tv, func(_ *workflowservice.PollWorkflowTaskQueueResponse) (*workflowservice.RespondWorkflowTaskCompletedRequest, error) {
+		return &workflowservice.RespondWorkflowTaskCompletedRequest{
+			Commands: []*commandpb.Command{{
+				CommandType: enumspb.COMMAND_TYPE_SCHEDULE_ACTIVITY_TASK,
+				Attributes: &commandpb.Command_ScheduleActivityTaskCommandAttributes{
+					ScheduleActivityTaskCommandAttributes: &commandpb.ScheduleActivityTaskCommandAttributes{
+						ActivityId:             tv.ActivityID(),
+						ActivityType:           tv.ActivityType(),
+						TaskQueue:              tv.TaskQueue(),
+						StartToCloseTimeout:    durationpb.New(10 * time.Second),
+						ScheduleToCloseTimeout: durationpb.New(runTimeout),
+						RetryPolicy: &commonpb.RetryPolicy{
+							InitialInterval:    durationpb.New(retryInterval),
+							BackoffCoefficient: 1,
+							MaximumInterval:    durationpb.New(retryInterval),
+							MaximumAttempts:    3,
+						},
+					},
+				},
+			}},
+		}, nil
+	})
+	s.NoError(err)
+
+	_, err = poller.PollAndHandleActivityTask(tv, func(_ *workflowservice.PollActivityTaskQueueResponse) (*workflowservice.RespondActivityTaskCompletedRequest, error) {
+		return nil, errors.New("retry me")
+	})
+	s.NoError(err)
+	wallAfterFail := time.Now()
+
+	_, err = poller.PollAndHandleActivityTask(tv, taskpoller.CompleteActivityTask(tv))
+	s.NoError(err)
+
+	_, err = poller.PollAndHandleWorkflowTask(tv, func(_ *workflowservice.PollWorkflowTaskQueueResponse) (*workflowservice.RespondWorkflowTaskCompletedRequest, error) {
+		return &workflowservice.RespondWorkflowTaskCompletedRequest{
+			Commands: []*commandpb.Command{completeWorkflowCmd()},
+		}, nil
+	})
+	s.NoError(err)
+
+	elapsed := time.Since(wallStart)
+	s.Less(elapsed, wallLimit,
+		"activity retry backoff should have been time-skipped; wall elapsed = %v", elapsed)
+
+	history := env.GetHistory(env.Namespace().String(), &commonpb.WorkflowExecution{WorkflowId: tv.WorkflowID(), RunId: runID})
+	s.True(hasEventType(history, enumspb.EVENT_TYPE_ACTIVITY_TASK_FAILED), "first attempt must fail")
+	s.True(hasEventType(history, enumspb.EVENT_TYPE_ACTIVITY_TASK_COMPLETED), "retry must complete")
+	s.True(hasEventType(history, enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_TIME_SKIPPING_TRANSITIONED),
+		"time-skipping transitioned event expected")
+	s.True(hasEventType(history, enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED), "workflow must complete")
+
+	recorder := env.GetTestCluster().GetTaskQueueRecorder()
+	s.NotNil(recorder)
+	recorded := recorder.GetRecordedTasksByCategoryFiltered(historytasks.CategoryTimer, testcore.TaskFilter{
+		NamespaceID: env.NamespaceID().String(),
+		WorkflowID:  tv.WorkflowID(),
+		RunID:       runID,
+	})
+	var retryTimers []*historytasks.ActivityRetryTimerTask
+	for _, rec := range recorded {
+		if t, ok := rec.Task.(*historytasks.ActivityRetryTimerTask); ok {
+			retryTimers = append(retryTimers, t)
+		}
+	}
+	s.GreaterOrEqual(len(retryTimers), 2, "expected initial + regenerated ActivityRetryTimerTask")
+	latest := retryTimers[len(retryTimers)-1]
+	s.WithinDuration(wallAfterFail, latest.VisibilityTimestamp, shiftTol,
+		"regenerated retry timer VisibilityTime must be ≈ wallAfterFail, got %v vs %v",
+		latest.VisibilityTimestamp, wallAfterFail)
 }
 
 func (s *TimeSkippingTestSuite) TestTimeSkipping_PendingSignalExternalBlocksSkip() {
