@@ -1,0 +1,170 @@
+---
+version: "2"
+run:
+  build-tags:
+    - apparmor
+    - containers_image_ostree_stub
+    # containers/image would use mtrmac/gpgme otherwise, which requires gpgme C headers
+    - containers_image_openpgp
+    - selinux
+    - test
+    # needs btrfs headers installed
+    - exclude_graphdriver_btrfs
+  concurrency: 6
+linters:
+  default: none
+  enable:
+    - arangolint
+    - asasalint
+    - asciicheck
+    - bidichk
+    - bodyclose
+    - canonicalheader
+    - copyloopvar
+    - decorder
+    - dogsled
+    - dupl
+    - dupword
+    - durationcheck
+    - embeddedstructfieldcheck
+    - errcheck
+    - errchkjson
+    - errorlint
+    - exptostd
+    - fatcontext
+    - forcetypeassert
+    - ginkgolinter
+    - gocheckcompilerdirectives
+    - gochecknoinits
+    - gochecksumtype
+    - goconst
+    - gocritic
+    - gocyclo
+    - godot
+    - goheader
+    - gomodguard
+    - goprintffuncname
+    - gosmopolitan
+    - govet
+    - grouper
+    - iface
+    - importas
+    - ineffassign
+    - intrange
+    - iotamixing
+    - loggercheck
+    - makezero
+    - mirror
+    - misspell
+    - modernize
+    - musttag
+    - nakedret
+    - nilnesserr
+    - nlreturn
+    - nolintlint
+    - nosprintfhostport
+    - perfsprint
+    - prealloc
+    - promlinter
+    - protogetter
+    - reassign
+    - recvcheck
+    - revive
+    - rowserrcheck
+    - spancheck
+    - staticcheck
+    - tagalign
+    - testableexamples
+    - testifylint
+    - tparallel
+    - unconvert
+    - unparam
+    - unqueryvet
+    - unused
+    - usestdlibvars
+    - usetesting
+    - wastedassign
+    - wsl_v5
+    # - containedctx
+    # - contextcheck
+    # - cyclop
+    # - depguard
+    # - err113
+    # - errname
+    # - exhaustive
+    # - exhaustruct
+    # - forbidigo
+    # - funcorder
+    # - funlen
+    # - gochecknoglobals
+    # - gocognit
+    # - godoclint
+    # - godox
+    # - gomoddirectives
+    # - gosec
+    # - inamedparam
+    # - interfacebloat
+    # - ireturn
+    # - lll
+    # - maintidx
+    # - mnd
+    # - nestif
+    # - nilerr
+    # - nilnil
+    # - noctx
+    # - noinlineerr
+    # - nonamedreturns
+    # - paralleltest
+    # - predeclared
+    # - sloglint
+    # - sqlclosecheck
+    # - tagliatelle
+    # - testpackage
+    # - thelper
+    # - varnamelen
+    # - whitespace
+    # - wrapcheck
+    # - zerologlint
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+    goconst:
+      min-occurrences: 6
+    gocritic:
+      enable-all: true
+      disabled-checks:
+        - filepathJoin
+        - whyNoLint
+    gocyclo:
+      min-complexity: 60
+    nakedret:
+      max-func-lines: 15
+    revive:
+      rules:
+        - name: argument-limit
+          arguments:
+            - 22
+          disabled: false
+    wsl_v5:
+      allow-first-in-block: true
+      allow-whole-block: false
+      branch-max-lines: 2
+  exclusions:
+    generated: strict
+    presets:
+      - comments
+      - std-error-handling
+formatters:
+  enable:
+    - gci
+    - gofumpt
+    - goimports
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - localmodule
+  exclusions:
+    generated: strict
