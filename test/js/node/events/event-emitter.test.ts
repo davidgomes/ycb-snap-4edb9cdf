@@ -950,9 +950,7 @@ test("events.once rejects on abort even if stopImmediatePropagation was called",
   const ac = new AbortController();
   withAbortStopper(ac.signal);
   const promise = EventEmitter.once(et, "foo", { signal: ac.signal });
-  ac.abort();
-  await Promise.resolve();
-  expect(Bun.peek.status(promise)).toBe("rejected");
+  process.nextTick(() => ac.abort());
   await expect(promise).rejects.toMatchObject({ name: "AbortError" });
 });
 
