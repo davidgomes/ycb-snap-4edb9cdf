@@ -1,0 +1,46 @@
+load("@fbsource//tools/build_defs/dirsync:fb_dirsync_cpp_benchmark.bzl", "fb_dirsync_cpp_benchmark")
+load("@fbsource//tools/build_defs/dirsync:fb_dirsync_cpp_unittest.bzl", "fb_dirsync_cpp_unittest")
+
+oncall("fbcode_entropy_wardens_folly")
+
+fb_dirsync_cpp_unittest(
+    name = "reproducible_accumulator_test",
+    srcs = ["ReproducibleAccumulatorTest.cpp"],
+    deps = [
+        "fbsource//third-party/fmt:fmt",
+        "//folly/math:kahan_summation",
+        "//folly/math:reproducible_accumulator",
+        "//folly/portability:gtest",
+    ],
+)
+
+fb_dirsync_cpp_unittest(
+    name = "kahan_summation_test",
+    srcs = ["KahanSummationTest.cpp"],
+    deps = [
+        "//folly/math:kahan_summation",
+        "//folly/portability:gtest",
+    ],
+)
+
+fb_dirsync_cpp_unittest(
+    name = "accurate_summation_test",
+    srcs = ["AccurateSummationTest.cpp"],
+    deps = [
+        "//folly/math:accurate_summation",
+        "//folly/math:kahan_summation",
+        "//folly/portability:gtest",
+    ],
+)
+
+fb_dirsync_cpp_benchmark(
+    name = "summation_benchmark",
+    srcs = ["SummationBenchmark.cpp"],
+    deps = [
+        "//folly:benchmark",
+        "//folly/init:init",
+        "//folly/math:accurate_summation",
+        "//folly/math:kahan_summation",
+        "//folly/math:reproducible_accumulator",
+    ],
+)

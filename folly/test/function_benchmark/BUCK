@@ -1,0 +1,26 @@
+load("@fbsource//tools/build_defs/dirsync:fb_dirsync_cpp_benchmark.bzl", "fb_dirsync_cpp_benchmark")
+
+oncall("fbcode_entropy_wardens_folly")
+
+fb_dirsync_cpp_benchmark(
+    name = "function_benchmark",
+    srcs = [
+        "benchmark_impl.cpp",
+        "main.cpp",
+        "test_functions.cpp",
+    ],
+    headers = [
+        "benchmark_impl.h",
+        "test_functions.h",
+    ],
+    args = [
+        "--json",
+    ],
+    deps = [
+        "fbsource//third-party/glog:glog",
+        "//folly:benchmark",
+        "//folly:function",
+        "//folly:scope_guard",
+        "//folly/portability:gflags",
+    ],
+)
