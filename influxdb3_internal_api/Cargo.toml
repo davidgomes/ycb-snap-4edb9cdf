@@ -1,0 +1,26 @@
+[package]
+name = "influxdb3_internal_api"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Core Crates
+influxdb_influxql_parser.workspace = true
+iox_query.workspace = true
+iox_query_params.workspace = true
+trace.workspace = true
+trace_http.workspace = true
+tracker.workspace = true
+
+# Local Crates
+
+# Crates.io dependencies
+anyhow.workspace = true
+async-trait.workspace = true
+datafusion.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

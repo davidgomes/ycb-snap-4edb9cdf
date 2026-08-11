@@ -1,0 +1,27 @@
+# default results directory for the load generator:
+results/
+# datafusion-cli history:
+**.history
+# rust compiled binary target directory:
+**/target
+# other:
+testing-certs
+**/*.rs.bk
+.idea/
+.env
+.gdb_history
+*.tsm
+**/.DS_Store
+**/.vscode
+heaptrack.*
+massif.out.*
+perf.data*
+perf.svg
+perf.txt
+valgrind-out.txt
+*.pending-snap
+# Helix editor configuration directory:
+**/.helix
+# .cargo/config.toml is checked in, but glibc builds create .cargo/config to
+# override it, which we can ignore
+.cargo/config

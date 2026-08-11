@@ -1,0 +1,34 @@
+[package]
+name = "influxdb3_client"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# core dependencies
+iox_query_params.workspace = true
+
+# Local deps
+influxdb3_catalog = { path = "../influxdb3_catalog" }
+influxdb3_types = { path = "../influxdb3_types" }
+influxdb3_wal = { path = "../influxdb3_wal" }
+
+# crates.io dependencies
+bytes.workspace = true
+hashbrown.workspace = true
+reqwest.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+# crates.io dependencies
+mockito.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

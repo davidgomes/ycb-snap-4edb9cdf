@@ -1,0 +1,22 @@
+---
+source: influxdb3/tests/cli/mod.rs
+expression: summary_output
+---
+distinct_caches summary:
+++
+++
+last_caches summary:
+++
+++
+parquet_files summary:
+++
+++
+processing_engine_logs summary:
+++
+++
+processing_engine_triggers summary:
+++
+++
+queries summary:
+++
+++

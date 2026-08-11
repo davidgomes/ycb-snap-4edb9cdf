@@ -1,0 +1,5 @@
+---
+source: influxdb3/tests/cli/mod.rs
+expression: result
+---
+distinct cache deleted successfully

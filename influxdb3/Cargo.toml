@@ -1,0 +1,132 @@
+[package]
+name = "influxdb3"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "influxdb3_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "influxdb3"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Core Crates
+authz.workspace = true
+datafusion_util.workspace = true
+iox_query.workspace = true
+iox_time.workspace = true
+metric.workspace = true
+object_store.workspace = true
+object_store_metrics.workspace = true
+observability_deps.workspace = true
+panic_logging.workspace = true
+parquet_file.workspace = true
+tokio_metrics_bridge.workspace = true
+trace.workspace = true
+trace_http.workspace = true
+trace_exporters.workspace = true
+trogging.workspace = true
+
+# Local Crates
+influxdb3_authz = { path = "../influxdb3_authz" }
+influxdb3_cache = { path = "../influxdb3_cache" }
+influxdb3_catalog = { path = "../influxdb3_catalog" }
+influxdb3_client = { path = "../influxdb3_client" }
+influxdb3_clap_blocks = { path = "../influxdb3_clap_blocks" }
+influxdb3_process = { path = "../influxdb3_process", default-features = false }
+influxdb3_processing_engine = {path = "../influxdb3_processing_engine"}
+influxdb3_server = { path = "../influxdb3_server" }
+influxdb3_shutdown = { path = "../influxdb3_shutdown" }
+influxdb3_sys_events = { path = "../influxdb3_sys_events" }
+influxdb3_telemetry = { path = "../influxdb3_telemetry" }
+influxdb3_types = { path = "../influxdb3_types" }
+influxdb3_wal = { path = "../influxdb3_wal" }
+influxdb3_write = { path = "../influxdb3_write" }
+
+# Crates.io dependencies
+anyhow.workspace = true
+backtrace.workspace = true
+base64.workspace = true
+clap.workspace = true
+owo-colors.workspace = true
+dotenvy.workspace = true
+futures.workspace = true
+hashbrown.workspace = true
+hex.workspace = true
+humantime.workspace = true
+itertools.workspace = true
+libc.workspace = true
+num_cpus.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+# Optional Dependencies
+console-subscriber = { version = "0.1.10", optional = true, features = ["parking_lot"] }
+tempfile = "3.15.0"
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemalloc-ctl = { version = "0.5.4", optional = true }
+tikv-jemallocator = { version = "0.5", optional = true, features = ["unprefixed_malloc_on_supported_platforms"] }
+
+[features]
+default = ["jemalloc_replacing_malloc", "azure", "gcp", "aws"]
+
+azure = ["influxdb3_clap_blocks/azure"] # Optional Azure Object store support
+gcp = ["influxdb3_clap_blocks/gcp"] # Optional GCP object store support
+aws = ["influxdb3_clap_blocks/aws"] # Optional AWS / S3 object store support
+
+# Enable tokio_console support (https://github.com/tokio-rs/console)
+#
+# Requires enabling trace level tracing events for [tokio,runtime].
+tokio_console = ["console-subscriber", "tokio/tracing", "observability_deps/release_max_level_trace"]
+
+# Use jemalloc as the default allocator.
+jemalloc_replacing_malloc = ["tikv-jemallocator", "tikv-jemalloc-ctl"]
+
+# Enable use as library in downstream projects that already configure a defaul
+# global allocator.
+disable_custom_global_allocator = []
+
+[dev-dependencies]
+# Core Crates
+arrow_util.workspace = true
+influxdb_iox_client.workspace = true
+
+# Crates.io dependencies in alphabetical order:
+arrow.workspace = true
+arrow-array.workspace = true
+arrow-flight.workspace = true
+assert_cmd.workspace = true
+futures.workspace = true
+hyper.workspace = true
+insta.workspace = true
+itertools.workspace = true
+pretty_assertions.workspace = true
+rcgen.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_urlencoded.workspace = true
+test_helpers.workspace = true
+tonic.workspace = true
+tower.workspace = true
+test-log.workspace = true
