@@ -1,0 +1,29 @@
+/**
+ * Copyright IBM Corp. 2016, 2025
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+import { module, test } from 'qunit';
+import { setupRenderingTest } from 'vault/tests/helpers';
+import { setupEngine } from 'ember-engines/test-support';
+import { setupMirage } from 'ember-cli-mirage/test-support';
+import { render } from '@ember/test-helpers';
+import hbs from 'htmlbars-inline-precompile';
+
+module('Integration | Component | kubernetes | ConfigCta', function (hooks) {
+  setupRenderingTest(hooks);
+  setupEngine(hooks, 'kubernetes');
+  setupMirage(hooks);
+
+  test('it should render message and action', async function (assert) {
+    await render(hbs`<ConfigCta />`, { owner: this.engine });
+    assert.dom('[data-test-empty-state-title]').hasText('Kubernetes not configured', 'Title renders');
+    assert
+      .dom('[data-test-empty-state-message]')
+      .hasText(
+        'Get started by establishing the URL of the Kubernetes API to connect to, along with some additional options.',
+        'Message renders'
+      );
+    assert.dom('a').hasText('Configure Kubernetes', 'Action link renders');
+  });
+});

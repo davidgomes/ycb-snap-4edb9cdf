@@ -1,0 +1,28 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Page::Header @title={{this.title}} @subtitle={{this.subtitle}}>
+  <:breadcrumbs>
+    <Page::Breadcrumbs @breadcrumbs={{this.breadcrumbs}} />
+  </:breadcrumbs>
+</Page::Header>
+
+{{#if (eq this.mode "create")}}
+  <TransitFormCreate @form={{this.form}} @errorMessage={{this.errorMessage}} />
+{{else if (eq this.mode "edit")}}
+  <TransitFormEdit @form={{this.form}} @capabilities={{this.capabilities}} />
+{{else if (eq this.mode "show")}}
+  <TransitFormShow
+    @refresh={{action "refresh"}}
+    @tab={{this.tab}}
+    @form={{this.form}}
+    @capabilities={{this.capabilities}}
+    @mode={{this.mode}}
+  />
+{{else}}
+  <Hds::ApplicationState class="top-padding-32 is-marginless" as |A|>
+    <A.Header @title="No Transit mode selected" @titleTag="h2" data-test-empty-state-title />
+  </Hds::ApplicationState>
+{{/if}}

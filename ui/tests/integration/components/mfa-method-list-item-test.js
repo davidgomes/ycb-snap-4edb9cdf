@@ -1,0 +1,23 @@
+/**
+ * Copyright IBM Corp. 2016, 2025
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+import { module, skip } from 'qunit';
+import { setupRenderingTest } from 'vault/tests/helpers';
+import { render } from '@ember/test-helpers';
+import { hbs } from 'ember-cli-htmlbars';
+
+module('Integration | Component | mfa-method-list-item', function (hooks) {
+  setupRenderingTest(hooks);
+
+  // TODO: fill out component test
+  skip('it renders', async function (assert) {
+    // Set any properties with this.set('myProperty', 'value');
+    // Handle any actions with this.set('myAction', function(val) { ... });
+
+    await render(hbs`<MfaMethodListItem />`);
+
+    assert.dom(this.element).hasText('');
+  });
+});

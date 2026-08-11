@@ -1,0 +1,18 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<InfoTableRow data-test-field="name" @label="Library name" @value={{@model.library.name}} />
+<InfoTableRow data-test-field="ttl" @label="TTL" @value={{@model.library.ttl}} @formatTtl={{true}} />
+<InfoTableRow data-test-field="max_ttl" @label="Max TTL" @value={{@model.library.max_ttl}} @formatTtl={{true}} />
+{{#let @model.library.disable_check_in_enforcement as |value|}}
+  <InfoTableRow @label="Check-in enforcement">
+    <Icon
+      class="is-flex-v-centered {{if value 'icon-false' 'icon-true'}}"
+      @name={{if value "x-square" "check-circle"}}
+      data-test-check-in-icon
+    />
+    <span>{{if value "Disabled" "Enabled"}}</span>
+  </InfoTableRow>
+{{/let}}

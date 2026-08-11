@@ -1,0 +1,58 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+<Page::Header @title={{@model.library.name}}>
+  <:breadcrumbs>
+    <Page::Breadcrumbs @breadcrumbs={{@breadcrumbs}} />
+  </:breadcrumbs>
+  <:actions>
+    <Hds::Dropdown as |D|>
+      <D.ToggleButton @text="Manage" @color="secondary" data-test-dropdown="Manage" />
+      {{#if
+        (has-capability
+          @model.capabilities
+          "update"
+          pathKey="ldapLibrary"
+          params=(hash backend=this.secretMountPath.currentPath name=@model.library.completeLibraryName)
+        )
+      }}
+        <D.Interactive @icon="settings" @route="libraries.library.edit" data-test-popup-menu="Edit library">Edit library</D.Interactive>
+      {{/if}}
+      {{#if
+        (has-capability
+          @model.capabilities
+          "delete"
+          pathKey="ldapLibrary"
+          params=(hash backend=this.secretMountPath.currentPath name=@model.library.completeLibraryName)
+        )
+      }}
+        <D.Interactive
+          @icon="trash"
+          @color="critical"
+          {{on "click" (fn (mut this.showConfirmModal) true)}}
+          data-test-popup-menu="Delete library"
+        >
+          Delete library
+        </D.Interactive>
+      {{/if}}
+    </Hds::Dropdown>
+  </:actions>
+</Page::Header>
+
+<nav class="tabs" aria-label="ldap tabs">
+  <ul>
+    <li><LinkTo @route="libraries.library.details.accounts" data-test-tab="accounts">Accounts</LinkTo></li>
+    <li><LinkTo @route="libraries.library.details.configuration" data-test-tab="config">Configuration</LinkTo></li>
+  </ul>
+</nav>
+
+{{#if this.showConfirmModal}}
+  <ConfirmModal
+    @color="critical"
+    @confirmMessage="You will not be able to recover it later."
+    @confirmTitle="Are you sure?"
+    @onClose={{fn (mut this.showConfirmModal) false}}
+    @onConfirm={{this.delete}}
+  />
+{{/if}}

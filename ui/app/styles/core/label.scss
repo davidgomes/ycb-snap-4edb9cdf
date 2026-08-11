@@ -1,0 +1,45 @@
+@use '../utils/size_variables';
+
+/**
+ * Copyright IBM Corp. 2016, 2025
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+// This file defines the style for .is-label
+
+.is-label {
+  color: var(--token-color-foreground-primary);
+  font-size: var(--token-typography-body-200-font-size);
+  font-weight: var(--token-typography-font-weight-bold);
+  display: flex;
+  align-items: center;
+  gap: size_variables.$spacing-4;
+  width: min-content;
+  min-width: 100%;
+
+  &:not(:last-child) {
+    margin-bottom: 0.25rem;
+  }
+
+  &::before,
+  &::after {
+    transform: translateY(0.2em);
+  }
+
+  &::before {
+    border-color: var(--token-color-palette-neutral-300);
+  }
+}
+
+.label-row {
+  display: flex;
+  align-items: center;
+  gap: size_variables.$spacing-4;
+  margin-bottom: size_variables.$spacing-4;
+
+  label {
+    color: var(--token-color-palette-neutral-600);
+    font-size: var(--token-typography-body-200-font-size);
+    font-weight: var(--token-typography-font-weight-bold);
+  }
+}

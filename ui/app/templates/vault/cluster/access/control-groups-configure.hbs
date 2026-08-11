@@ -1,0 +1,22 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+{{#if (has-feature "Control Groups")}}
+  <Page::Header @title="Approval workflow">
+    <:breadcrumbs>
+      <Page::Breadcrumbs
+        @breadcrumbs={{array
+          (hash label="Vault" route="vault.cluster.dashboard" icon="vault")
+          (hash label="Approval workflow" route="vault.cluster.access.control-groups")
+          (hash label="Configure")
+        }}
+      />
+    </:breadcrumbs>
+  </Page::Header>
+
+  <EditForm @model={{this.model}} @onSave={{action "onSave"}} />
+{{else}}
+  <UpgradePage @title="Approval workflow" @minimumEdition="Vault Enterprise Premium" />
+{{/if}}

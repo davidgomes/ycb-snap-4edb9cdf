@@ -1,0 +1,88 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Page::Header @title={{this.title}} @subtitle={{this.subtitle}}>
+  <:breadcrumbs>
+    <KeyValueHeader
+      @baseKey={{@form}}
+      @path="vault.cluster.secrets.backend.list"
+      @mode={{this.mode}}
+      @root={{this.breadcrumbs}}
+      @showCurrent={{true}}
+    />
+  </:breadcrumbs>
+</Page::Header>
+
+{{#if (eq this.mode "show")}}
+  <Toolbar>
+    <ToolbarActions>
+      {{#if @capabilities.canDelete}}
+        <ConfirmAction
+          @buttonText="Delete role"
+          class="toolbar-button"
+          @buttonColor="secondary"
+          @onConfirmAction={{action "delete"}}
+        />
+        <div class="toolbar-separator"></div>
+      {{/if}}
+      {{#if (eq @form.data.key_type "otp")}}
+        <ToolbarSecretLink @secret={{@form.data.name}} @mode="credentials" data-test-backend-credentials @replace={{true}}>
+          Generate Credential
+        </ToolbarSecretLink>
+      {{else}}
+        <ToolbarSecretLink @secret={{@form.data.name}} @mode="sign" data-test-backend-credentials @replace={{true}}>
+          Sign Keys
+        </ToolbarSecretLink>
+      {{/if}}
+      {{#if (or @capabilities.canUpdate @capabilities.canDelete)}}
+        <ToolbarSecretLink @secret={{@form.data.name}} @mode="edit" data-test-edit-link={{true}} @replace={{true}}>
+          Edit role
+        </ToolbarSecretLink>
+      {{/if}}
+    </ToolbarActions>
+  </Toolbar>
+{{/if}}
+
+{{#if (or (eq this.mode "edit") (eq this.mode "create"))}}
+  <form onsubmit={{action "createOrUpdate" "create"}}>
+    <div class="box is-sideless is-fullwidth is-marginless">
+      <NamespaceReminder @mode={{this.mode}} @noun="SSH role" />
+      <FormFieldGroupsLoop @model={{@form}} @mode={{this.mode}} />
+    </div>
+    <div class="field is-grouped-split box is-fullwidth is-bottomless">
+      <Hds::ButtonSet>
+        <Hds::Button @text={{if (eq this.mode "create") "Create role" "Save"}} type="submit" data-test-role-ssh-create />
+        {{#if (eq this.mode "create")}}
+          <Hds::Button
+            @text="Cancel"
+            @color="secondary"
+            @route="vault.cluster.secrets.backend.list-root"
+            @model={{@form.data.backend}}
+            @query={{hash tab="role"}}
+          />
+        {{else}}
+          <Hds::Button
+            @text="Cancel"
+            @color="secondary"
+            @route="vault.cluster.secrets.backend.show"
+            @models={{array @form.data.backend @form.data.name}}
+          />
+        {{/if}}
+      </Hds::ButtonSet>
+    </div>
+  </form>
+{{else}}
+  <div class="box is-fullwidth is-sideless is-paddingless is-marginless">
+    {{#each this.displayFields as |field|}}
+      {{#let (get @form field.name) as |value|}}
+        <InfoTableRow
+          @label={{capitalize (or field.options.label (humanize (dasherize field.name)))}}
+          @value={{if (eq field.type "object") (stringify value) value}}
+          @formatTtl={{eq field.options.editType "ttl"}}
+        />
+      {{/let}}
+    {{/each}}
+  </div>
+{{/if}}

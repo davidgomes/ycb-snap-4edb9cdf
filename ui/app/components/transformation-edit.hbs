@@ -1,0 +1,238 @@
+{{!
+  Copyright IBM Corp. 2016, 2026
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Page::Header @title={{this.title}} @subtitle={{this.subtitle}}>
+  <:breadcrumbs>
+    <Page::Breadcrumbs @breadcrumbs={{this.breadcrumbs}} />
+  </:breadcrumbs>
+</Page::Header>
+
+{{#if (eq @mode "show")}}
+  <Toolbar>
+    <ToolbarActions>
+      {{#if @capabilities.canDelete}}
+        {{#if (gt @form.data.allowed_roles.length 0)}}
+          <Hds::TooltipButton @text="This transformation is in use by a role and can't be deleted.">
+            <Hds::Button
+              @text="Delete transformation"
+              @color="secondary"
+              class="toolbar-button"
+              aria-disabled="true"
+              disabled
+            />
+          </Hds::TooltipButton>
+        {{else}}
+          <Hds::Button
+            @text="Delete transformation"
+            @color="secondary"
+            class="toolbar-button"
+            data-test-delete
+            {{on "click" (fn (mut this.isDeleteModalActive) true)}}
+          />
+        {{/if}}
+        <div class="toolbar-separator"></div>
+      {{/if}}
+      {{#if @capabilities.canUpdate}}
+        {{#if (gt @form.data.allowed_roles.length 0)}}
+          <Hds::Button
+            @text="Edit transformation"
+            @color="secondary"
+            class="toolbar-button"
+            data-test-edit-link
+            {{on "click" (fn (mut this.isEditModalActive) true)}}
+          />
+        {{else}}
+          <ToolbarSecretLink
+            @secret={{@form.data.name}}
+            @backend={{@form.data.backend}}
+            @mode="edit"
+            @replace={{true}}
+            data-test-edit-link
+          >
+            Edit transformation
+          </ToolbarSecretLink>
+        {{/if}}
+      {{/if}}
+    </ToolbarActions>
+  </Toolbar>
+{{/if}}
+
+{{#if (or (eq @mode "edit") (eq @mode "create"))}}
+  <form {{on "submit" this.createOrUpdate}}>
+    <div class="box is-sideless is-fullwidth is-marginless">
+      <NamespaceReminder @mode={{@mode}} @noun="transformation" />
+      <MessageError @errorMessage={{this.errorMessage}} />
+      {{#each this.visibleFormFields as |field|}}
+        {{#if (eq field.name "template")}}
+          <div class="form-section">
+            <SearchSelect
+              @id="template"
+              @label={{field.options.label}}
+              @labelClass="title is-4"
+              @subText={{field.options.subText}}
+              @options={{this.templates}}
+              @inputValue={{@form.data.template}}
+              @onChange={{fn (mut @form.template)}}
+              @selectLimit={{1}}
+              @disallowNewItems={{true}}
+              @fallbackComponent="string-list"
+              data-test-field
+            />
+            {{#if (and this.modelValidations.template (not this.modelValidations.template.isValid))}}
+              <Hds::Form::Error data-test-validation-error="template">
+                {{this.modelValidations.template.errors}}
+              </Hds::Form::Error>
+            {{/if}}
+          </div>
+        {{else if (eq field.name "allowed_roles")}}
+          <div class="form-section">
+            <SearchSelect
+              @id="allowed_roles"
+              @label={{field.options.label}}
+              @labelClass="title is-4"
+              @subText={{field.options.subText}}
+              @options={{this.roles}}
+              @inputValue={{@form.data.allowed_roles}}
+              @onChange={{fn (mut @form.allowed_roles)}}
+              @fallbackComponent="string-list"
+              @wildcardLabel="role"
+              data-test-field
+            />
+          </div>
+        {{else}}
+          <FormField
+            data-test-field
+            @attr={{field}}
+            @model={{@form}}
+            @mode={{@mode}}
+            @modelValidations={{this.modelValidations}}
+          />
+        {{/if}}
+      {{/each}}
+    </div>
+    <div class="field is-grouped-split box is-fullwidth is-bottomless">
+      <Hds::ButtonSet>
+        <Hds::Button @text={{if (eq @mode "create") "Create transformation" "Save"}} type="submit" data-test-submit />
+        {{#if (eq @mode "create")}}
+          <Hds::Button
+            @text="Cancel"
+            @color="secondary"
+            @route="vault.cluster.secrets.backend.list-root"
+            @model={{@form.data.backend}}
+            @query={{hash tab="transformations"}}
+          />
+        {{else}}
+          <Hds::Button
+            @text="Cancel"
+            @color="secondary"
+            @route="vault.cluster.secrets.backend.show"
+            @models={{array @form.data.backend @form.data.name}}
+          />
+        {{/if}}
+      </Hds::ButtonSet>
+    </div>
+  </form>
+{{else}}
+  <div class="box is-fullwidth is-sideless is-paddingless is-marginless">
+    {{#each this.visibleFormFields as |field|}}
+      {{#if (eq field.name "allowed_roles")}}
+        <InfoTableRow
+          @label={{capitalize (or field.options.label (humanize (dasherize field.name)))}}
+          @value={{get @form.data field.name}}
+          @type="array"
+          @isLink={{true}}
+          @queryParam="role"
+          @wildcardLabel="role"
+        />
+      {{else}}
+        <InfoTableRow
+          @label={{capitalize (or field.options.label (humanize (dasherize field.name)))}}
+          @value={{get @form.data field.name}}
+          @type={{field.type}}
+        />
+      {{/if}}
+    {{/each}}
+  </div>
+
+  <div class="has-top-margin-xl has-bottom-margin-s">
+    <label class="title has-border-bottom-light page-header">CLI Commands</label>
+    <div class="has-bottom-margin-s">
+      <h2 class="title is-6">Encode</h2>
+      <div class="has-bottom-margin-s">
+        <span class="helper-text has-text-grey">
+          To test the encoding capability of your transformation, use the following command. It will output an encoded_value.
+        </span>
+      </div>
+      <div class="copy-text level">
+        {{#let (concat "vault write " @form.data.backend "/encode/" this.cliCommand) as |copyEncodeCommand|}}
+          <Hds::CodeBlock
+            @language="bash"
+            @hasLineNumbers={{false}}
+            @hasLineWrapping={{true}}
+            @hasCopyButton={{true}}
+            @value={{copyEncodeCommand}}
+          />
+        {{/let}}
+      </div>
+    </div>
+    <div>
+      <h2 class="title is-6">Decode</h2>
+      <div class="has-bottom-margin-s">
+        <span class="helper-text has-text-grey">
+          To test decoding capability of your transformation, use the encoded_value in the following command. It should
+          return your original input.
+        </span>
+      </div>
+      <div class="copy-text level">
+        {{#let (concat "vault write " @form.data.backend "/decode/" this.cliCommand) as |copyDecodeCommand|}}
+          <Hds::CodeBlock
+            @language="bash"
+            @hasLineNumbers={{false}}
+            @hasLineWrapping={{true}}
+            @hasCopyButton={{true}}
+            @value={{copyDecodeCommand}}
+          />
+        {{/let}}
+      </div>
+    </div>
+  </div>
+{{/if}}
+
+<ConfirmationModal
+  @title="Delete transformation"
+  @onClose={{fn (mut this.isDeleteModalActive) false}}
+  @isActive={{this.isDeleteModalActive}}
+  @confirmText={{@form.data.name}}
+  @toConfirmMsg="deleting the transformation."
+  @onConfirm={{this.onDelete}}
+>
+  <p class="has-bottom-margin-m">
+    Deleting the
+    <strong>{{@form.data.name}}</strong>
+    transformation means that the underlying keys are lost and the data encoded by the transformation are unrecoverable and
+    cannot be decoded.
+  </p>
+  <MessageError @errorMessage={{this.errorMessage}} />
+</ConfirmationModal>
+
+{{#if this.isEditModalActive}}
+  <Hds::Modal id="transformation-edit-modal" @color="warning" @onClose={{fn (mut this.isEditModalActive) false}} as |M|>
+    <M.Header @icon="alert-triangle">
+      Edit transformation
+    </M.Header>
+    <M.Body>
+      <p>
+        You're editing a transformation that is in use by at least one role. Editing it may mean that encode and decode
+        operations stop working. Are you sure?
+      </p>
+    </M.Body>
+    <M.Footer as |F|>
+      <Hds::ButtonSet>
+        <Hds::Button @text="Confirm" data-test-edit-confirm-button {{on "click" this.confirmEdit}} />
+        <Hds::Button @color="secondary" @text="Cancel" {{on "click" F.close}} />
+      </Hds::ButtonSet>
+    </M.Footer>
+  </Hds::Modal>
+{{/if}}

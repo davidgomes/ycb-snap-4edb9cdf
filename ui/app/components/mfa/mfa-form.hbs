@@ -1,0 +1,32 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+{{#if this.fetchQrCode.isRunning}}
+  <Mfa::SplashCard @header="Redirecting..." @isLoading={{true}} data-test-mfa-form />
+{{else if this.currentSelfEnrollConstraint.qrCode}}
+  {{! Clicking "Continue" clears this.currentSelfEnrollConstraint.qrCode }}
+  <Mfa::Form::SelfEnroll
+    @constraints={{this.constraints}}
+    @onCancel={{@onCancel}}
+    @onVerify={{this.checkStateAndValidate}}
+  />
+{{else if (and (not this.validate.isRunning) this.needsToChoose)}}
+  {{! This component only renders when one enforcement with multiple methods is configured
+  Or there are multiple enforcements and each one has methods that support self-enrollment }}
+  <Mfa::Form::ChooseMethod @constraints={{this.constraints}} @onCancel={{@onCancel}} @onSelect={{this.onSelect}} />
+{{else}}
+  <Mfa::Form::Verify
+    @codeDelayMessage={{this.codeDelayMessage}}
+    @constraints={{this.constraints}}
+    @countdown={{this.countdown}}
+    @error={{this.error}}
+    {{! Only this component renders whenever validate.isRunning (even if the user verified in the SelfEnroll component) }}
+    @isLoading={{or this.validate.isRunning @loginAndTransition.isRunning}}
+    @methodAlreadyEnrolled={{this.methodAlreadyEnrolled}}
+    @onCancel={{@onCancel}}
+    @onSelect={{this.onSelect}}
+    @onVerify={{this.checkStateAndValidate}}
+  />
+{{/if}}

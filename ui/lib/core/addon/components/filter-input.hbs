@@ -1,0 +1,13 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Hds::Form::TextInput::Base
+  @type="search"
+  @id={{@id}}
+  @value={{@value}}
+  {{on "input" this.onInput}}
+  data-test-filter-input
+  ...attributes
+/>

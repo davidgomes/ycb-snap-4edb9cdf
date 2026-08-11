@@ -1,0 +1,96 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+{{#if (eq @mode "edit")}}
+  <form onsubmit={{this.onSubmit}} data-test-clients-config-form>
+    <div class="box is-sideless is-fullwidth is-marginless">
+      <MessageError @errorMessage={{this.errorMessage}} />
+      {{! reporting_enabled is specifically for automated reporting }}
+      {{! it will be false for CE clusters or enterprise customers who have opted out of automated license reporting }}
+      {{#unless @config.reporting_enabled}}
+        <label class="is-label">Usage data collection</label>
+        <p class="sub-text">
+          Enable or disable client tracking. Keep in mind that disabling tracking will delete the data for the current month.
+        </p>
+        <div class="control is-flex has-bottom-margin-l">
+          <Hds::Form::Toggle::Field
+            @id="enabled"
+            data-test-input="enabled"
+            checked={{this.enabled}}
+            {{on "change" (pipe (pick "target.checked") (fn (mut this.enabled)))}}
+            as |F|
+          >
+            <F.Label data-test-form-field-label>
+              Data collection is
+              {{if this.enabled "on" "off"}}
+            </F.Label>
+          </Hds::Form::Toggle::Field>
+        </div>
+      {{/unless}}
+
+      <div class="field" data-test-field="name">
+        <Hds::Form::TextInput::Field
+          @value={{@config.retention_months}}
+          @isInvalid={{this.validationError}}
+          disabled={{this.save.isRunning}}
+          autocomplete="off"
+          spellcheck="false"
+          data-test-input="retention_months"
+          {{on "input" (pipe (pick "target.value") (fn (mut @config.retention_months)))}}
+          as |F|
+        >
+          <F.Label>Retention period</F.Label>
+          <F.HelperText>
+            The number of months of activity logs to maintain for client tracking.
+          </F.HelperText>
+          {{#if this.validationError}}
+            <F.Error data-test-validation-error="retention_months">{{this.validationError}}</F.Error>
+          {{/if}}
+        </Hds::Form::TextInput::Field>
+      </div>
+    </div>
+    <div class="field is-grouped-split box is-fullwidth is-bottomless">
+      <Hds::ButtonSet>
+        <Hds::Button @text="Save" type="submit" disabled={{this.save.isRunning}} data-test-submit />
+        <Hds::Button @text="Cancel" @color="secondary" @route="vault.cluster.clients.config" />
+      </Hds::ButtonSet>
+    </div>
+  </form>
+
+  {{#if this.modalOpen}}
+    <Hds::Modal id="clients-config-modal" @color="warning" @onClose={{fn (mut this.modalOpen) false}} as |M|>
+      <M.Header @icon="alert-triangle" data-test-clients-config-modal="title">
+        {{this.modalTitle}}
+      </M.Header>
+      <M.Body>
+        {{#if this.enabled}}
+          <p class="has-bottom-margin-s" data-test-clients-config-modal="on">
+            Vault will start tracking data starting from today’s date,
+            {{date-format (now) "MMMM d, yyyy"}}. If you’ve previously enabled usage tracking, that historical data will
+            still be available to you.
+          </p>
+        {{else}}
+          <p class="has-bottom-margin-s" data-test-clients-config-modal="off">
+            Turning usage tracking off means that all data for the current month will be deleted. You will still be able to
+            query previous months.
+          </p>
+          <p>Are you sure?</p>
+        {{/if}}
+      </M.Body>
+      <M.Footer as |F|>
+        <Hds::ButtonSet>
+          <Hds::Button @text="Continue" {{on "click" (perform this.save)}} data-test-clients-config-modal="continue" />
+          <Hds::Button @text="Cancel" @color="secondary" {{on "click" F.close}} data-test-clients-config-modal="cancel" />
+        </Hds::ButtonSet>
+      </M.Footer>
+    </Hds::Modal>
+  {{/if}}
+{{else}}
+  <div class="tabs-container box is-bottomless is-marginless is-fullwidth is-paddingless" data-test-clients-config-table>
+    {{#each this.infoRows as |item|}}
+      <InfoTableRow @label={{item.label}} @helperText={{item.helperText}} @value={{item.value}} />
+    {{/each}}
+  </div>
+{{/if}}

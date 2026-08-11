@@ -1,0 +1,83 @@
+/**
+ * Copyright IBM Corp. 2016, 2025
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+import Component from '@glimmer/component';
+import { tracked } from '@glimmer/tracking';
+import { service } from '@ember/service';
+import { action } from '@ember/object';
+import { fetchMfaLoginEnforcements } from 'vault/utils/mfa-login-enforcement-helpers';
+import MfaLoginEnforcementForm from 'vault/forms/mfa/login-enforcement';
+
+/**
+ * @module MfaLoginEnforcementHeader
+ * MfaLoginEnforcementHeader components are used to display information when creating and editing login enforcements
+ *
+ * @example
+ * ```js
+ * <MfaLoginEnforcementHeader @heading="New enforcement" />
+ * <MfaLoginEnforcementHeader @radioCardGroupValue={{this.enforcementPreference}} @onRadioCardSelect={{fn (mut this.enforcementPreference)}} @onEnforcementSelect={{fn (mut this.enforcement)}} />
+ * ```
+ * @callback onRadioCardSelect
+ * @callback onEnforcementSelect
+ * @param {boolean} [isInline] - toggle component display when used inline with mfa method form -- overrides heading and shows radio cards and enforcement select
+ * @param {string} [heading] - page heading to display outside of inline mode
+ * @param {string} [radioCardGroupValue] - selected value of the radio card group in inline mode -- new, existing or skip are the accepted values
+ * @param {onRadioCardSelect} [onRadioCardSelect] - change event triggered on radio card select
+ * @param {onEnforcementSelect} [onEnforcementSelect] - change event triggered on enforcement select when radioCardGroupValue is set to existing
+ */
+
+export default class MfaLoginEnforcementHeaderComponent extends Component {
+  @service api;
+
+  constructor() {
+    super(...arguments);
+    if (this.args.isInline) {
+      this.fetchEnforcements();
+    }
+  }
+
+  breadcrumbs = [
+    {
+      label: 'Vault',
+      route: 'vault.cluster.dashboard',
+      icon: 'vault',
+    },
+    {
+      label: 'Multi-factor authentication',
+      route: 'vault.cluster.access.mfa.methods.index',
+    },
+    {
+      label: 'Enforcements',
+      route: 'vault.cluster.access.mfa.enforcements.index',
+    },
+    {
+      label: this.args.heading,
+    },
+  ];
+
+  @tracked enforcements = [];
+
+  async fetchEnforcements() {
+    try {
+      // cache initial values for lookup in select handler
+      this._enforcements = await fetchMfaLoginEnforcements(this.api);
+      this.enforcements = [...this._enforcements];
+    } catch (error) {
+      this.enforcements = [];
+    }
+  }
+
+  @action
+  onEnforcementSelect([name]) {
+    // search select returns array of strings, in this case enforcement name
+    // lookup enforcement data and wrap in form instance
+    const enforcementData = this._enforcements.find((enf) => enf.id === name);
+    if (enforcementData) {
+      // Create a form instance from the API data
+      const enforcementForm = new MfaLoginEnforcementForm(enforcementData, { isNew: false });
+      this.args.onEnforcementSelect(enforcementForm);
+    }
+  }
+}

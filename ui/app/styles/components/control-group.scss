@@ -1,0 +1,42 @@
+@use '../utils/box-shadow_variables';
+@use '../utils/size_variables';
+@use '../core/box.scss';
+
+/**
+ * Copyright IBM Corp. 2016, 2025
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+.control-group,
+.control-group-success {
+  @extend .box;
+  box-shadow:
+    box-shadow_variables.$box-shadow-middle,
+    0 0 1px var(--token-color-palette-neutral-500);
+}
+.control-group-success.is-editor {
+  background: var(--token-color-surface-faint);
+}
+
+.control-group a {
+  color: currentColor;
+}
+.control-group-header {
+  box-shadow: 0 0 1px currentColor;
+  padding: size_variables.$spacing-10 size_variables.$spacing-14;
+  background: var(--token-color-surface-faint);
+  color: var(--token-color-foreground-faint);
+  position: relative;
+  strong {
+    color: currentColor;
+  }
+}
+
+.control-group-header.is-success {
+  color: var(--token-color-foreground-success-on-surface);
+  background: var(--token-color-palette-green-50);
+}
+
+.control-group .authorizations {
+  margin-top: size_variables.$spacing-10;
+}

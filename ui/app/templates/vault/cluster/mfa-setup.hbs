@@ -1,0 +1,28 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Sidebar::Nav::Cluster />
+
+{{#if (eq this.onStep 1)}}
+  <Mfa::MfaSetupStepOne
+    @header={{this.header}}
+    @description={{this.description}}
+    @isUUIDVerified={{this.isUUIDVerified}}
+    @restartFlow={{this.restartFlow}}
+    @saveUUIDandQrCode={{this.saveUUIDandQrCode}}
+    @showWarning={{this.showWarning}}
+  />
+{{/if}}
+{{#if (eq this.onStep 2)}}
+  <Mfa::MfaSetupStepTwo
+    @header={{this.header}}
+    @description={{this.description}}
+    @entityId={{this.entityId}}
+    @uuid={{this.uuid}}
+    @qrCode={{this.qrCode}}
+    @restartFlow={{this.restartFlow}}
+    @warning={{this.warning}}
+  />
+{{/if}}

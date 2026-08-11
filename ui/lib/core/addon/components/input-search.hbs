@@ -1,0 +1,24 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<div class="field" ...attributes>
+  <Hds::Form::TextInput::Field
+    @type="text"
+    @id={{@id}}
+    @value={{this.searchInput}}
+    {{on (or @changeEvent "keyup") this.inputChanged}}
+    placeholder={{@placeholder}}
+    autocomplete="off"
+    data-test-input-search={{@id}}
+    as |F|
+  >
+    {{#if @label}}
+      <F.Label data-test-form-label={{@label}}>{{@label}}</F.Label>
+    {{/if}}
+    {{#if @subText}}
+      <F.HelperText>{{@subText}}</F.HelperText>
+    {{/if}}
+  </Hds::Form::TextInput::Field>
+</div>

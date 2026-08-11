@@ -1,0 +1,12 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<ConfirmAction
+  @buttonText="Seal"
+  @confirmTitle="Seal this cluster?"
+  @confirmMessage="You will not be able to read or write any data until the cluster is unsealed again."
+  @onConfirmAction={{this.handleSeal}}
+  data-test-button="Seal"
+/>

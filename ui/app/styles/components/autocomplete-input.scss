@@ -1,0 +1,23 @@
+/**
+ * Copyright IBM Corp. 2016, 2025
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+.autocomplete-input {
+  background: hsl(0, 0%, 100%) !important;
+  border: 1px solid var(--token-color-palette-neutral-300);
+  box-sizing: border-box;
+  border-radius: var(--token-form-control-border-radius);
+  width: 99%;
+  padding: 4px 0;
+  margin-left: 0.5%;
+  margin-top: -4px;
+}
+
+.autocomplete-input-option {
+  padding: 12px;
+  &:hover {
+    background-color: var(--token-color-surface-faint);
+    cursor: pointer;
+  }
+}

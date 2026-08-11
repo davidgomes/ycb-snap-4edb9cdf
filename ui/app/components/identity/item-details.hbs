@@ -1,0 +1,42 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<div class="box is-shadowless is-marginless is-fullwidth">
+  {{#if @model.disabled}}
+    <Hds::Alert data-test-disabled-warning @type="inline" @color="warning" class="has-bottom-margin-s" as |A|>
+      <A.Title>Attention</A.Title>
+      <A.Description>
+        This
+        {{@model.identity_type}}
+        is disabled. All associated tokens cannot be used, but are not revoked.
+      </A.Description>
+      {{#if @model.canEdit}}
+        <A.Button data-test-enable-identity @text="Enable" @color="secondary" {{on "click" (action "enable" @model)}} />
+      {{/if}}
+    </Hds::Alert>
+  {{/if}}
+  <InfoTableRow @label="Name" @value={{@model.name}} data-test-identity-item-name={{true}} />
+  <InfoTableRow @label="Type" @value={{@model.type}} />
+  <InfoTableRow @label="ID" @value={{@model.id}} @addCopyButton={{true}} />
+  <InfoTableRow @label="Merged Ids" @value={{@model.merged_entity_ids}}>
+    <div>
+      {{#each @model.merged_entity_ids as |id|}}
+        <div>
+          <code class="has-text-black">{{id}}</code>
+        </div>
+      {{/each}}
+    </div>
+  </InfoTableRow>
+  <InfoTableRow @label="Created" @value={{@model.creation_time}}>
+    <time datetime={{@model.creation_time}} title={{@model.creation_time}}>
+      {{date-format @model.creation_time "MMM dd, yyyy h:mm a"}}
+    </time>
+  </InfoTableRow>
+  <InfoTableRow @label="Last Updated" @value={{this.model.last_update_time}}>
+    <time datetime={{this.model.last_update_time}} title={{this.model.last_update_time}}>
+      {{date-format this.model.last_update_time "MMM dd, yyyy h:mm a"}}
+    </time>
+  </InfoTableRow>
+</div>

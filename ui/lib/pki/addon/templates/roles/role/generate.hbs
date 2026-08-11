@@ -1,0 +1,12 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Page::Header @icon="certificate" @title={{if this.hasSubmitted "View Generated Certificate" "Generate Certificate"}}>
+  <:breadcrumbs>
+    <Page::Breadcrumbs @breadcrumbs={{this.breadcrumbs}} />
+  </:breadcrumbs>
+</Page::Header>
+
+<PkiRoleGenerate @form={{this.model.form}} @role={{this.model.role}} @mode="generate" @onSuccess={{this.toggleTitle}} />

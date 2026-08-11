@@ -1,0 +1,84 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+{{#if this.signedIntermediate}}
+  {{! this block displays when the intermediate has been signed successfully }}
+  <Toolbar />
+  <main data-test-sign-intermediate-result>
+    <div class="box is-sideless is-fullwidth is-shadowless">
+      <Hds::Alert @type="inline" @color="highlight" class="has-bottom-margin-s" as |A|>
+        <A.Title>Next steps</A.Title>
+        <A.Description>
+          The CA Chain and Issuing CA values will only be available once. Make sure you copy and save it now.
+        </A.Description>
+      </Hds::Alert>
+
+      <InfoTableRow @label="Serial number">
+        <LinkTo @route="certificates.certificate.details" @model={{this.signedIntermediate.serial_number}}>
+          {{this.signedIntermediate.serial_number}}
+        </LinkTo>
+      </InfoTableRow>
+      <InfoTableRow @label="Certificate">
+        <EncodedDataCard @data={{this.signedIntermediate.certificate}} />
+      </InfoTableRow>
+      <InfoTableRow @label="Issuing CA">
+        <EncodedDataCard @data={{this.signedIntermediate.issuing_ca}} />
+      </InfoTableRow>
+      <InfoTableRow @label="CA Chain">
+        <EncodedDataCard @data={{this.signedIntermediate.ca_chain}} />
+      </InfoTableRow>
+
+      <ParsedCertificateInfoRows @model={{this.parsedCertificate}} />
+    </div>
+  </main>
+{{else}}
+  <form {{on "submit" (perform this.save)}} data-test-sign-intermediate-form>
+    <div class="box is-sideless is-fullwidth is-marginless">
+      <MessageError @errorMessage={{this.errorBanner}} class="has-top-margin-s" />
+      <NamespaceReminder @mode={{"create"}} @noun="signed intermediate" />
+
+      {{#each this.fields as |field|}}
+        {{#let (find-by "name" field @form.formFields) as |formField|}}
+          <FormField
+            data-test-field={{field}}
+            @attr={{formField}}
+            @model={{@form}}
+            @modelValidations={{this.modelValidations}}
+            @showHelpText={{false}}
+          >
+            {{! attr customTtl has editType yield and will show this component }}
+            <PkiNotValidAfterForm @form={{@form}} />
+          </FormField>
+        {{/let}}
+      {{/each}}
+
+      <PkiGenerateToggleGroups @form={{@form}} @groups={{this.groups}} />
+    </div>
+
+    <Hds::ButtonSet class="has-top-padding-s">
+      <Hds::Button
+        @text="Save"
+        @icon={{if this.save.isRunning "loading"}}
+        type="submit"
+        disabled={{this.save.isRunning}}
+        data-test-pki-sign-intermediate-save
+      />
+      <Hds::Button
+        @text="Cancel"
+        @color="secondary"
+        class="has-left-margin-s"
+        disabled={{this.save.isRunning}}
+        {{on "click" @onCancel}}
+        data-test-pki-sign-intermediate-cancel
+      />
+    </Hds::ButtonSet>
+    {{#if this.inlineFormAlert}}
+      <div class="control">
+        <AlertInline @type="danger" class="has-top-padding-s" @message={{this.inlineFormAlert}} data-test-form-error />
+      </div>
+    {{/if}}
+
+  </form>
+{{/if}}

@@ -1,0 +1,94 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Page::Header @title="Wrap data">
+  <:breadcrumbs>
+    <Page::Breadcrumbs @breadcrumbs={{this.breadcrumbs}} />
+  </:breadcrumbs>
+  <:description>
+    Generate single-use tokens that encrypt sensitive data short-term to provide secure secret delivery and intercept
+    detection.
+    <Hds::Link::Inline @isHrefExternal={{true}} @href={{doc-link "/vault/gui/wrapping"}}>
+      Learn more
+    </Hds::Link::Inline>
+  </:description>
+</Page::Header>
+
+{{#if this.token}}
+  <div class="box is-fullwidth is-marginless">
+    <div class="field">
+      <label for="wrap-info" class="is-label">Wrapped token</label>
+      <Hds::Copy::Snippet
+        @textToCopy={{this.token}}
+        @color="secondary"
+        data-test-tools-input="wrapping-token"
+        @onError={{fn (set-flash-message "Clipboard copy failed. The Clipboard API requires a secure context." "danger")}}
+      />
+    </div>
+  </div>
+  <div class="field is-grouped box is-fullwidth is-bottomless">
+    <Hds::ButtonSet>
+      <Hds::Button
+        @icon="arrow-left"
+        @text="Back"
+        @color="tertiary"
+        {{on "click" (fn this.reset false)}}
+        data-test-button="Back"
+      />
+      <Hds::Button @text="Done" @color="secondary" {{on "click" this.reset}} data-test-button="Done" />
+    </Hds::ButtonSet>
+  </div>
+{{else}}
+  <form {{on "submit" this.handleSubmit}}>
+    <div class="box is-fullwidth is-marginless">
+      <NamespaceReminder @mode="perform" @noun="wrap" />
+      <MessageError @errorMessage={{this.errorMessage}} />
+      <Toolbar>
+        <ToolbarFilters>
+          <Toggle @name="json" @checked={{this.showJson}} @onChange={{this.handleToggle}}>
+            <span class="has-text-grey">JSON</span>
+          </Toggle>
+        </ToolbarFilters>
+      </Toolbar>
+      {{#if this.showJson}}
+        <JsonEditor
+          class="has-top-margin-s"
+          @title="Data to wrap"
+          @helpText="json-formatted"
+          @value={{this.stringifiedWrapData}}
+          @valueUpdated={{this.editorUpdated}}
+        />
+      {{else}}
+        <KvObjectEditor
+          class="has-top-margin-l"
+          @label="Data to wrap"
+          @value={{this.wrapData}}
+          @onChange={{fn (mut this.wrapData)}}
+          @warnNonStringValues={{true}}
+        />
+      {{/if}}
+      <TtlPicker
+        @label="Wrap TTL"
+        @initialValue="30m"
+        @onChange={{this.updateTtl}}
+        @helperTextDisabled="Vault will use the default (30m)"
+        @helperTextEnabled="Wrap will expire after"
+        @changeOnInit={{true}}
+      />
+      {{#if this.hasLintingErrors}}
+        <AlertInline
+          @color="warning"
+          class="has-top-padding-s"
+          @message="JSON is unparsable. Fix linting errors to avoid data discrepancies."
+        />
+      {{/if}}
+    </div>
+    <div class="field is-grouped box is-fullwidth is-bottomless">
+      <div class="control">
+        <Hds::Button @text="Wrap data" type="submit" data-test-submit />
+      </div>
+    </div>
+  </form>
+{{/if}}

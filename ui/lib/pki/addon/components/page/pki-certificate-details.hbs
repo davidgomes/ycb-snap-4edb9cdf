@@ -1,0 +1,76 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Toolbar>
+  <ToolbarActions>
+    <Hds::Button
+      @text="Download"
+      @color="secondary"
+      @icon="download"
+      class="toolbar-button"
+      {{on "click" this.downloadCert}}
+      data-test-pki-cert-download-button
+    />
+    {{#if this.showRevoke}}
+      <ConfirmAction
+        @buttonText="Revoke certificate"
+        class="toolbar-button"
+        @buttonColor="secondary"
+        @onConfirmAction={{fn (perform this.revoke)}}
+        @confirmTitle="Revoke certificate?"
+        data-test-pki-cert-revoke-button
+      />
+    {{/if}}
+  </ToolbarActions>
+</Toolbar>
+
+{{#if @certData.private_key}}
+  <div class="has-top-margin-m">
+    <Hds::Alert data-test-cert-detail-next-steps @type="inline" @color="highlight" class="has-bottom-margin-s" as |A|>
+      <A.Title>Next steps</A.Title>
+      <A.Description>
+        The
+        <code>private_key</code>
+        is only available once. Make sure you copy and save it now.
+      </A.Description>
+    </Hds::Alert>
+  </div>
+{{/if}}
+
+{{#each this.displayFields as |field|}}
+  {{#let (or (get @certData field) (get this.parsedCertificate field)) as |value|}}
+    {{#if value}}
+      {{#if (this.isCertificate field)}}
+        <InfoTableRow @label={{this.label field}}>
+          <EncodedDataCard @data={{value}} />
+        </InfoTableRow>
+      {{else if (eq field "serial_number")}}
+        <InfoTableRow @label="Serial number">
+          <code class="has-text-black">{{value}}</code>
+        </InfoTableRow>
+      {{else}}
+        <InfoTableRow
+          @label={{this.label field}}
+          @value={{value}}
+          @formatDate={{if (eq field "revocation_time") "MMM dd yyyy hh:mm:ss a"}}
+        />
+      {{/if}}
+    {{/if}}
+  {{/let}}
+{{/each}}
+
+<ParsedCertificateInfoRows @model={{this.parsedCertificate}} />
+
+{{#if @onBack}}
+  <div class="field is-grouped box is-fullwidth is-bottomless">
+    <Hds::Button
+      @text="Back"
+      @color="secondary"
+      disabled={{this.revoke.isRunning}}
+      {{on "click" @onBack}}
+      data-test-pki-cert-details-back
+    />
+  </div>
+{{/if}}

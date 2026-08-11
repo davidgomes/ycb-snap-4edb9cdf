@@ -1,0 +1,17 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<LinkTo
+  class="toolbar-link"
+  ...attributes
+  @route={{@route}}
+  @models={{this.models}}
+  @query={{this.query}}
+  @replace={{@replace}}
+  @disabled={{@disabled}}
+>
+  {{yield}}
+  <Icon class="toolbar-icon" @name={{this.glyph}} data-test-icon={{this.glyph}} />
+</LinkTo>

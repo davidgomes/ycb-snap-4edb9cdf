@@ -1,0 +1,194 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<div class="tabs-container box is-sideless is-fullwidth is-paddingless is-marginless">
+  <nav class="tabs" aria-label="navigation to manage transit backend">
+    <ul>
+      <li class={{if (eq @tab "actions") "is-active"}}>
+        <SecretLink
+          @secret={{@form.data.id}}
+          @mode="show"
+          @backend={{@form.data.backend}}
+          @replace={{true}}
+          @queryParams={{hash tab="actions"}}
+          data-test-transit-key-actions-link={{true}}
+        >
+          Key Actions
+        </SecretLink>
+      </li>
+
+      <li class={{if (eq @tab "details") "is-active"}}>
+        <SecretLink
+          @secret={{@form.data.id}}
+          @mode="show"
+          @backend={{@form.data.backend}}
+          @replace={{true}}
+          @queryParams={{hash tab="details"}}
+          data-test-transit-link="details"
+        >
+          Details
+        </SecretLink>
+      </li>
+
+      <li class={{if (eq @tab "versions") "is-active"}}>
+        <SecretLink
+          @secret={{@form.data.id}}
+          @mode="show"
+          @backend={{@form.data.backend}}
+          @replace={{true}}
+          @queryParams={{hash tab="versions"}}
+          data-test-transit-link="versions"
+        >
+          Versions
+        </SecretLink>
+      </li>
+    </ul>
+  </nav>
+</div>
+{{#if (not-eq @tab "actions")}}
+  <Toolbar>
+    <ToolbarActions>
+      {{#if (and (eq @tab "versions") @capabilities.canRotate)}}
+        <ConfirmAction
+          @buttonText="Rotate key"
+          class="toolbar-button"
+          @buttonColor="secondary"
+          @confirmTitle="Rotate this key?"
+          @confirmMessage="After rotation, all key actions will default to using the newest version of the key."
+          @modalColor="warning"
+          @onConfirmAction={{this.rotateKey}}
+          data-test-transit-key-rotate
+        />
+      {{/if}}
+      {{#if (eq @mode "show")}}
+        {{#if (or @capabilities.canUpdate @capabilities.canDelete)}}
+          <ToolbarSecretLink @secret={{@form.data.id}} @backend={{@form.data.backend}} @mode="edit" replace={{true}}>
+            Edit key
+          </ToolbarSecretLink>
+        {{/if}}
+      {{/if}}
+    </ToolbarActions>
+  </Toolbar>
+{{/if}}
+
+{{#if (eq @tab "actions")}}
+  <div class="transit-card-container">
+    {{#each @form.data.supportedActions as |supportedAction|}}
+      <LinkedBlock
+        @params={{array "vault.cluster.secrets.backend.actions" @form.data.backend @form.data.id}}
+        @queryParams={{hash action=supportedAction.name}}
+        class="transit-card"
+        data-test-transit-card={{supportedAction.name}}
+      >
+        <div class="transit-icon">
+          <Icon
+            @name={{supportedAction.glyph}}
+            class="has-text-grey auto-width"
+            aria-label={{concat @form.data.backend.path " options"}}
+          />
+        </div>
+        <div class="transit-description">
+          <h2 class="title is-6" data-test-transit-action-title={{supportedAction.name}}>
+            {{#if (eq supportedAction.name "export")}}
+              Export Key
+            {{else if (eq supportedAction.name "hmac")}}
+              HMAC
+            {{else}}
+              {{humanize supportedAction.name}}
+            {{/if}}
+          </h2>
+          <p class="transit-action-description">{{supportedAction.description}}</p>
+        </div>
+      </LinkedBlock>
+    {{/each}}
+  </div>
+{{else if (eq @tab "versions")}}
+  {{#if
+    (or (eq @form.data.type "aes256-gcm96") (eq @form.data.type "chacha20-poly1305") (eq @form.data.type "aes128-gcm96"))
+  }}
+    {{#each-in @form.data.keys as |version creationTimestamp|}}
+      <div class="linked-block list-item-row no-destination" data-test-transit-version={{version}}>
+        <div class="columns is-mobile">
+          <div class="column is-3">
+            <div class="level level-left">
+              <Icon @name="history" class="has-text-grey-light is-padded" />
+              <strong class="has-padding is-size-5">Version {{version}}</strong>
+            </div>
+          </div>
+          <div class="column is-4">
+            <div class="td is-borderless">
+              <small class="help has-text-grey">
+                {{this.getTimestamp creationTimestamp}}
+              </small>
+            </div>
+          </div>
+          <div class="column is-5">
+            <div class="td is-borderless">
+              {{#if (coerce-eq @form.data.min_decryption_version version)}}
+                <p class="help level level-left">
+                  <Icon @name="check-circle-fill" class="has-text-success" />
+                  Current minimum decryption version
+                </p>
+              {{/if}}
+            </div>
+          </div>
+        </div>
+      </div>
+    {{/each-in}}
+  {{else}}
+    {{#each-in @form.data.keys as |version meta|}}
+      <div class="linked-block list-item-row" data-test-transit-version={{version}}>
+        <div class="columns is-mobile">
+          <div class="column is-3">
+            <div class="level level-left">
+              <Icon @name="history" class="has-text-grey-light is-padded" />
+              <strong class="has-padding is-size-5">Version {{version}}</strong>
+            </div>
+          </div>
+          <div class="column is-4">
+            <div class="td is-borderless">
+              <small class="help has-text-grey">
+                {{date-from-now meta.creation_time addSuffix=true}}
+              </small>
+            </div>
+          </div>
+          <div class="column is-4">
+            <div class="td is-borderless">
+              {{#if (coerce-eq @form.data.min_decryption_version version)}}
+                <p class="help level level-left">
+                  <Icon @name="check-circle-fill" class="has-text-success" />
+                  Current minimum decryption version
+                </p>
+              {{/if}}
+            </div>
+          </div>
+          <div class="column is-1 is-flex-end">
+            <Hds::Dropdown @isInline={{true}} @listPosition="bottom-right" as |dd|>
+              <dd.ToggleIcon
+                @icon="more-horizontal"
+                @text="Public key options"
+                @hasChevron={{false}}
+                data-test-popup-menu-trigger
+              />
+              <dd.CopyItem @text={{meta.public_key}} @copyItemTitle="Copy Public Key" />
+            </Hds::Dropdown>
+          </div>
+        </div>
+      </div>
+    {{/each-in}}
+  {{/if}}
+{{else}}
+  <InfoTableRow @label="Type" @value={{@form.data.type}} />
+  <InfoTableRow
+    @label="Auto-rotation period"
+    @value={{or (format-duration @form.data.auto_rotate_period) "Key will not be automatically rotated"}}
+  />
+  <InfoTableRow @label="Deletion allowed" @value={{stringify @form.data.deletion_allowed}} />
+
+  {{#if @form.data.derived}}
+    <InfoTableRow @label="Derived" @value={{@form.data.derived}} />
+    <InfoTableRow @label="Convergent encryption" @value={{@form.data.convergent_encryption}} />
+  {{/if}}
+{{/if}}

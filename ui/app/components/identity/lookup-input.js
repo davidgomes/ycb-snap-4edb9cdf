@@ -1,0 +1,71 @@
+/**
+ * Copyright IBM Corp. 2016, 2025
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+import { service } from '@ember/service';
+import Component from '@ember/component';
+import { task } from 'ember-concurrency';
+import { underscore } from 'vault/helpers/underscore';
+import AuthMethodResource from 'vault/resources/auth/method';
+
+export default Component.extend({
+  flashMessages: service(),
+  router: service(),
+  api: service(),
+
+  // Public API - either 'entity' or 'group'
+  type: 'entity',
+
+  param: 'alias name',
+  paramValue: null,
+  aliasMountAccessor: null,
+
+  authMethods: null,
+
+  init() {
+    this._super(...arguments);
+    this.api.sys.authListEnabledMethods().then(({ data }) => {
+      const methods = this.api
+        .responseObjectToArray(data, 'path')
+        .map((method) => new AuthMethodResource(method, this));
+      this.set('authMethods', methods);
+      this.set('aliasMountAccessor', methods[0].accessor);
+    });
+  },
+
+  data() {
+    const { param, paramValue, aliasMountAccessor } = this;
+    const data = {};
+
+    data[underscore([param])] = paramValue;
+    if (param === 'alias name') {
+      data.alias_mount_accessor = aliasMountAccessor;
+    }
+    return data;
+  },
+
+  lookup: task(function* () {
+    const flash = this.flashMessages;
+    const type = this.type;
+    const { param, paramValue } = this;
+    let response;
+    try {
+      if (type === 'entity') {
+        response = yield this.api.identity.entityLookUp(this.data());
+      } else {
+        response = yield this.api.identity.groupLookUp(this.data());
+      }
+    } catch (err) {
+      flash.danger(
+        `We encountered an error attempting the ${type} lookup: ${err.message || err.errors.join('')}.`
+      );
+      return;
+    }
+    if (response?.data?.id) {
+      return this.router.transitionTo('vault.cluster.access.identity.show', response.data.id, 'details');
+    } else {
+      flash.danger(`We were unable to find an identity ${type} with a "${param}" of "${paramValue}".`);
+    }
+  }),
+});

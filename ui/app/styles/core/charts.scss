@@ -1,0 +1,93 @@
+@use '../utils/size_variables';
+
+/**
+ * Copyright IBM Corp. 2016, 2025
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+:root {
+  --clients-chart-color-single: var(--token-color-palette-blue-500);
+
+  /* HDS Hue Cycle - Level 200 (Vibrant) */
+
+  --clients-chart-color-first: var(--token-color-palette-blue-200);
+  --clients-chart-color-second: var(--token-color-palette-purple-200);
+  --clients-chart-color-third: var(--token-color-palette-green-200);
+  --clients-chart-color-fourth: var(--token-color-palette-amber-200);
+  --clients-chart-color-fifth: var(--token-color-palette-red-200);
+
+  /* HDS Hue Cycle - Level 400 (Deep) */
+  --clients-chart-color-sixth: var(--token-color-palette-blue-400);
+  --clients-chart-color-seventh: var(--token-color-palette-purple-400);
+  --clients-chart-color-eighth: var(--token-color-palette-green-400);
+  --clients-chart-color-ninth: var(--token-color-palette-amber-400);
+  --clients-chart-color-tenth: var(--token-color-palette-red-400);
+}
+
+$single: var(--clients-chart-color-single);
+// stacked bar chart color scheme
+$first: var(--clients-chart-color-first);
+$second: var(--clients-chart-color-second);
+$third: var(--clients-chart-color-third);
+$fourth: var(--clients-chart-color-fourth);
+
+// Carbon Charts tooltip styling
+.cds--cc--tooltip {
+  background-color: #000;
+  box-shadow: none;
+  color: #fff;
+  font-weight: 700;
+
+  .content-box {
+    color: #fff;
+  }
+}
+
+.carbon-chart-tooltip {
+  background-color: #000;
+  border: 0;
+  box-shadow: none;
+  color: #fff;
+  font-weight: 700;
+  padding: 8px 12px;
+
+  &::before,
+  &::after {
+    background-color: #000;
+    border: 0;
+    box-shadow: none;
+  }
+}
+
+.usage-reporting-chart-tooltip {
+  padding: 8px 12px;
+  background: #000;
+  border: 0;
+  box-shadow: none;
+  color: #fff;
+  display: block;
+  font-weight: var(--token-typography-font-weight-bold);
+}
+
+.cds--cc--tooltip:has(.usage-reporting-chart-tooltip) {
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+}
+
+.usage-reporting-chart-tooltip * {
+  color: inherit;
+  font-weight: inherit;
+}
+
+.usage-reporting-chart-tooltip::before,
+.usage-reporting-chart-tooltip::after {
+  background: #000;
+  border: 0;
+  box-shadow: none;
+}
+
+.usage-reporting-chart-tooltip__label,
+.usage-reporting-chart-tooltip__value {
+  margin: 0;
+}

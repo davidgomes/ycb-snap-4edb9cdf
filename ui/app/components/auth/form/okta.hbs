@@ -1,0 +1,31 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+{{#if this.showNumberChallenge}}
+  <OktaNumberChallenge
+    @correctAnswer={{this.challengeAnswer}}
+    @hasError={{this.oktaVerifyError}}
+    @onReturnToLogin={{this.cancelLogin}}
+  />
+{{else}}
+  <form {{on "submit" this.onSubmit}} data-test-auth-form={{@authType}}>
+
+    {{yield to="namespace"}}
+
+    <div class="has-padding-l">
+      {{yield to="back"}}
+      {{yield to="authSelectOptions"}}
+      {{yield to="error"}}
+
+      <Auth::Fields @loginFields={{this.loginFields}} />
+
+      {{yield to="advancedSettings"}}
+
+      <Auth::SignInButton @text="Sign in" @icon={{if (or this.login.isRunning @loginTransitionIsRunning) "loading"}} />
+
+      {{yield to="footer"}}
+    </div>
+  </form>
+{{/if}}

@@ -1,0 +1,1543 @@
+// Copyright IBM Corp. 2016, 2025
+// SPDX-License-Identifier: BUSL-1.1
+
+package vault
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"net/http"
+	"slices"
+	"strings"
+
+	"github.com/golang/protobuf/ptypes"
+	hclog "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/go-memdb"
+	"github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/go-secure-stdlib/strutil"
+	"github.com/hashicorp/vault/helper/identity"
+	"github.com/hashicorp/vault/helper/identity/mfa"
+	"github.com/hashicorp/vault/helper/namespace"
+	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/helper/consts"
+	"github.com/hashicorp/vault/sdk/logical"
+	"google.golang.org/protobuf/types/known/timestamppb"
+)
+
+func entityPathFields() map[string]*framework.FieldSchema {
+	return map[string]*framework.FieldSchema{
+		"id": {
+			Type:        framework.TypeString,
+			Description: "ID of the entity. If set, updates the corresponding existing entity.",
+		},
+		"name": {
+			Type:        framework.TypeString,
+			Description: "Name of the entity",
+		},
+		"external_id": {
+			Type:        framework.TypeString,
+			Description: "External ID of the entity",
+		},
+		"scim_client_id": {
+			Type:        framework.TypeString,
+			Description: "SCIM Client ID of the entity",
+		},
+		"metadata": {
+			Type: framework.TypeKVPairs,
+			Description: `Metadata to be associated with the entity.
+In CLI, this parameter can be repeated multiple times, and it all gets merged together.
+For example:
+vault <command> <path> metadata=key1=value1 metadata=key2=value2
+					`,
+		},
+		"policies": {
+			Type:        framework.TypeCommaStringSlice,
+			Description: "Policies to be tied to the entity.",
+		},
+		"disabled": {
+			Type:        framework.TypeBool,
+			Description: "If set true, tokens tied to this identity will not be able to be used (but will not be revoked).",
+		},
+	}
+}
+
+// entityPaths returns the API endpoints supported to operate on entities.
+// Following are the paths supported:
+// entity - To register a new entity
+// entity/id - To lookup, modify, delete and list entities based on ID
+// entity/merge - To merge entities based on ID
+func entityPaths(i *IdentityStore) []*framework.Path {
+	return []*framework.Path{
+		{
+			Pattern: "entity$",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "entity",
+				OperationVerb:   "create",
+			},
+
+			Fields: entityPathFields(),
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback: i.handleEntityUpdateCommon(),
+				},
+			},
+
+			HelpSynopsis:    strings.TrimSpace(entityHelp["entity"][0]),
+			HelpDescription: strings.TrimSpace(entityHelp["entity"][1]),
+		},
+		{
+			Pattern: "entity/name/(?P<name>.+)",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "entity",
+				OperationSuffix: "by-name",
+			},
+
+			Fields: entityPathFields(),
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback: i.handleEntityNameUpdateCommon(),
+					DisplayAttrs: &framework.DisplayAttributes{
+						OperationVerb: "update",
+					},
+				},
+				logical.ReadOperation: &framework.PathOperation{
+					Callback: i.pathEntityNameRead(),
+					DisplayAttrs: &framework.DisplayAttributes{
+						OperationVerb: "read",
+					},
+				},
+				logical.DeleteOperation: &framework.PathOperation{
+					Callback: i.pathEntityNameDelete(),
+					DisplayAttrs: &framework.DisplayAttributes{
+						OperationVerb: "delete",
+					},
+				},
+			},
+
+			HelpSynopsis:    strings.TrimSpace(entityHelp["entity-name"][0]),
+			HelpDescription: strings.TrimSpace(entityHelp["entity-name"][1]),
+		},
+		{
+			Pattern: "entity/id/" + framework.GenericNameRegex("id"),
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "entity",
+				OperationSuffix: "by-id",
+			},
+
+			Fields: entityPathFields(),
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback: i.handleEntityIDUpdateCommon(),
+					DisplayAttrs: &framework.DisplayAttributes{
+						OperationVerb: "update",
+					},
+				},
+				logical.ReadOperation: &framework.PathOperation{
+					Callback: i.pathEntityIDRead(),
+					DisplayAttrs: &framework.DisplayAttributes{
+						OperationVerb: "read",
+					},
+				},
+				logical.DeleteOperation: &framework.PathOperation{
+					Callback: i.pathEntityIDDelete(),
+					DisplayAttrs: &framework.DisplayAttributes{
+						OperationVerb: "delete",
+					},
+				},
+			},
+
+			HelpSynopsis:    strings.TrimSpace(entityHelp["entity-id"][0]),
+			HelpDescription: strings.TrimSpace(entityHelp["entity-id"][1]),
+		},
+		{
+			Pattern: "entity/batch-delete",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "entity",
+				OperationVerb:   "batch-delete",
+			},
+
+			Fields: map[string]*framework.FieldSchema{
+				"entity_ids": {
+					Type:        framework.TypeCommaStringSlice,
+					Description: "Entity IDs to delete",
+				},
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback: i.handleEntityBatchDelete(),
+				},
+			},
+
+			HelpSynopsis:    strings.TrimSpace(entityHelp["batch-delete"][0]),
+			HelpDescription: strings.TrimSpace(entityHelp["batch-delete"][1]),
+		},
+		{
+			Pattern: "entity/name/?$",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "entity",
+				OperationSuffix: "by-name",
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.ListOperation: &framework.PathOperation{
+					Callback: i.pathEntityNameList(),
+				},
+			},
+
+			HelpSynopsis:    strings.TrimSpace(entityHelp["entity-name-list"][0]),
+			HelpDescription: strings.TrimSpace(entityHelp["entity-name-list"][1]),
+		},
+		{
+			Pattern: "entity/id/?$",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "entity",
+				OperationSuffix: "by-id",
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.ListOperation: &framework.PathOperation{
+					Callback: i.pathEntityIDList(),
+					Responses: map[int][]framework.Response{
+						http.StatusOK: {{
+							Description: "OK",
+							Fields: map[string]*framework.FieldSchema{
+								"keys": {
+									Type:        framework.TypeStringSlice,
+									Description: `A list of  entity ids`,
+									Required:    true,
+								},
+								"key_info": {
+									Type:        framework.TypeMap,
+									Description: `Entity details keyed by the entity id`,
+									Required:    false,
+								},
+							},
+						}},
+					},
+				},
+			},
+
+			HelpSynopsis:    strings.TrimSpace(entityHelp["entity-id-list"][0]),
+			HelpDescription: strings.TrimSpace(entityHelp["entity-id-list"][1]),
+		},
+		{
+			Pattern: "entity/merge/?$",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: "entity",
+				OperationVerb:   "merge",
+			},
+
+			Fields: map[string]*framework.FieldSchema{
+				"from_entity_ids": {
+					Type:        framework.TypeCommaStringSlice,
+					Description: "Entity IDs which need to get merged",
+				},
+				"to_entity_id": {
+					Type:        framework.TypeString,
+					Description: "Entity ID into which all the other entities need to get merged",
+				},
+				"conflicting_alias_ids_to_keep": {
+					Type:        framework.TypeCommaStringSlice,
+					Description: "Alias IDs to keep in case of conflicting aliases. Ignored if no conflicting aliases found",
+				},
+				"force": {
+					Type:        framework.TypeBool,
+					Description: "Setting this will follow the 'mine' strategy for merging MFA secrets. If there are secrets of the same type both in entities that are merged from and in entity into which all others are getting merged, secrets in the destination will be unaltered. If not set, this API will throw an error containing all the conflicts.",
+				},
+			},
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback:                  i.pathEntityMergeID(),
+					ForwardPerformanceStandby: true,
+				},
+			},
+
+			HelpSynopsis:    strings.TrimSpace(entityHelp["entity-merge-id"][0]),
+			HelpDescription: strings.TrimSpace(entityHelp["entity-merge-id"][1]),
+		},
+	}
+}
+
+// pathEntityMergeID merges two or more entities into a single entity
+func (i *IdentityStore) pathEntityMergeID() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+		toEntityIDInterface, ok := d.GetOk("to_entity_id")
+		if !ok || toEntityIDInterface == "" {
+			return logical.ErrorResponse("missing entity id to merge to"), nil
+		}
+		toEntityID := toEntityIDInterface.(string)
+
+		fromEntityIDsInterface, ok := d.GetOk("from_entity_ids")
+		if !ok || len(fromEntityIDsInterface.([]string)) == 0 {
+			return logical.ErrorResponse("missing entity ids to merge from"), nil
+		}
+		fromEntityIDs := fromEntityIDsInterface.([]string)
+
+		var conflictingAliasIDsToKeep []string
+		if conflictingAliasIDsToKeepInterface, ok := d.GetOk("conflicting_alias_ids_to_keep"); ok {
+			conflictingAliasIDsToKeep = conflictingAliasIDsToKeepInterface.([]string)
+		}
+
+		var force bool
+		if forceInterface, ok := d.GetOk("force"); ok {
+			force = forceInterface.(bool)
+		}
+
+		// Create a MemDB transaction to merge entities
+		i.lock.Lock()
+		defer i.lock.Unlock()
+
+		txn := i.db.Txn(true)
+		defer txn.Abort()
+
+		toEntity, err := i.MemDBEntityByIDInTxn(txn, toEntityID, true)
+		if err != nil {
+			return nil, err
+		}
+
+		// Merging SCIM-managed entities via the API is not allowed.
+		if toEntity != nil && toEntity.ScimClientID != "" {
+			return logical.ErrorResponse("SCIM-managed resources must be modified through SCIM, cannot target to_entity %s", toEntity.ID), logical.ErrPermissionDenied
+		}
+		for _, fromEntityID := range fromEntityIDs {
+			fromEntity, err := i.MemDBEntityByIDInTxn(txn, fromEntityID, false)
+			if err != nil {
+				return nil, err
+			}
+			// non-existent fromEntity validation is handled in mergeEntity
+			if fromEntity != nil && fromEntity.ScimClientID != "" {
+				return logical.ErrorResponse("SCIM-managed resources must be modified through SCIM, cannot target from_entity %s", fromEntity.ID), logical.ErrPermissionDenied
+			}
+		}
+
+		userErr, intErr, aliases := i.mergeEntity(ctx, txn, toEntity, fromEntityIDs, conflictingAliasIDsToKeep, force, false, false, true, false)
+		if userErr != nil {
+			// Not an error due to alias clash, return like normal
+			if len(aliases) == 0 {
+				return logical.ErrorResponse(userErr.Error()), nil
+			}
+			// Alias clash error, so include additional details
+			return logical.ErrorResponseWithData(aliases, userErr.Error()), nil
+		}
+		if intErr != nil {
+			return nil, intErr
+		}
+
+		// Committing the transaction *after* successfully performing storage
+		// persistence
+		txn.Commit()
+
+		return nil, nil
+	}
+}
+
+// handleEntityUpdateCommon is used to update an entity
+func (i *IdentityStore) handleEntityUpdateCommon() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+		i.lock.Lock()
+		defer i.lock.Unlock()
+		return i.EntityUpdateCommon(ctx, d)
+	}
+}
+
+// handleEntityNameUpdateCommon is used to update an entity via the name path.
+func (i *IdentityStore) handleEntityNameUpdateCommon() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+		i.lock.Lock()
+		defer i.lock.Unlock()
+		return i.EntityNameUpdateCommon(ctx, d)
+	}
+}
+
+// handleEntityIDUpdateCommon is used to update an entity via the id path.
+func (i *IdentityStore) handleEntityIDUpdateCommon() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+		i.lock.Lock()
+		defer i.lock.Unlock()
+		return i.EntityIDUpdateCommon(ctx, d)
+	}
+}
+
+// pathEntityNameRead returns the properties of an entity for a given entity ID
+func (i *IdentityStore) pathEntityNameRead() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+		entityName := d.Get("name").(string)
+		if entityName == "" {
+			return logical.ErrorResponse("missing entity name"), nil
+		}
+
+		entity, err := i.MemDBEntityByName(ctx, entityName, false)
+		if err != nil {
+			return nil, err
+		}
+		if entity == nil {
+			return nil, nil
+		}
+
+		return i.handleEntityReadCommon(ctx, entity)
+	}
+}
+
+// pathEntityIDRead returns the properties of an entity for a given entity ID
+func (i *IdentityStore) pathEntityIDRead() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+		entityID := d.Get("id").(string)
+		if entityID == "" {
+			return logical.ErrorResponse("missing entity id"), nil
+		}
+
+		entity, err := i.MemDBEntityByID(entityID, false)
+		if err != nil {
+			return nil, err
+		}
+		if entity == nil {
+			return nil, nil
+		}
+
+		return i.handleEntityReadCommon(ctx, entity)
+	}
+}
+
+func (i *IdentityStore) handleEntityReadCommon(ctx context.Context, entity *identity.Entity) (*logical.Response, error) {
+	ns, err := namespace.FromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if ns.ID != entity.NamespaceID {
+		return nil, nil
+	}
+
+	respData := map[string]interface{}{}
+	respData["id"] = entity.ID
+	respData["name"] = entity.Name
+	respData["metadata"] = entity.Metadata
+	respData["merged_entity_ids"] = entity.MergedEntityIDs
+	respData["policies"] = strutil.RemoveDuplicates(entity.Policies, false)
+	respData["disabled"] = entity.Disabled
+	respData["namespace_id"] = entity.NamespaceID
+
+	// Convert protobuf timestamp into RFC3339 format
+	respData["creation_time"] = ptypes.TimestampString(entity.CreationTime)
+	respData["last_update_time"] = ptypes.TimestampString(entity.LastUpdateTime)
+
+	// Convert each alias into a map and replace the time format in each
+	aliasesToReturn := make([]interface{}, len(entity.Aliases))
+	for aliasIdx, alias := range entity.Aliases {
+		aliasMap := map[string]interface{}{}
+		aliasMap["id"] = alias.ID
+		aliasMap["canonical_id"] = alias.CanonicalID
+		aliasMap["mount_accessor"] = alias.MountAccessor
+		aliasMap["metadata"] = alias.Metadata
+		aliasMap["name"] = alias.Name
+		aliasMap["merged_from_canonical_ids"] = alias.MergedFromCanonicalIDs
+		aliasMap["creation_time"] = ptypes.TimestampString(alias.CreationTime)
+		aliasMap["last_update_time"] = ptypes.TimestampString(alias.LastUpdateTime)
+		aliasMap["local"] = alias.Local
+		aliasMap["custom_metadata"] = alias.CustomMetadata
+
+		if i.scimEnabled {
+			aliasMap["scim_client_id"] = alias.ScimClientID
+		}
+
+		if mountValidationResp := i.router.ValidateMountByAccessor(alias.MountAccessor); mountValidationResp != nil {
+			aliasMap["mount_type"] = mountValidationResp.MountType
+			aliasMap["mount_path"] = mountValidationResp.MountPath
+		}
+
+		aliasesToReturn[aliasIdx] = aliasMap
+	}
+
+	// Add the aliases information to the response which has the correct time
+	// formats
+	respData["aliases"] = aliasesToReturn
+
+	if i.scimEnabled {
+		respData["scim_client_id"] = entity.ScimClientID
+	}
+
+	addExtraEntityDataToResponse(entity, respData)
+
+	// Fetch the groups this entity belongs to and return their identifiers
+	groups, inheritedGroups, err := i.groupsByEntityID(entity.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	groupIDs := make([]string, len(groups))
+	for i, group := range groups {
+		groupIDs[i] = group.ID
+	}
+	respData["direct_group_ids"] = groupIDs
+
+	inheritedGroupIDs := make([]string, len(inheritedGroups))
+	for i, group := range inheritedGroups {
+		inheritedGroupIDs[i] = group.ID
+	}
+	respData["inherited_group_ids"] = inheritedGroupIDs
+
+	respData["group_ids"] = append(groupIDs, inheritedGroupIDs...)
+
+	return &logical.Response{
+		Data: respData,
+	}, nil
+}
+
+// pathEntityIDDelete deletes the entity for a given entity ID
+func (i *IdentityStore) pathEntityIDDelete() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+		entityID := d.Get("id").(string)
+		if entityID == "" {
+			return logical.ErrorResponse("missing entity id"), nil
+		}
+
+		i.lock.Lock()
+		defer i.lock.Unlock()
+
+		// Create a MemDB transaction to delete entity
+		txn := i.db.Txn(true)
+		defer txn.Abort()
+
+		// Fetch the entity using its ID
+		entity, err := i.MemDBEntityByIDInTxn(txn, entityID, true)
+		if err != nil {
+			return nil, err
+		}
+		if entity == nil {
+			return nil, nil
+		}
+
+		err = i.handleEntityDeleteCommon(ctx, txn, entity, true)
+		if err != nil {
+			return nil, err
+		}
+
+		txn.Commit()
+
+		return nil, nil
+	}
+}
+
+// pathEntityNameDelete deletes the entity for a given entity ID
+func (i *IdentityStore) pathEntityNameDelete() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+		entityName := d.Get("name").(string)
+		if entityName == "" {
+			return logical.ErrorResponse("missing entity name"), nil
+		}
+
+		i.lock.Lock()
+		defer i.lock.Unlock()
+
+		// Create a MemDB transaction to delete entity
+		txn := i.db.Txn(true)
+		defer txn.Abort()
+
+		// Fetch the entity using its name
+		entity, err := i.MemDBEntityByNameInTxn(ctx, txn, entityName, true)
+		if err != nil {
+			return nil, err
+		}
+		// If there is no entity for the ID, do nothing
+		if entity == nil {
+			return nil, nil
+		}
+
+		ns, err := namespace.FromContext(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if entity.NamespaceID != ns.ID {
+			return nil, nil
+		}
+
+		err = i.handleEntityDeleteCommon(ctx, txn, entity, true)
+		if err != nil {
+			return nil, err
+		}
+
+		txn.Commit()
+
+		return nil, nil
+	}
+}
+
+// pathEntityIDDelete deletes the entity for a given entity ID
+func (i *IdentityStore) handleEntityBatchDelete() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+		entityIDs := d.Get("entity_ids").([]string)
+		if len(entityIDs) == 0 {
+			return logical.ErrorResponse("missing entity ids to delete"), nil
+		}
+
+		// Sort the ids by the bucket they will be deleted from
+		byBucket := make(map[string]map[string]struct{})
+		for _, id := range entityIDs {
+			bucketKey := i.entityPacker.BucketKey(id)
+
+			bucket, ok := byBucket[bucketKey]
+			if !ok {
+				bucket = make(map[string]struct{})
+				byBucket[bucketKey] = bucket
+			}
+
+			bucket[id] = struct{}{}
+		}
+
+		deleteIdsForBucket := func(entityIDs []string) error {
+			i.lock.Lock()
+			defer i.lock.Unlock()
+
+			ns, err := namespace.FromContext(ctx)
+			if err != nil {
+				return err
+			}
+
+			// Create a MemDB transaction to delete entities from the inmem database
+			// without altering storage. Batch deletion on storage bucket items is
+			// performed directly through entityPacker.
+			txn := i.db.Txn(true)
+			defer txn.Abort()
+
+			// Storage buckets are shared across namespaces and keyed only by entity
+			// ID, so deleting a caller-supplied ID that belongs to another namespace
+			// would destroy that entity's storage. Restrict deletion to entities in
+			// the request's namespace and hand only those IDs to the packer.
+			idsToDelete := make([]string, 0, len(entityIDs))
+			for _, entityID := range entityIDs {
+				// Fetch the entity using its ID
+				entity, err := i.MemDBEntityByIDInTxn(txn, entityID, true)
+				if err != nil {
+					return err
+				}
+				if entity == nil {
+					continue
+				}
+				if entity.NamespaceID != ns.ID {
+					continue
+				}
+
+				err = i.handleEntityDeleteCommon(ctx, txn, entity, false)
+				if err != nil {
+					return err
+				}
+				idsToDelete = append(idsToDelete, entityID)
+			}
+
+			// Write all updates for this bucket.
+			err = i.entityPacker.DeleteMultipleItems(ctx, i.logger, idsToDelete)
+			if err != nil {
+				return err
+			}
+
+			txn.Commit()
+			return nil
+		}
+
+		for _, bucket := range byBucket {
+			ids := make([]string, len(bucket))
+			i := 0
+			for id := range bucket {
+				ids[i] = id
+				i++
+			}
+
+			err := deleteIdsForBucket(ids)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		return nil, nil
+	}
+}
+
+// handleEntityDeleteCommon deletes an entity by removing it from groups of
+// which it's a member and then, if update is true, deleting the entity itself.
+func (i *IdentityStore) handleEntityDeleteCommon(ctx context.Context, txn *memdb.Txn, entity *identity.Entity, update bool) error {
+	ns, err := namespace.FromContext(ctx)
+	if err != nil {
+		return err
+	}
+	if entity.NamespaceID != ns.ID {
+		return nil
+	}
+	scimClientID := scimClientIDFromContext(ctx)
+	if entity.ScimClientID != scimClientID {
+		return errors.New("SCIM-managed resources must be modified through SCIM")
+	}
+	// Remove entity ID as a member from all the groups it belongs, both
+	// internal and external
+	groups, err := i.MemDBGroupsByMemberEntityIDInTxn(txn, entity.ID, true, false)
+	if err != nil {
+		return err
+	}
+
+	for _, group := range groups {
+		group.MemberEntityIDs = strutil.StrListDelete(group.MemberEntityIDs, entity.ID)
+		err = i.UpsertGroupInTxn(ctx, txn, group, true)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Delete all the aliases in the entity and the respective indexes
+	err = i.deleteAliasesInEntityInTxn(txn, entity, entity.Aliases)
+	if err != nil {
+		return err
+	}
+
+	// Delete the entity using the same transaction
+	err = i.MemDBDeleteEntityByIDInTxn(txn, entity.ID)
+	if err != nil {
+		return err
+	}
+
+	if update {
+		// Delete the entity from storage
+		err = i.entityPacker.DeleteItem(ctx, entity.ID)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (i *IdentityStore) pathEntityIDList() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+		return i.handlePathEntityListCommon(ctx, req, d, true)
+	}
+}
+
+func (i *IdentityStore) pathEntityNameList() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+		return i.handlePathEntityListCommon(ctx, req, d, false)
+	}
+}
+
+// handlePathEntityListCommon lists the IDs or names of all the valid entities
+// in the identity store
+func (i *IdentityStore) handlePathEntityListCommon(ctx context.Context, req *logical.Request, d *framework.FieldData, byID bool) (*logical.Response, error) {
+	ns, err := namespace.FromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	ws := memdb.NewWatchSet()
+
+	txn := i.db.Txn(false)
+
+	iter, err := txn.Get(entitiesTable, "namespace_id", ns.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch iterator for entities in memdb: %w", err)
+	}
+
+	ws.Add(iter.WatchCh())
+
+	var keys []string
+	entityInfo := map[string]interface{}{}
+
+	type mountInfo struct {
+		MountType string
+		MountPath string
+	}
+	mountAccessorMap := map[string]mountInfo{}
+
+	for {
+		// Check for timeouts
+		select {
+		case <-ctx.Done():
+			resp := logical.ListResponseWithInfo(keys, entityInfo)
+			resp.AddWarning("partial response due to timeout")
+			return resp, nil
+		default:
+			break
+		}
+
+		raw := iter.Next()
+		if raw == nil {
+			break
+		}
+		entity := raw.(*identity.Entity)
+		if byID {
+			keys = append(keys, entity.ID)
+		} else {
+			keys = append(keys, entity.Name)
+		}
+		entityInfoEntry := map[string]interface{}{
+			"name":             entity.Name,
+			"creation_time":    ptypes.TimestampString(entity.CreationTime),
+			"last_update_time": ptypes.TimestampString(entity.LastUpdateTime),
+			"disabled":         entity.Disabled,
+		}
+		if len(entity.Aliases) > 0 {
+			aliasList := make([]interface{}, 0, len(entity.Aliases))
+			for _, alias := range entity.Aliases {
+				entry := map[string]interface{}{
+					"id":               alias.ID,
+					"name":             alias.Name,
+					"mount_accessor":   alias.MountAccessor,
+					"creation_time":    ptypes.TimestampString(alias.CreationTime),
+					"last_update_time": ptypes.TimestampString(alias.LastUpdateTime),
+				}
+
+				mi, ok := mountAccessorMap[alias.MountAccessor]
+				if ok {
+					entry["mount_type"] = mi.MountType
+					entry["mount_path"] = mi.MountPath
+				} else {
+					mi = mountInfo{}
+					if mountValidationResp := i.router.ValidateMountByAccessor(alias.MountAccessor); mountValidationResp != nil {
+						mi.MountType = mountValidationResp.MountType
+						mi.MountPath = mountValidationResp.MountPath
+						entry["mount_type"] = mi.MountType
+						entry["mount_path"] = mi.MountPath
+					}
+					mountAccessorMap[alias.MountAccessor] = mi
+				}
+
+				aliasList = append(aliasList, entry)
+			}
+			entityInfoEntry["aliases"] = aliasList
+		}
+		entityInfo[entity.ID] = entityInfoEntry
+	}
+
+	return logical.ListResponseWithInfo(keys, entityInfo), nil
+}
+
+func (i *IdentityStore) mergeEntityAsPartOfUpsert(ctx context.Context, txn *memdb.Txn, toEntity *identity.Entity, fromEntityID string, persist bool) (error, error) {
+	err1, err2, _ := i.mergeEntity(ctx, txn, toEntity, []string{fromEntityID}, []string{}, true, false, true, persist, true)
+	return err1, err2
+}
+
+// A small type to return useful information to the UI after an entity clash
+// Every alias involved in a clash will be returned.
+type aliasClashInformation struct {
+	Alias     string `json:"alias"`
+	Entity    string `json:"entity"`
+	EntityId  string `json:"entity_id"`
+	Mount     string `json:"mount"`
+	MountPath string `json:"mount_path"`
+}
+
+func (i *IdentityStore) mergeEntity(ctx context.Context, txn *memdb.Txn, toEntity *identity.Entity, fromEntityIDs, conflictingAliasIDsToKeep []string, force, grabLock, mergePolicies, persist, forceMergeAliases bool) (error, error, []aliasClashInformation) {
+	if grabLock {
+		i.lock.Lock()
+		defer i.lock.Unlock()
+	}
+
+	if toEntity == nil {
+		return errors.New("entity id to merge to is invalid"), nil, nil
+	}
+
+	ns, err := namespace.FromContext(ctx)
+	if err != nil {
+		return nil, err, nil
+	}
+	if toEntity.NamespaceID != ns.ID {
+		return errors.New("entity id to merge into does not belong to the request's namespace"), nil, nil
+	}
+
+	if len(fromEntityIDs) > 1 && len(conflictingAliasIDsToKeep) > 1 {
+		return errors.New("aliases conflicts cannot be resolved with multiple from entity ids - merge one entity at a time"), nil, nil
+	}
+
+	sanitizedFromEntityIDs := strutil.RemoveDuplicates(fromEntityIDs, false)
+
+	// A map to check if there are any clashes between mount accessors for any of the sanitizedFromEntityIDs
+	fromEntityAccessors := make(map[string]string)
+
+	// A list detailing all aliases where a clash has occurred, so that the error
+	// can be understood by the UI
+	aliasesInvolvedInClashes := make([]aliasClashInformation, 0)
+
+	// An error detailing if any alias clashes happen (shared mount accessor)
+	var aliasClashError error
+
+	for _, fromEntityID := range sanitizedFromEntityIDs {
+		if fromEntityID == toEntity.ID {
+			return errors.New("to_entity_id should not be present in from_entity_ids"), nil, nil
+		}
+
+		fromEntity, err := i.MemDBEntityByIDInTxn(txn, fromEntityID, false)
+		if err != nil {
+			return nil, err, nil
+		}
+
+		if fromEntity == nil {
+			// If forceMergeAliases is true, and we didn't find a fromEntity, then something
+			// is wrong with storage. This function was called as part of an automated
+			// merge from CreateOrFetchEntity or Invalidate to repatriate an alias with its 'true'
+			// entity. As a result, the entity _should_ exist, but we can't find it.
+			// MemDb may be in a bad state, because fromEntity should be non-nil in the
+			// automated merge case.
+			if forceMergeAliases {
+				return fmt.Errorf("fromEntity %s was not found in memdb as part of an automated entity merge into %s; storage/memdb may be in a bad state", fromEntityID, toEntity.ID), nil, nil
+			}
+			return errors.New("entity id to merge from is invalid"), nil, nil
+		}
+
+		if fromEntity.NamespaceID != toEntity.NamespaceID {
+			return errors.New("entity id to merge from does not belong to this namespace"), nil, nil
+		}
+
+		// If we're not resolving a conflict, we check to see if
+		// any aliases conflict between the toEntity and this fromEntity:
+		if !forceMergeAliases && len(conflictingAliasIDsToKeep) == 0 {
+			for _, toAlias := range toEntity.Aliases {
+				for _, fromAlias := range fromEntity.Aliases {
+					// First, check to see if this alias clashes with an alias from any of the other fromEntities:
+					id, mountAccessorInAnotherFromEntity := fromEntityAccessors[fromAlias.MountAccessor]
+					if mountAccessorInAnotherFromEntity && (id != fromEntityID) {
+						return fmt.Errorf("mount accessor %s found in multiple fromEntities, merge should be done with one fromEntity at a time", fromAlias.MountAccessor), nil, nil
+					}
+
+					fromEntityAccessors[fromAlias.MountAccessor] = fromEntityID
+
+					// If it doesn't, check if it clashes with the toEntities
+					if toAlias.MountAccessor == fromAlias.MountAccessor {
+						if aliasClashError == nil {
+							aliasClashError = multierror.Append(aliasClashError, fmt.Errorf("toEntity and at least one fromEntity have aliases with the same mount accessor, repeat the merge request specifying exactly one fromEntity, clashes: "))
+						}
+						aliasClashError = multierror.Append(aliasClashError,
+							fmt.Errorf("mountAccessor: %s, toEntity ID: %s, fromEntity ID: %s, conflicting toEntity alias ID: %s, conflicting fromEntity alias ID: %s",
+								toAlias.MountAccessor, toEntity.ID, fromEntityID, toAlias.ID, fromAlias.ID))
+
+						var toAliasMountType string
+						var toAliasMountPath string
+						mountValidationRespToAlias := i.router.ValidateMountByAccessor(toAlias.MountAccessor)
+						if mountValidationRespToAlias != nil {
+							toAliasMountType = mountValidationRespToAlias.MountType
+							toAliasMountPath = mountValidationRespToAlias.MountPath
+						}
+
+						var fromAliasMountType string
+						var fromAliasMountPath string
+						mountValidationRespFromAlias := i.router.ValidateMountByAccessor(fromAlias.MountAccessor)
+						if mountValidationRespFromAlias != nil {
+							fromAliasMountType = mountValidationRespFromAlias.MountType
+							fromAliasMountPath = mountValidationRespFromAlias.MountPath
+						}
+
+						// Also add both to our summary of all clashes:
+						aliasesInvolvedInClashes = append(aliasesInvolvedInClashes, aliasClashInformation{
+							Entity:    toEntity.Name,
+							EntityId:  toEntity.ID,
+							Alias:     toAlias.Name,
+							Mount:     toAliasMountType,
+							MountPath: toAliasMountPath,
+						})
+						aliasesInvolvedInClashes = append(aliasesInvolvedInClashes, aliasClashInformation{
+							Entity:    fromEntity.Name,
+							EntityId:  fromEntityID,
+							Alias:     fromAlias.Name,
+							Mount:     fromAliasMountType,
+							MountPath: fromAliasMountPath,
+						})
+					}
+				}
+			}
+		}
+
+		for configID, configSecret := range fromEntity.MFASecrets {
+			_, ok := toEntity.MFASecrets[configID]
+			if ok && !force {
+				return nil, fmt.Errorf("conflicting MFA config ID %q in entity ID %q", configID, fromEntity.ID), nil
+			} else {
+				if toEntity.MFASecrets == nil {
+					toEntity.MFASecrets = make(map[string]*mfa.Secret)
+				}
+				toEntity.MFASecrets[configID] = configSecret
+			}
+		}
+	}
+
+	// Check alias clashes after validating every fromEntity, so that we have a full list of errors
+	if aliasClashError != nil {
+		return aliasClashError, nil, aliasesInvolvedInClashes
+	}
+
+	isPerfSecondaryOrStandby := i.localNode.ReplicationState().HasState(consts.ReplicationPerformanceSecondary) ||
+		i.localNode.HAState() == consts.PerfStandby
+	var fromEntityGroups []*identity.Group
+
+	toEntityAccessors := make(map[string][]string)
+	for _, alias := range toEntity.Aliases {
+		if accessors, ok := toEntityAccessors[alias.MountAccessor]; !ok {
+			// While it is not supported to have multiple aliases with the same mount accessor in one entity
+			// we do not strictly enforce the invariant. Thus, we account for multiple just to be safe
+			if accessors == nil {
+				toEntityAccessors[alias.MountAccessor] = []string{alias.ID}
+			} else {
+				toEntityAccessors[alias.MountAccessor] = append(accessors, alias.ID)
+			}
+		}
+	}
+
+	for _, fromEntityID := range sanitizedFromEntityIDs {
+		if fromEntityID == toEntity.ID {
+			return errors.New("to_entity_id should not be present in from_entity_ids"), nil, nil
+		}
+
+		fromEntity, err := i.MemDBEntityByIDInTxn(txn, fromEntityID, true)
+		if err != nil {
+			return nil, err, nil
+		}
+
+		if fromEntity == nil {
+			// If forceMergeAliases is true, and we didn't find a fromEntity, then something
+			// is wrong with storage. This function was called as part of an automated
+			// merge from CreateOrFetchEntity or Invalidate to repatriate an alias with its 'true'
+			// entity. As a result, the entity _should_ exist, but we can't find it.
+			// MemDb may be in a bad state, because fromEntity should be non-nil in the
+			// automated merge case.
+			if forceMergeAliases {
+				return fmt.Errorf("fromEntity %s was not found in memdb as part of an automated entity merge into %s; storage/memdb may be in a bad state", fromEntityID, toEntity.ID), nil, nil
+			}
+			return errors.New("entity id to merge from is invalid"), nil, nil
+		}
+
+		if fromEntity.NamespaceID != toEntity.NamespaceID {
+			return errors.New("entity id to merge from does not belong to this namespace"), nil, nil
+		}
+
+		for _, fromAlias := range fromEntity.Aliases {
+			// We're going to modify this alias but it's still a pointer to the one in
+			// MemDB that could be being read by other goroutines even though we might
+			// be removing from MemDB really shortly...
+			fromAlias, err = fromAlias.Clone()
+			if err != nil {
+				return nil, err, nil
+			}
+			// If true, we need to handle conflicts (conflict = both aliases share the same mount accessor)
+			if toAliasIds, ok := toEntityAccessors[fromAlias.MountAccessor]; ok {
+				for _, toAliasId := range toAliasIds {
+					// When forceMergeAliases is true (as part of the merge-during-upsert case), we make the decision
+					// for the user, and keep the from_entity alias
+					// This case's code is the same as when the user selects to keep the from_entity alias
+					// but is kept separate for clarity.
+					if forceMergeAliases {
+						i.logger.Info("Deleting to_entity alias during entity merge", "to_entity", toEntity.ID, "deleted_alias", toAliasId)
+						err := i.MemDBDeleteAliasByIDInTxn(txn, toAliasId, false)
+						if err != nil {
+							return nil, fmt.Errorf("aborting entity merge - failed to delete orphaned alias %q during merge into entity %q: %w", toAliasId, toEntity.ID, err), nil
+						}
+						// Remove the alias from the entity's list in memory too!
+						toEntity.DeleteAliasByID(toAliasId)
+					} else if strutil.StrListContains(conflictingAliasIDsToKeep, toAliasId) {
+						i.logger.Info("Deleting from_entity alias during entity merge", "from_entity", fromEntityID, "deleted_alias", fromAlias.ID)
+						err := i.MemDBDeleteAliasByIDInTxn(txn, fromAlias.ID, false)
+						if err != nil {
+							return nil, fmt.Errorf("aborting entity merge - failed to delete orphaned alias %q during merge into entity %q: %w", fromAlias.ID, toEntity.ID, err), nil
+						}
+						// Don't need to alter toEntity aliases since we it never contained
+						// the alias we're deleting.
+
+						// Continue to next alias, as there's no alias to merge left in the from_entity
+						continue
+					} else if strutil.StrListContains(conflictingAliasIDsToKeep, fromAlias.ID) {
+						i.logger.Info("Deleting to_entity alias during entity merge", "to_entity", toEntity.ID, "deleted_alias", toAliasId)
+						err := i.MemDBDeleteAliasByIDInTxn(txn, toAliasId, false)
+						if err != nil {
+							return nil, fmt.Errorf("aborting entity merge - failed to delete orphaned alias %q during merge into entity %q: %w", toAliasId, toEntity.ID, err), nil
+						}
+						// Remove the alias from the entity's list in memory too!
+						toEntity.DeleteAliasByID(toAliasId)
+					} else {
+						return fmt.Errorf("conflicting mount accessors in following alias IDs and neither were present in conflicting_alias_ids_to_keep: %s, %s", fromAlias.ID, toAliasId), nil, nil
+					}
+				}
+			}
+
+			// Set the desired canonical ID
+			fromAlias.CanonicalID = toEntity.ID
+
+			fromAlias.MergedFromCanonicalIDs = append(fromAlias.MergedFromCanonicalIDs, fromEntity.ID)
+
+			// We don't insert into MemDB right now because we'll do that for all the
+			// aliases we want to end up with at the end to ensure they are inserted
+			// in the same order as when they load from storage next time.
+
+			// Add the alias to the desired entity
+			toEntity.UpsertAlias(fromAlias)
+		}
+
+		// If told to, merge policies
+		if mergePolicies {
+			toEntity.Policies = strutil.RemoveDuplicates(strutil.MergeSlices(toEntity.Policies, fromEntity.Policies), false)
+		}
+
+		// If the entity from which we are merging from was already a merged
+		// entity, transfer over the Merged set to the entity we are
+		// merging into.
+		toEntity.MergedEntityIDs = append(toEntity.MergedEntityIDs, fromEntity.MergedEntityIDs...)
+
+		// Add the entity from which we are merging from to the list of entities
+		// the entity we are merging into is composed of.
+		toEntity.MergedEntityIDs = append(toEntity.MergedEntityIDs, fromEntity.ID)
+
+		// Remove entity ID as a member from all the groups it belongs, both
+		// internal and external
+		groups, err := i.MemDBGroupsByMemberEntityIDInTxn(txn, fromEntity.ID, true, false)
+		if err != nil {
+			return nil, err, nil
+		}
+		for _, group := range groups {
+			group.MemberEntityIDs = strutil.StrListDelete(group.MemberEntityIDs, fromEntity.ID)
+			err = i.UpsertGroupInTxn(ctx, txn, group, persist && !isPerfSecondaryOrStandby)
+			if err != nil {
+				return nil, err, nil
+			}
+
+			fromEntityGroups = append(fromEntityGroups, group)
+		}
+
+		// Delete the entity which we are merging from in MemDB using the same transaction
+		err = i.MemDBDeleteEntityByIDInTxn(txn, fromEntity.ID)
+		if err != nil {
+			return nil, err, nil
+		}
+
+		if persist && !isPerfSecondaryOrStandby {
+			// Delete the entity which we are merging from in storage
+			err = i.entityPacker.DeleteItem(ctx, fromEntity.ID)
+			if err != nil {
+				return nil, err, nil
+			}
+		}
+	}
+
+	// Normalize Alias order. We do this because we persist NonLocal and Local
+	// aliases separately and so after next reload local aliases will all come
+	// after non-local ones. While it's logically equivalent, it makes reasoning
+	// about merges and determinism very hard if the order of things in MemDB can
+	// change from one unseal to the next so we are especially careful to ensure
+	// it's exactly the same whether we just merged or on a subsequent load.
+	// persistEntities will already split these up and persist them separately, so
+	// we're kinda duplicating effort and code here but this should't happen often
+	// so I think it's fine.
+	nonLocalAliases, localAliases := splitLocalAliases(toEntity)
+	toEntity.Aliases = append(nonLocalAliases, localAliases...)
+
+	// Don't forget to insert aliases into alias table that were part of
+	// `toEntity` but were not merged above (because they didn't conflict). This
+	// might re-insert the same aliases we just inserted above again but that's a
+	// no-op. TODO: maybe we could remove the memdb updates in the loop above and
+	// have them all be inserted here.
+	for _, alias := range toEntity.Aliases {
+		err = i.MemDBUpsertAliasInTxn(txn, alias, false)
+		if err != nil {
+			return nil, err, nil
+		}
+	}
+
+	// Update MemDB with changes to the entity we are merging to
+	err = i.MemDBUpsertEntityInTxn(txn, toEntity)
+	if err != nil {
+		return nil, err, nil
+	}
+
+	for _, group := range fromEntityGroups {
+		group.MemberEntityIDs = append(group.MemberEntityIDs, toEntity.ID)
+		err = i.UpsertGroupInTxn(ctx, txn, group, persist && !isPerfSecondaryOrStandby)
+		if err != nil {
+			return nil, err, nil
+		}
+	}
+
+	if persist && !isPerfSecondaryOrStandby {
+		// Persist the entity which we are merging to
+		err = i.persistEntity(ctx, toEntity)
+		if err != nil {
+			return nil, err, nil
+		}
+	}
+
+	return nil, nil, nil
+}
+
+// entityIntegrityCheck is the result of running checkEntityIntegrity() on an
+// entity.
+type entityIntegrityCheck struct {
+	// The entity that check refers to
+	entity *identity.Entity
+	// The entity has nil aliases
+	hasNilAliases bool
+	// The entity has dangling aliases
+	danglingAliases []*identity.Alias
+	// The entity has duplicate aliases by ID. This is _not_ the same as same-case
+	// duplicates.
+	duplicateAliases map[string][]*identity.Alias
+}
+
+// checkEntityIntegrity inspects the internal state of the entity and any
+// associated aliases. It returns an entityIntegrityCheck which includes details
+// about any issues that may have been discovered. An error is return if any
+// integrity errors are discovered.
+//
+// NOTE: We currently only check the integrity of the aliases associated with
+// the entity itself.
+func checkEntityIntegrity(entity *identity.Entity) (*entityIntegrityCheck, error) {
+	if entity == nil {
+		return nil, errors.New("no entity provided")
+	}
+
+	results := &entityIntegrityCheck{
+		entity:          entity,
+		hasNilAliases:   false,
+		danglingAliases: []*identity.Alias{},
+	}
+
+	hasDuplicateAliases := false
+	hasDanglingAliases := false
+	seenAliases := map[string][]*identity.Alias{}
+
+	for alias := range slices.Values(entity.Aliases) {
+		if alias == nil {
+			results.hasNilAliases = true
+			continue
+		}
+
+		if alias.CanonicalID != entity.ID {
+			hasDanglingAliases = true
+			results.danglingAliases = append(results.danglingAliases, alias)
+		}
+
+		if seenAliases[alias.ID] != nil {
+			hasDuplicateAliases = true
+			seenAliases[alias.ID] = append(seenAliases[alias.ID], alias)
+		} else {
+			seenAliases[alias.ID] = []*identity.Alias{alias}
+		}
+	}
+
+	if hasDuplicateAliases {
+		// Delete any seen aliases that don't have duplicates instances
+		maps.DeleteFunc(seenAliases, func(k string, v []*identity.Alias) bool {
+			return len(v) < 2
+		})
+		results.duplicateAliases = seenAliases
+	}
+
+	if results.hasNilAliases || hasDanglingAliases || hasDuplicateAliases {
+		return results, errors.New("failed entity integrity check")
+	}
+
+	return results, nil
+}
+
+// repairEntityIntegrity attempts to repair any errors encountered when the
+// entityIntegrityCheck was created. The entityIntegrityCheck must have a
+// reference to an entity.
+func (i *entityIntegrityCheck) repair(log hclog.Logger) error {
+	if i == nil {
+		return errors.New("entity integrity check is uninitialized")
+	}
+
+	if i.entity == nil {
+		return errors.New("no entity provided")
+	}
+
+	// Remove any nil aliases
+	if i.hasNilAliases {
+		i.entity.Aliases = slices.DeleteFunc(i.entity.Aliases, func(alias *identity.Alias) bool {
+			return alias == nil
+		})
+	}
+
+	// Delete duplicate instances of the same alias. We do this to ensure that
+	// only the most recently updated instances of the alias win.
+	for duplicateInstances := range maps.Values(i.duplicateAliases) {
+		if err := i.deleteDuplicateAliasInstances(log, duplicateInstances); err != nil {
+			return fmt.Errorf("deleting duplicate identity alias instances: %w", err)
+		}
+	}
+
+	// Now associate any dangling aliases that we might have. As associating and
+	// and resolving duplicate updates our modified time we always do this after
+	// deleting duplicates instances as that may use the unaltered modified time
+	// in determining which instance wins.
+	//
+	// Our list of danglingAliases is not guaranteed to reflect the current state
+	// of our entity, as we may have duplicate alias instances which are also
+	// dangling. We only need to resolve those which are still in our updated
+	// entity list.
+	for dangling := range slices.Values(i.danglingAliases) {
+		if !slices.Contains(i.entity.Aliases, dangling) {
+			continue
+		}
+		if err := i.resolveAndAssociateDanglingEntityAlias(log, dangling); err != nil {
+			return fmt.Errorf("resolving and associating dangling identity alias: %w", err)
+		}
+	}
+
+	slices.SortFunc(i.entity.Aliases, func(a, b *identity.Alias) int {
+		return cmp.Compare(a.GetID(), b.GetID())
+	})
+
+	return nil
+}
+
+// deleteDuplicateAliasInstances deletes duplicate alias instances where the
+// more than one instance of an alias (Same ID) has somehow been persisted into
+// storage. The most-recently updated alias will win. Given a tie the first
+// found wins.
+func (i *entityIntegrityCheck) deleteDuplicateAliasInstances(log hclog.Logger, aliases []*identity.Alias) error {
+	switch {
+	case i == nil:
+		return errors.New("entity integrity check unitialized")
+	case aliases == nil:
+		return errors.New("no reference to aliases was given")
+	case len(aliases) < 2:
+		return errors.New("no duplicates were detected")
+	case i.entity == nil:
+		return errors.New("entity integrity check is not associated with an entity")
+	}
+
+	// Do a sanity check that all aliases have the same ID before we go and delete
+	// things.
+	id := aliases[0].ID
+	for a := range slices.Values(aliases) {
+		if a == nil {
+			continue
+		}
+
+		if a.ID != id {
+			return errors.New("deleting duplicate alias instances: instance list contains different IDs")
+		}
+	}
+
+	// Determine the instance of the alias that we want to keep. Given how
+	// UpsertAlias() works, this ought to be the first instance we run into, which
+	// we default to here. The only exception is if somehow a newer instance was
+	// appended below. It ought not be possible but we'll enforce most-recent wins
+	// anyway.
+	var aliasToKeep *identity.Alias
+	for _, alias := range aliases {
+		if alias == nil {
+			continue
+		}
+
+		if aliasToKeep == nil {
+			aliasToKeep = alias
+			continue
+		}
+
+		if t := alias.GetLastUpdateTime().AsTime(); t.After(aliasToKeep.GetLastUpdateTime().AsTime()) {
+			aliasToKeep = alias
+		}
+	}
+
+	if aliasToKeep == nil {
+		return errors.New("no identity aliases to keep in deduplication")
+	}
+	log.Trace("deleting all but one duplicate identity alias instance",
+		"num_to_delete", len(aliases)-1,
+		"alias_to_keep", aliasToKeep,
+	)
+
+	i.entity.Aliases = slices.DeleteFunc(i.entity.Aliases, func(a *identity.Alias) bool {
+		if a == nil {
+			return true
+		}
+		if aliasToKeep.ID == a.ID && a != aliasToKeep {
+			return true
+		}
+
+		return false
+	})
+
+	return nil
+}
+
+// resolveAndAssociateDanglingEntityAlias determines how best to resolve a
+// dangling entity alias. Depending on the context of the entities aliases there
+// are several different approaches to resolution and association. The entity
+// alias will be updated in-place when there are no errors in resolution.
+// The implementation must be deterministic so that integrity resolution is the
+// same on all nodes.
+func (i *entityIntegrityCheck) resolveAndAssociateDanglingEntityAlias(log hclog.Logger, alias *identity.Alias) error {
+	switch {
+	case i == nil:
+		return errors.New("entity integrity check uninitialized")
+	case alias == nil:
+		return errors.New("no reference to an identity alias was given")
+	case i.entity == nil:
+		return errors.New("entity integrity check is not associated with an entity")
+	}
+
+	if alias.CanonicalID == i.entity.ID {
+		// The alias is not actually dangling.
+		return nil
+	}
+
+	if i.entity.ID == "" {
+		// Our entity doesn't actually have an ID to associate it with.
+		return errors.New("entity does not have an ID")
+	}
+
+	now := timestamppb.Now()
+
+	// Update our entity ID with the correct entity ID while also including our
+	// prior ID in the aliases merged from field.
+	resolveAliasID := func() {
+		log.Warn("associating dangling identity alias with entity",
+			"alias_id", alias.ID,
+			"dangling_canonical_id", alias.CanonicalID,
+			"new_canonical_id", i.entity.ID,
+		)
+
+		if cid := alias.CanonicalID; cid != "" {
+			alias.MergedFromCanonicalIDs = append(alias.MergedFromCanonicalIDs, cid)
+			if alias.Metadata == nil {
+				alias.Metadata = make(map[string]string)
+			}
+			alias.Metadata["dangling_canonical_id"] = cid
+		}
+		alias.CanonicalID = i.entity.ID
+		alias.LastUpdateTime = now
+	}
+
+	// Update our alias name with our old name and create a new name by appending
+	// the name and entity UUID together. This will allow users to choose whether
+	// or not to delete the rename or merge the dangling alias.
+	renameAlias := func() {
+		oldName := alias.Name
+		alias.Name = alias.Name + "-" + alias.ID
+		if alias.Metadata == nil {
+			alias.Metadata = make(map[string]string)
+		}
+		alias.Metadata["dangling_prior_name"] = oldName
+		alias.LastUpdateTime = now
+
+		log.Warn("renamed dangling duplicate identity alias",
+			"alias_id", alias.ID,
+			"name", alias.Name,
+			"old_name", oldName,
+		)
+	}
+
+	if len(i.entity.Aliases) == 1 {
+		// The alias is dangling but there are no other aliases with the same alias
+		// name and mount accessor.
+		resolveAliasID()
+
+		return nil
+	}
+
+	duplicateAliases := make([]*identity.Alias, 0)
+	for _, ea := range i.entity.Aliases {
+		if ea == nil {
+			continue
+		}
+		if alias.Name+alias.MountAccessor == ea.Name+ea.MountAccessor {
+			duplicateAliases = append(duplicateAliases, ea)
+		}
+	}
+
+	if len(duplicateAliases) < 1 {
+		// The alias is dangling but there are no other aliases with the same alias
+		// name and mount accessor. We only need to resolve the alias ID.
+		resolveAliasID()
+
+		return nil
+	}
+
+	// We have duplicate dangling aliases.
+	log.Warn("DUPLICATE DETECTED, dangling duplicate identity alias detected, see following logs for details and refer to " +
+		identityDuplicateReportUrl + " for resolution.")
+
+	// Our dangling alias is a duplicate. Determine whether or not all of the
+	// duplicates are dangling or not as that will determine whether or not
+	// we need to rename the alias to avoid a clash.
+	allDangling := true
+	for _, da := range duplicateAliases {
+		if i.entity.ID == da.CanonicalID {
+			allDangling = false
+			break
+		}
+	}
+	if !allDangling {
+		// The alias is dangling, a duplicate, and there is a duplicate that is not
+		// dangling. We'll rename our dangling duplicate and allow any other aliases
+		// that are not dangling inherit the name.
+		renameAlias()
+		resolveAliasID()
+
+		return nil
+	}
+
+	// We have duplicate aliases and all of them are dangling. If we're the most
+	// recently updated alias in that set then we'll keep our name, otherwise
+	// we'll rename to allow the most recently updated to keep the name.
+	var mostRecentlyUpdatedAlias *identity.Alias
+	for _, de := range duplicateAliases {
+		if de == nil {
+			continue
+		}
+		if mostRecentlyUpdatedAlias == nil {
+			mostRecentlyUpdatedAlias = de
+			continue
+		}
+
+		if t := de.GetLastUpdateTime().AsTime(); t.After(mostRecentlyUpdatedAlias.GetLastUpdateTime().AsTime()) {
+			mostRecentlyUpdatedAlias = de
+		}
+	}
+
+	if alias.GetLastUpdateTime().AsTime().Before(mostRecentlyUpdatedAlias.GetLastUpdateTime().AsTime()) {
+		// The alias is dangling, a duplicate, and is not most recently updated
+		// dangling duplicate. We'll rename our dangling duplicate and allow the
+		// the most recently updated duplicate to inherit the name.
+		renameAlias()
+	}
+
+	resolveAliasID()
+
+	return nil
+}
+
+var entityHelp = map[string][2]string{
+	"entity": {
+		"Create a new entity",
+		"",
+	},
+	"entity-id": {
+		"Update, read or delete an entity using entity ID",
+		"",
+	},
+	"entity-name": {
+		"Update, read or delete an entity using entity name",
+		"",
+	},
+	"entity-id-list": {
+		"List all the entity IDs",
+		"",
+	},
+	"entity-name-list": {
+		"List all the entity names",
+		"",
+	},
+	"entity-merge-id": {
+		"Merge two or more entities together",
+		"",
+	},
+	"batch-delete": {
+		"Delete all of the entities provided",
+		"",
+	},
+}

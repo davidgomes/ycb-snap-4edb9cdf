@@ -1,0 +1,68 @@
+/**
+ * Copyright IBM Corp. 2016, 2025
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+import Controller from '@ember/controller';
+import { capitalize } from '@ember/string';
+import { service } from '@ember/service';
+import { tracked } from '@glimmer/tracking';
+
+export default class OidcConfigureController extends Controller {
+  @service router;
+
+  @tracked header = null;
+
+  constructor() {
+    super(...arguments);
+    this.router.on('routeDidChange', (transition) => this.setHeader(transition));
+  }
+
+  setHeader(transition) {
+    // set correct header state based on child route
+    // when no clients have been created, display create button as call to action
+    // list views share the same header with tabs as resource links
+    // the remaining routes are responsible for their own header
+    const routeName = transition.to.name;
+    if (routeName.includes('oidc.index')) {
+      this.header = 'cta';
+    } else {
+      const isList = ['clients', 'assignments', 'keys', 'scopes', 'providers'].find((resource) => {
+        return routeName.includes(`${resource}.index`);
+      });
+      this.header = isList ? 'list' : null;
+    }
+  }
+
+  get isCta() {
+    return this.header === 'cta';
+  }
+
+  get breadcrumbs() {
+    // we check parent for the name as the currentRoute is always "index"
+    const route = this.router.currentRoute.parent.localName ?? '';
+    const isDefaultRoute = route === 'clients' || route == 'oidc';
+    const showApplications = route !== 'oidc' ? ': Applications' : '';
+
+    const baseCrumbs = [
+      { label: 'Vault', route: 'vault.cluster.dashboard', icon: 'vault' },
+      {
+        label: `OIDC provider${showApplications}`,
+        route: 'vault.cluster.access.oidc',
+        current: isDefaultRoute,
+      },
+    ];
+
+    // clients is the default view, so in order to match current patterns, we do not include it as a breadcrumb
+    if (!isDefaultRoute && route) {
+      return [
+        ...baseCrumbs,
+        {
+          label: capitalize(route),
+        },
+      ];
+    }
+
+    return baseCrumbs;
+  }
+}

@@ -1,0 +1,40 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<form data-test-transit-create-form onsubmit={{perform this.save}}>
+  <div class="box is-fullwidth is-marginless">
+    <MessageError @model={{@form}} @errorMessage={{this.errorBanner}} />
+    <NamespaceReminder @mode="create" @noun="transit key" />
+
+    {{#each @form.formFields as |attr|}}
+      <FormField @attr={{attr}} @model={{@form}} @modelValidations={{this.modelValidations}}>
+        {{#if (eq attr.name "auto_rotate_period")}}
+          <div class="field">
+            <TtlPicker
+              @initialValue="30d"
+              @initialEnabled={{false}}
+              @label="Auto-rotation period"
+              @helperTextDisabled="Key will never be automatically rotated"
+              @helperTextEnabled="Key will be automatically rotated every"
+              @onChange={{this.handleAutoRotateChange}}
+            />
+          </div>
+        {{/if}}
+      </FormField>
+    {{/each}}
+
+    <div class="field is-grouped box is-fullwidth is-bottomless">
+      <Hds::ButtonSet>
+        <Hds::Button @text="Create key" data-test-transit-key="create" type="submit" />
+        <Hds::Button
+          @text="Cancel"
+          @color="secondary"
+          @model={{@form.data.backend}}
+          @route="vault.cluster.secrets.backend.list-root"
+        />
+      </Hds::ButtonSet>
+    </div>
+  </div>
+</form>

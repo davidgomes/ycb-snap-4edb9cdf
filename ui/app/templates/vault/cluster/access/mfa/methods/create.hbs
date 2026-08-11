@@ -1,0 +1,98 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Page::Header
+  @title={{if this.method.type (concat "Configure " this.methodNameFromType " MFA") "Multi-factor authentication"}}
+>
+  <:breadcrumbs>
+    <Page::Breadcrumbs
+      @breadcrumbs={{array
+        (hash label="Vault" route="vault.cluster.dashboard" icon="vault")
+        (hash label="Methods" route="vault.cluster.access.mfa.methods.index")
+        (hash label="Configure MFA Method")
+      }}
+    />
+  </:breadcrumbs>
+  <:description>
+    Enforce a secondary layer of identity verification (such as TOTP, Okta, or Duo) during the login process.
+    <Hds::Link::Inline @isHrefExternal={{true}} @href={{doc-link "/vault/gui/login-mfa"}}>
+      Learn more
+    </Hds::Link::Inline>
+  </:description>
+</Page::Header>
+
+<div>
+  {{#if this.showForms}}
+    <h3 class="is-size-4 has-text-weight-semibold">Settings</h3>
+    <p class="has-border-top-light has-top-padding-l">
+      {{this.description}}
+      <Hds::Link::Inline
+        @isHrefExternal={{true}}
+        @href={{doc-link (concat "/vault/api-docs/secret/identity/mfa/" this.type)}}
+      >
+        Learn more
+      </Hds::Link::Inline>
+    </p>
+    <Mfa::MethodForm @form={{this.method}} @validations={{this.methodErrors}} class="is-shadowless" />
+    <Mfa::MfaLoginEnforcementHeader
+      @isInline={{true}}
+      @radioCardGroupValue={{this.enforcementPreference}}
+      @onRadioCardSelect={{this.onEnforcementPreferenceChange}}
+      @onEnforcementSelect={{this.onEnforcementSelect}}
+    />
+    {{#if (eq this.enforcementPreference "new")}}
+      <Mfa::MfaLoginEnforcementForm
+        @form={{this.enforcement}}
+        @isInline={{true}}
+        @modelErrors={{this.enforcementErrors}}
+        class="has-top-margin-l"
+      />
+    {{/if}}
+  {{else}}
+    <div class="is-flex-row">
+      {{#each this.methods as |method|}}
+        <RadioCard
+          @value={{lowercase method.name}}
+          @groupValue={{this.type}}
+          @onChange={{this.onTypeSelect}}
+          data-test-radio-card={{lowercase method.name}}
+        >
+          <div class="radio-card-row is-flex-v-centered">
+            <div>
+              <Icon @name={{method.icon}} @size="24" class={{if (eq method.name "TOTP") "has-text-grey"}} />
+              <p
+                class="has-text-weight-semibold has-text-center
+                  {{if (or (eq method.name 'Okta') (eq method.name 'TOTP')) 'has-top-margin-xs'}}"
+              >
+                {{method.name}}
+              </p>
+            </div>
+          </div>
+        </RadioCard>
+      {{/each}}
+    </div>
+    {{#if this.type}}
+      <p class="has-top-margin-l">
+        {{this.description}}
+        <DocLink @path={{concat "/vault/api-docs/secret/identity/mfa/" this.type}}>Learn more.</DocLink>
+      </p>
+      {{! in a future release cards may be displayed to choose from either template or custom config for TOTP }}
+      {{! if template is selected a user could choose a predefined config for common authenticators and the values would be populated on the model }}
+    {{/if}}
+  {{/if}}
+
+  <div class="has-top-margin-l has-border-top-light">
+    <div class="has-top-margin-l has-bottom-margin-l">
+      {{#if this.showForms}}
+        <Hds::ButtonSet>
+          <Hds::Button @text="Continue" {{on "click" (perform this.save)}} data-test-mfa-create-save />
+          <Hds::Button @text="Cancel" @color="secondary" {{on "click" this.cancel}} />
+        </Hds::ButtonSet>
+      {{else if this.type}}
+        <Hds::Button @text="Next" {{on "click" this.createModels}} data-test-mfa-create-next />
+      {{/if}}
+    </div>
+  </div>
+</div>

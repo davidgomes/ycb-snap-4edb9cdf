@@ -1,0 +1,720 @@
+// Copyright IBM Corp. 2016, 2025
+// SPDX-License-Identifier: BUSL-1.1
+
+package pki
+
+import (
+	"bytes"
+	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
+	"encoding/base64"
+	"encoding/pem"
+	"fmt"
+	"io"
+	"math"
+	"math/big"
+	http2 "net/http"
+	"os"
+	"os/exec"
+	"path"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/vault/api"
+	"github.com/hashicorp/vault/sdk/helper/certutil"
+	"github.com/hashicorp/vault/sdk/logical"
+	"github.com/pavlo-v-chernykh/keystore-go/v4"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/ocsp"
+	"software.sslmate.com/src/go-pkcs12"
+)
+
+// Setup helpers
+func CreateBackendWithStorage(t testing.TB) (*backend, logical.Storage) {
+	t.Helper()
+
+	config := logical.TestBackendConfig()
+	config.StorageView = &logical.InmemStorage{}
+
+	var err error
+	b := Backend(config)
+	b.pkiCertificateCounter = &testingPkiCertificateCounter{}
+	err = b.Setup(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Assume for our tests we have performed the migration already.
+	b.pkiStorageVersion.Store(1)
+	return b, config.StorageView
+}
+
+func mountPKIEndpoint(t testing.TB, client *api.Client, path string) {
+	t.Helper()
+
+	err := client.Sys().Mount(path, &api.MountInput{
+		Type: "pki",
+		Config: api.MountConfigInput{
+			DefaultLeaseTTL: "16h",
+			MaxLeaseTTL:     "32h",
+		},
+	})
+	require.NoError(t, err, "failed mounting pki endpoint")
+}
+
+func mountCertEndpoint(t testing.TB, client *api.Client, path string) {
+	t.Helper()
+
+	err := client.Sys().EnableAuthWithOptions(path, &api.MountInput{
+		Type: "cert",
+		Config: api.MountConfigInput{
+			DefaultLeaseTTL: "16h",
+			MaxLeaseTTL:     "32h",
+		},
+	})
+	require.NoError(t, err, "failed mounting cert endpoint")
+}
+
+// Signing helpers
+func requireSignedBy(t *testing.T, cert *x509.Certificate, signingCert *x509.Certificate) {
+	t.Helper()
+
+	if err := cert.CheckSignatureFrom(signingCert); err != nil {
+		t.Fatalf("signature verification failed: %v", err)
+	}
+}
+
+func requireSignedByAtPath(t *testing.T, client *api.Client, leaf *x509.Certificate, path string) {
+	t.Helper()
+
+	resp, err := client.Logical().Read(path)
+	require.NoError(t, err, "got unexpected error fetching parent certificate")
+	require.NotNil(t, resp, "missing response when fetching parent certificate")
+	require.NotNil(t, resp.Data, "missing data from parent certificate response")
+	require.NotNil(t, resp.Data["certificate"], "missing certificate field on parent read response")
+
+	parentCert := resp.Data["certificate"].(string)
+	parent := parseCert(t, parentCert)
+
+	requireSignedBy(t, leaf, parent)
+}
+
+// Certificate helper
+func parseCert(t *testing.T, pemCert string) *x509.Certificate {
+	t.Helper()
+
+	block, _ := pem.Decode([]byte(pemCert))
+	require.NotNil(t, block, "failed to decode PEM block")
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	require.NoError(t, err)
+	return cert
+}
+
+// PKCS12 helpers
+
+// verifyAndDecodePKCS12 verifies a PKCS#12 response and decodes the base64 archive.
+// It accepts the response and error directly so callers can pass CBWrite inline.
+func verifyAndDecodePKCS12(t *testing.T, path string, resp *logical.Response, err error, shouldError bool) []byte {
+	t.Helper()
+	if shouldError {
+		require.Error(t, err)
+		require.Contains(t, err.Error(), `invalid "pkcs12_encoder" parameter: encoder must be "modern2026" or "modern2023"; received: "modern2020"`)
+		return nil
+	}
+
+	requireSuccessNonNilResponse(t, resp, err, fmt.Sprintf("endpoint: %s errored", path))
+	require.Contains(t, resp.Data, "certificate")
+	pkcs12Base64, ok := resp.Data["certificate"].(string)
+	require.True(t, ok, "pkcs12 field should be a string")
+	require.NotEmpty(t, pkcs12Base64)
+
+	// Decode pkcs12
+	pkcs12Bytes, err := base64.StdEncoding.DecodeString(pkcs12Base64)
+	require.NoError(t, err, "pkcs12 data should be valid base64")
+	require.NotEmpty(t, pkcs12Bytes)
+	return pkcs12Bytes
+}
+
+// requireDecodesPKCS12Chain decodes a PKCS#12 bundle containing a private key, a certificate, and a chain of CA certificates.
+// It asserts that decoding succeeds, the private key and certificate are present, and the certificate's public key matches the private key.
+func requireDecodesPKCS12Chain(t *testing.T, pkcs12Bytes []byte, password string) (interface{}, *x509.Certificate, []*x509.Certificate) {
+	t.Helper()
+
+	privateKey, cert, caCerts, err := pkcs12.DecodeChain(pkcs12Bytes, password)
+	require.NoError(t, err, "failed decoding chain %w", err)
+	require.NotNil(t, privateKey, "PKCS12 should have private key")
+	require.NotNil(t, cert, "PKCS12 should include a certificate")
+	// Extract public key from private key for comparison
+	var pubKey crypto.PublicKey
+	switch k := privateKey.(type) {
+	case *rsa.PrivateKey:
+		pubKey = &k.PublicKey
+	case *ecdsa.PrivateKey:
+		pubKey = &k.PublicKey
+	default:
+		t.Fatalf("unsupported private key type: %T", privateKey)
+	}
+	requireMatchingPublicKeys(t, cert, pubKey)
+	return privateKey, cert, caCerts
+}
+
+// requireDecodesPKCS12TrustStore decodes a PKCS#12 trust store and asserts that decoding succeeds and certificates are present.
+func requireDecodesPKCS12TrustStore(t *testing.T, pkcs12Bytes []byte, password string) []*x509.Certificate {
+	t.Helper()
+
+	certs, err := pkcs12.DecodeTrustStore(pkcs12Bytes, password)
+	require.NoError(t, err, "failed decoding trust store %w", err)
+	require.NotEmpty(t, certs, "PKCS12 trust store should contain certificates")
+	return certs
+}
+
+// JKS helpers
+
+// verifyAndDecodeJKS verifies a JKS response and decodes the base64 archive.
+// It accepts the response and error directly so callers can pass CBWrite inline.
+func verifyAndDecodeJKS(t *testing.T, path string, resp *logical.Response, err error) []byte {
+	t.Helper()
+	requireSuccessNonNilResponse(t, resp, err, fmt.Sprintf("endpoint: %s errored", path))
+	require.Contains(t, resp.Data, "certificate")
+	jksBase64, ok := resp.Data["certificate"].(string)
+	require.True(t, ok, "jks field should be a string")
+	require.NotEmpty(t, jksBase64)
+
+	// Decode JKS
+	jksBytes, err := base64.StdEncoding.DecodeString(jksBase64)
+	require.NoError(t, err, "jks should be valid base64")
+	require.NotEmpty(t, jksBytes)
+	return jksBytes
+}
+
+// requireDecodesJKSChain decodes JKS with private key and returns key + certs
+func requireDecodesJKSChain(t *testing.T, jksBytes []byte, password string, expectedAlias string) (crypto.PrivateKey, *x509.Certificate, []*x509.Certificate) {
+	t.Helper()
+
+	ks := keystore.New()
+	err := ks.Load(bytes.NewReader(jksBytes), []byte(password))
+	require.NoError(t, err, "failed to load JKS keystore")
+
+	// First make sure the alias is what we expect since we use that to assert the entry
+	aliases := ks.Aliases()
+	require.Len(t, aliases, 1, "keystore should only have 1 alias")
+	require.Contains(t, aliases, expectedAlias, "list does not include expected alias")
+
+	// Get the PrivateKeyEntry and parse contents
+	pke, err := ks.GetPrivateKeyEntry(expectedAlias, []byte(password))
+	require.NoError(t, err, "failed to get private key entry")
+	require.NotNil(t, pke, "private key entry is nil")
+	require.NotEmpty(t, pke.CertificateChain, "certificate chain is empty")
+
+	// Parse private key (PKCS#8 DER format)
+	privKey, err := x509.ParsePKCS8PrivateKey(pke.PrivateKey)
+	require.NoError(t, err, "failed to parse private key")
+
+	// Parse certificates
+	leafCert, err := x509.ParseCertificate(pke.CertificateChain[0].Content)
+	require.NoError(t, err, "failed to parse leaf certificate")
+
+	var caCerts []*x509.Certificate
+	for i := 1; i < len(pke.CertificateChain); i++ {
+		cert, err := x509.ParseCertificate(pke.CertificateChain[i].Content)
+		require.NoError(t, err, "failed to parse CA certificate at index %d", i)
+		caCerts = append(caCerts, cert)
+	}
+
+	return privKey, leafCert, caCerts
+}
+
+// requireDecodesJKSTrustStore decodes JKS trust store (no private key) and returns all certs
+func requireDecodesJKSTrustStore(t *testing.T, jksBytes []byte, password string, expectedAliases []string) []*x509.Certificate {
+	t.Helper()
+
+	ks := keystore.New()
+	err := ks.Load(bytes.NewReader(jksBytes), []byte(password))
+	require.NoError(t, err, "failed to load JKS keystore, invalid password?")
+
+	// First make sure the alias is what we expect since we use that to assert the entry
+	aliases := ks.Aliases()
+	require.NotEmpty(t, aliases, "keystore has no entries")
+	// JKS does not guarantee alias iteration order, so compare aliases as a set.
+	require.ElementsMatch(t, expectedAliases, aliases, "list does not match expected aliases")
+
+	var certs []*x509.Certificate
+	// Retrieve TrustedCertificateEntry for each alias
+	for _, alias := range expectedAliases {
+		entry, err := ks.GetTrustedCertificateEntry(alias)
+		require.NoError(t, err, "failed to get trusted cert entry for alias %s", alias)
+
+		cert, err := x509.ParseCertificate(entry.Certificate.Content)
+		require.NoError(t, err, "failed to parse certificate for alias %s", alias)
+		certs = append(certs, cert)
+	}
+
+	require.NotEmpty(t, certs, "no trusted certificate entries found")
+	return certs
+}
+
+// End PKCS#12 and JKS helpers
+
+func requireMatchingPublicKeys(t *testing.T, cert *x509.Certificate, key crypto.PublicKey) {
+	t.Helper()
+
+	certPubKey := cert.PublicKey
+	areEqual, err := certutil.ComparePublicKeysAndType(certPubKey, key)
+	require.NoError(t, err, "failed comparing public keys: %#v", err)
+	require.True(t, areEqual, "public keys mismatched: got: %v, expected: %v", certPubKey, key)
+}
+
+func getSelfSigned(t *testing.T, subject, issuer *x509.Certificate, key *rsa.PrivateKey) (string, *x509.Certificate) {
+	t.Helper()
+	selfSigned, err := x509.CreateCertificate(rand.Reader, subject, issuer, key.Public(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(selfSigned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pemSS := strings.TrimSpace(string(pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: selfSigned,
+	})))
+	return pemSS, cert
+}
+
+// CRL related helpers
+func getCrlCertificateList(t *testing.T, client *api.Client, mountPoint string) pkix.TBSCertificateList {
+	t.Helper()
+
+	path := fmt.Sprintf("/v1/%s/crl", mountPoint)
+	return getParsedCrlAtPath(t, client, path).TBSCertList
+}
+
+func parseCrlPemBytes(t *testing.T, crlPem []byte) pkix.TBSCertificateList {
+	t.Helper()
+
+	certList, err := x509.ParseCRL(crlPem)
+	require.NoError(t, err)
+	return certList.TBSCertList
+}
+
+func requireSerialNumberInCRL(t *testing.T, revokeList pkix.TBSCertificateList, serialNum string) bool {
+	if t != nil {
+		t.Helper()
+	}
+
+	serialsInList := make([]string, 0, len(revokeList.RevokedCertificates))
+	for _, revokeEntry := range revokeList.RevokedCertificates {
+		formattedSerial := certutil.GetHexFormatted(revokeEntry.SerialNumber.Bytes(), ":")
+		serialsInList = append(serialsInList, formattedSerial)
+		if formattedSerial == serialNum {
+			return true
+		}
+	}
+
+	if t != nil {
+		t.Fatalf("the serial number %s, was not found in the CRL list containing: %v", serialNum, serialsInList)
+	}
+
+	return false
+}
+
+func getParsedCrl(t *testing.T, client *api.Client, mountPoint string) *pkix.CertificateList {
+	t.Helper()
+
+	path := fmt.Sprintf("/v1/%s/crl", mountPoint)
+	return getParsedCrlAtPath(t, client, path)
+}
+
+func getParsedCrlAtPath(t *testing.T, client *api.Client, path string) *pkix.CertificateList {
+	t.Helper()
+
+	req := client.NewRequest("GET", path)
+	resp, err := client.RawRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	crlBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if len(crlBytes) == 0 {
+		t.Fatalf("expected CRL in response body")
+	}
+
+	crl, err := x509.ParseDERCRL(crlBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return crl
+}
+
+func getParsedCrlFromBackend(t *testing.T, b *backend, s logical.Storage, path string) *pkix.CertificateList {
+	t.Helper()
+
+	resp, err := CBRead(b, s, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	crl, err := x509.ParseDERCRL(resp.Data[logical.HTTPRawBody].([]byte))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return crl
+}
+
+// Direct storage backend helpers (b, s := createBackendWithStorage(t)) which
+// are mostly compatible with client.Logical() operations. The main difference
+// is that the JSON round-tripping hasn't occurred, so values are as the
+// backend returns them (e.g., []string instead of []interface{}).
+func CBReq(b *backend, s logical.Storage, operation logical.Operation, path string, data map[string]interface{}) (*logical.Response, error) {
+	resp, err := b.HandleRequest(context.Background(), &logical.Request{
+		Operation:  operation,
+		Path:       path,
+		Data:       data,
+		Storage:    s,
+		MountPoint: "pki/",
+	})
+	if err != nil || resp == nil {
+		return resp, err
+	}
+
+	if msg, ok := resp.Data["error"]; ok && msg != nil && len(msg.(string)) > 0 {
+		return resp, fmt.Errorf("%s", msg)
+	}
+
+	return resp, nil
+}
+
+func CBHeader(b *backend, s logical.Storage, path string) (*logical.Response, error) {
+	return CBReq(b, s, logical.HeaderOperation, path, make(map[string]interface{}))
+}
+
+func CBRead(b *backend, s logical.Storage, path string) (*logical.Response, error) {
+	return CBReq(b, s, logical.ReadOperation, path, make(map[string]interface{}))
+}
+
+func CBWrite(b *backend, s logical.Storage, path string, data map[string]interface{}) (*logical.Response, error) {
+	return CBReq(b, s, logical.UpdateOperation, path, data)
+}
+
+func CBPatch(b *backend, s logical.Storage, path string, data map[string]interface{}) (*logical.Response, error) {
+	return CBReq(b, s, logical.PatchOperation, path, data)
+}
+
+func CBList(b *backend, s logical.Storage, path string) (*logical.Response, error) {
+	return CBReq(b, s, logical.ListOperation, path, make(map[string]interface{}))
+}
+
+func CBDelete(b *backend, s logical.Storage, path string) (*logical.Response, error) {
+	return CBReq(b, s, logical.DeleteOperation, path, make(map[string]interface{}))
+}
+
+func requireFieldsSetInResp(t *testing.T, resp *logical.Response, fields ...string) {
+	t.Helper()
+
+	var missingFields []string
+	for _, field := range fields {
+		value, ok := resp.Data[field]
+		if !ok || value == nil {
+			missingFields = append(missingFields, field)
+		}
+	}
+
+	require.Empty(t, missingFields, "The following fields were required but missing from response:\n%v", resp.Data)
+}
+
+func requireSuccessNonNilResponse(t *testing.T, resp *logical.Response, err error, msgAndArgs ...interface{}) {
+	t.Helper()
+
+	require.NoError(t, err, msgAndArgs...)
+	if resp.IsError() {
+		errContext := fmt.Sprintf("Expected successful response but got error: %v", resp.Error())
+		require.Falsef(t, resp.IsError(), errContext, msgAndArgs...)
+	}
+	require.NotNil(t, resp, msgAndArgs...)
+}
+
+func requireSuccessNilResponse(t *testing.T, resp *logical.Response, err error, msgAndArgs ...interface{}) {
+	t.Helper()
+
+	require.NoError(t, err, msgAndArgs...)
+	if resp.IsError() {
+		errContext := fmt.Sprintf("Expected successful response but got error: %v", resp.Error())
+		require.Falsef(t, resp.IsError(), errContext, msgAndArgs...)
+	}
+	if resp != nil {
+		msg := fmt.Sprintf("expected nil response but got: %v", resp)
+		require.Nilf(t, resp, msg, msgAndArgs...)
+	}
+}
+
+func getCRLNumber(t *testing.T, crl pkix.TBSCertificateList) int {
+	t.Helper()
+
+	for _, extension := range crl.Extensions {
+		if extension.Id.Equal(certutil.CRLNumberOID) {
+			bigInt := new(big.Int)
+			leftOver, err := asn1.Unmarshal(extension.Value, &bigInt)
+			require.NoError(t, err, "Failed unmarshalling crl number extension")
+			require.Empty(t, leftOver, "leftover bytes from unmarshalling crl number extension")
+			require.True(t, bigInt.IsInt64(), "parsed crl number integer is not an int64")
+			require.False(t, math.MaxInt <= bigInt.Int64(), "parsed crl number integer can not fit in an int")
+			return int(bigInt.Int64())
+		}
+	}
+
+	t.Fatalf("failed to find crl number extension")
+	return 0
+}
+
+func getCrlReferenceFromDelta(t *testing.T, crl pkix.TBSCertificateList) int {
+	t.Helper()
+
+	for _, extension := range crl.Extensions {
+		if extension.Id.Equal(certutil.DeltaCRLIndicatorOID) {
+			bigInt := new(big.Int)
+			leftOver, err := asn1.Unmarshal(extension.Value, &bigInt)
+			require.NoError(t, err, "Failed unmarshalling delta crl indicator extension")
+			require.Empty(t, leftOver, "leftover bytes from unmarshalling delta crl indicator extension")
+			require.True(t, bigInt.IsInt64(), "parsed delta crl integer is not an int64")
+			require.False(t, math.MaxInt <= bigInt.Int64(), "parsed delta crl integer can not fit in an int")
+			return int(bigInt.Int64())
+		}
+	}
+
+	t.Fatalf("failed to find delta crl indicator extension")
+	return 0
+}
+
+// waitForUpdatedCrl will wait until the CRL at the provided path has been reloaded
+// up for a maxWait duration and gives up if the timeout has been reached. If a negative
+// value for lastSeenCRLNumber is provided, the method will load the current CRL and wait
+// for a newer CRL be generated.
+func waitForUpdatedCrl(t *testing.T, client *api.Client, crlPath string, lastSeenCRLNumber int, maxWait time.Duration) pkix.TBSCertificateList {
+	t.Helper()
+
+	newCrl, didTimeOut := waitForUpdatedCrlUntil(t, client, crlPath, lastSeenCRLNumber, maxWait)
+	if didTimeOut {
+		t.Fatalf("Timed out waiting for new CRL rebuild on path %s", crlPath)
+	}
+	return newCrl.TBSCertList
+}
+
+// waitForUpdatedCrlUntil is a helper method that will wait for a CRL to be updated up until maxWait duration
+// or give up and return the last CRL it loaded. It will not fail, if it does not see a new CRL within the
+// max duration unlike waitForUpdatedCrl. Returns the last loaded CRL at the provided path and a boolean
+// indicating if we hit maxWait duration or not.
+func waitForUpdatedCrlUntil(t *testing.T, client *api.Client, crlPath string, lastSeenCrlNumber int, maxWait time.Duration) (*pkix.CertificateList, bool) {
+	t.Helper()
+
+	crl := getParsedCrlAtPath(t, client, crlPath)
+	initialCrlRevision := getCRLNumber(t, crl.TBSCertList)
+	newCrlRevision := initialCrlRevision
+
+	// Short circuit the fetches if we have a version of the CRL we want
+	if lastSeenCrlNumber > 0 && getCRLNumber(t, crl.TBSCertList) > lastSeenCrlNumber {
+		return crl, false
+	}
+
+	start := time.Now()
+	iteration := 0
+	for {
+		iteration++
+
+		if time.Since(start) > maxWait {
+			t.Logf("Timed out waiting for new CRL on path %s after iteration %d, delay: %v",
+				crlPath, iteration, time.Now().Sub(start))
+			return crl, true
+		}
+
+		crl = getParsedCrlAtPath(t, client, crlPath)
+		newCrlRevision = getCRLNumber(t, crl.TBSCertList)
+		if newCrlRevision > initialCrlRevision {
+			t.Logf("Got new revision of CRL %s from %d to %d after iteration %d, delay %v",
+				crlPath, initialCrlRevision, newCrlRevision, iteration, time.Now().Sub(start))
+			return crl, false
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// A quick CRL to string to provide better test error messages
+func summarizeCrl(t *testing.T, crl pkix.TBSCertificateList) string {
+	version := getCRLNumber(t, crl)
+	serials := []string{}
+	for _, cert := range crl.RevokedCertificates {
+		serials = append(serials, normalizeSerialFromBigInt(cert.SerialNumber))
+	}
+	return fmt.Sprintf("CRL Version: %d\n"+
+		"This Update: %s\n"+
+		"Next Update: %s\n"+
+		"Revoked Serial Count: %d\n"+
+		"Revoked Serials: %v", version, crl.ThisUpdate, crl.NextUpdate, len(serials), serials)
+}
+
+// OCSP helpers
+func generateRequest(t *testing.T, requestHash crypto.Hash, cert *x509.Certificate, issuer *x509.Certificate) []byte {
+	t.Helper()
+
+	opts := &ocsp.RequestOptions{Hash: requestHash}
+	ocspRequestDer, err := ocsp.CreateRequest(cert, issuer, opts)
+	require.NoError(t, err, "Failed generating OCSP request")
+	return ocspRequestDer
+}
+
+func requireOcspResponseSignedBy(t *testing.T, ocspResp *ocsp.Response, issuer *x509.Certificate) {
+	t.Helper()
+
+	err := ocspResp.CheckSignatureFrom(issuer)
+	require.NoError(t, err, "Failed signature verification of ocsp response: %w", err)
+}
+
+func performOcspPost(t *testing.T, cert *x509.Certificate, issuerCert *x509.Certificate, client *api.Client, ocspPath string) *ocsp.Response {
+	t.Helper()
+
+	baseClient := client.WithNamespace("")
+
+	ocspReq := generateRequest(t, crypto.SHA256, cert, issuerCert)
+	ocspPostReq := baseClient.NewRequest(http2.MethodPost, ocspPath)
+	ocspPostReq.Headers.Set("Content-Type", "application/ocsp-request")
+	ocspPostReq.BodyBytes = ocspReq
+	rawResp, err := baseClient.RawRequest(ocspPostReq)
+	require.NoError(t, err, "failed sending unified-ocsp post request")
+
+	require.Equal(t, 200, rawResp.StatusCode)
+	require.Equal(t, ocspResponseContentType, rawResp.Header.Get("Content-Type"))
+	bodyReader := rawResp.Body
+	respDer, err := io.ReadAll(bodyReader)
+	bodyReader.Close()
+	require.NoError(t, err, "failed reading response body")
+
+	ocspResp, err := ocsp.ParseResponse(respDer, issuerCert)
+	require.NoError(t, err, "parsing ocsp get response")
+	return ocspResp
+}
+
+func requireCertMissingFromStorage(t *testing.T, client *api.Client, cert *x509.Certificate) {
+	serial := serialFromCert(cert)
+	requireSerialMissingFromStorage(t, client, serial)
+}
+
+func requireSerialMissingFromStorage(t *testing.T, client *api.Client, serial string) {
+	resp, err := client.Logical().ReadWithContext(context.Background(), "pki/cert/"+serial)
+	require.NoErrorf(t, err, "failed reading certificate with serial %s", serial)
+	require.Nilf(t, resp, "expected a nil response looking up serial %s got: %v", serial, resp)
+}
+
+func requireCertInStorage(t *testing.T, client *api.Client, cert *x509.Certificate) {
+	serial := serialFromCert(cert)
+	requireSerialInStorage(t, client, serial)
+}
+
+func requireSerialInStorage(t *testing.T, client *api.Client, serial string) {
+	resp, err := client.Logical().ReadWithContext(context.Background(), "pki/cert/"+serial)
+	require.NoErrorf(t, err, "failed reading certificate with serial %s", serial)
+	require.NotNilf(t, resp, "reading certificate returned a nil response for serial: %s", serial)
+	require.NotNilf(t, resp.Data, "reading certificate returned a nil data response for serial: %s", serial)
+	require.NotEmpty(t, resp.Data["certificate"], "certificate field was empty for serial: %s", serial)
+}
+
+func writeToTmpDir(t *testing.T, tmpDir string, filename string, contents string) string {
+	filePath := path.Join(tmpDir, filename)
+	out, err := os.Create(filePath)
+	require.NoError(t, err, "failed creating file %s", filePath)
+	_, err = out.WriteString(contents)
+	require.NoError(t, err, "failed writing to file %s", filePath)
+	err = out.Close()
+	require.NoError(t, err, "failed closing file %s", filePath)
+	return filePath
+}
+
+func findExtension(oid asn1.ObjectIdentifier, extensions []pkix.Extension) (bool, pkix.Extension, []string) {
+	var oidsInExtensions []string
+
+	isFound := false
+	var extension pkix.Extension
+	for _, ext := range extensions {
+		oidsInExtensions = append(oidsInExtensions, ext.Id.String())
+		if ext.Id.Equal(oid) {
+			extension = ext
+			isFound = true
+			break
+		}
+	}
+	return isFound, extension, oidsInExtensions
+}
+
+// Openssl is a good reference implementation for x509 and CMPv2
+func findOpenSSL() (string, string, bool) {
+	paths := os.Getenv("PATH")
+	for _, pathFolder := range strings.Split(paths, ":") {
+		cmd := path.Join(pathFolder, "openssl")
+		out, err := exec.Command(cmd, "version").CombinedOutput()
+		if err != nil {
+			continue
+		}
+		// We need a v3 version of OpenSSL to properly support the CMP command we run
+		if strings.Contains(string(out), "OpenSSL 3.") {
+			return cmd, string(out), true
+		}
+	}
+
+	return "", "", false
+}
+
+func runOpenSSL(t *testing.T, log hclog.Logger, opensslCmd string, args []string) []byte {
+	log.Info("Running OpenSSL", "command", opensslCmd, "args", strings.Join(args, " "))
+	output, err := exec.Command(opensslCmd, args...).CombinedOutput()
+	require.NoError(t, err, "failed running command %s with args: %v\n%s", opensslCmd, args, string(output))
+	log.Info("OpenSSL output", "output", string(output))
+	return output
+}
+
+type testingPkiCertificateCounter struct {
+	count logical.CertCount
+}
+
+var _ logical.CertificateCounter = (*testingPkiCertificateCounter)(nil)
+
+func (c *testingPkiCertificateCounter) Reset() {
+	c.count = logical.CertCount{}
+}
+
+func (c *testingPkiCertificateCounter) AddCount(params logical.CertCount) {
+	c.count.Add(params)
+}
+
+func (c *testingPkiCertificateCounter) Increment() logical.CertCountIncrementer {
+	return logical.NewCertCountIncrementer(c)
+}
+
+func (c *testingPkiCertificateCounter) RequireCount(t require.TestingT, issuedCerts, storedCerts uint64, pkiDurationAdjustedCerts float64) {
+	require.Equal(t, issuedCerts, c.count.IssuedCerts, "issued certificates count mismatch %s")
+	require.Equal(t, storedCerts, c.count.StoredCerts, "stored certificates count mismatch %s")
+	require.Equal(t, pkiDurationAdjustedCerts, c.count.PkiDurationAdjustedCerts, "pki duration adjusted certificates count mismatch %s")
+}
+
+func (c *testingPkiCertificateCounter) RequireZero(t require.TestingT) {
+	c.RequireCount(t, 0, 0, 0)
+}
+
+// See logical.durationAdjustedCertificateCount for the billing specification and implementation details.
+func adjustedCertificateCountFromDuration(validity time.Duration) float64 {
+	const standardDuration = 730.0
+	validityHours := validity.Hours()
+	units := validityHours / standardDuration
+	// Round to 4 decimal places
+	return math.Round(units*10000) / 10000
+}

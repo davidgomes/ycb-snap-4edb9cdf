@@ -1,0 +1,142 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<div class="has-bottom-margin-m" ...attributes>
+  {{#if @hideToggle}}
+    <fieldset class="field is-grouped is-marginless is-borderless">
+      {{#if (has-block)}}
+        {{! Allow label override }}
+        {{yield}}
+      {{else}}
+        <legend>
+          <span class="ttl-picker-label is-large" data-test-ttl-form-label={{this.label}}>{{this.label}}</span><br />
+          {{#if this.helperText}}
+            <div class="sub-text">
+              <span data-test-ttl-form-subtext>{{this.helperText}}</span>
+              {{#if @description}}
+                <Hds::TooltipButton
+                  @text={{@description}}
+                  @placement="bottom"
+                  aria-label="description"
+                  data-test-tooltip="ttl-picker"
+                >
+                  <Icon @name="info" />
+                </Hds::TooltipButton>
+              {{/if}}
+            </div>
+          {{/if}}
+        </legend>
+      {{/if}}
+      <div class="control is-marginless" data-test-ttl-inputs>
+        <label for="time-{{this.elementId}}" class="sr-only">Number of units</label>
+        <Input
+          id="time-{{this.elementId}}"
+          @value={{this.time}}
+          @type="text"
+          name="time"
+          class="input {{if this.errorMessage 'has-error'}}"
+          oninput={{perform this.updateTime value="target.value"}}
+          pattern="[0-9]*"
+          data-test-ttl-value={{this.label}}
+        />
+      </div>
+      <div class="control">
+        <label for="select-ttl-unit" class="sr-only">Unit for TTL</label>
+        {{! Select automatically gets id based on name }}
+        <Select
+          @ariaLabel="TTL unit for {{this.label}}"
+          @name="ttl-unit"
+          @options={{this.unitOptions}}
+          @onChange={{this.updateUnit}}
+          @selectedValue={{this.unit}}
+          data-test-ttl-unit={{this.label}}
+        />
+      </div>
+      {{#if this.errorMessage}}
+        <div class="columns is-mobile is-variable is-1 ttl-value-error">
+          <div class="is-narrow message-icon">
+            <Icon @name="x-square-fill" class="has-text-danger" />
+          </div>
+          <div class="has-text-danger">
+            {{this.errorMessage}}
+          </div>
+        </div>
+      {{/if}}
+    </fieldset>
+  {{else}}
+    <Toggle
+      @name={{this.label}}
+      @onChange={{action "toggleEnabled"}}
+      @checked={{this.enableTTL}}
+      @hideLabel={{true}}
+      data-test-ttl-toggle={{this.label}}
+      aria-describedby={{concat (dasherize this.label) "-helper-text"}}
+    >
+      <fieldset class="field is-grouped is-marginless is-borderless">
+        {{#if (has-block)}}
+          {{! Allow label override }}
+          {{yield}}
+        {{else}}
+          <legend>
+            <span class="ttl-picker-label is-large" data-test-ttl-form-label={{this.label}}>{{this.label}}</span><br />
+            {{#if this.helperText}}
+              <div class="sub-text">
+                <span id={{concat (dasherize this.label) "-helper-text"}} data-test-ttl-form-subtext>{{this.helperText}}
+                </span>
+                {{#if @description}}
+                  <Hds::TooltipButton
+                    @text={{@description}}
+                    @placement="bottom"
+                    aria-label="description"
+                    data-test-tooltip="ttl-picker"
+                  >
+                    <Icon @name="info" />
+                  </Hds::TooltipButton>
+                {{/if}}
+              </div>
+            {{/if}}
+          </legend>
+        {{/if}}
+        {{#if (or this.enableTTL @hideToggle)}}
+          <div class="control is-marginless" data-test-ttl-inputs>
+            <label for="time-{{this.elementId}}" class="sr-only">Number of units</label>
+            <Input
+              id="time-{{this.elementId}}"
+              @value={{this.time}}
+              @type="text"
+              name="time"
+              class="input {{if this.errorMessage 'has-error'}}"
+              oninput={{perform this.updateTime value="target.value"}}
+              pattern="[0-9]*"
+              data-test-ttl-value={{this.label}}
+            />
+          </div>
+          <div class="control">
+            <label for="unit-{{this.elementId}}" class="sr-only">Unit for TTL</label>
+            <Select
+              id="unit-{{this.elementId}}"
+              @ariaLabel="TTL unit for {{this.label}}"
+              @name="ttl-unit"
+              @options={{this.unitOptions}}
+              @onChange={{this.updateUnit}}
+              @selectedValue={{this.unit}}
+              data-test-ttl-unit={{this.label}}
+            />
+          </div>
+          {{#if this.errorMessage}}
+            <div class="columns is-mobile is-variable is-1 ttl-value-error">
+              <div class="is-narrow message-icon">
+                <Icon @name="x-square-fill" class="has-text-danger" />
+              </div>
+              <div class="has-text-danger">
+                {{this.errorMessage}}
+              </div>
+            </div>
+          {{/if}}
+        {{/if}}
+      </fieldset>
+    </Toggle>
+  {{/if}}
+</div>

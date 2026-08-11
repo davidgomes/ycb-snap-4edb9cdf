@@ -1,0 +1,29 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+{{#each @model.policies as |policyName|}}
+  <LinkedBlock @params={{array "vault.cluster.policy.show" "acl" policyName}} class="list-item-row">
+    <Hds::Layout::Flex @direction="row" @align="center" @gap="16" as |LF|>
+      <LF.Item @grow={{true}} @shrink={{true}}>
+        <LinkTo
+          @route="vault.cluster.policy.show"
+          @models={{array "acl" policyName}}
+          class="is-block has-text-black has-text-weight-semibold"
+        >
+          <span class="is-underline">{{policyName}}</span>
+        </LinkTo>
+      </LF.Item>
+      <LF.Item>
+        {{#if @model.canEdit}}
+          <Identity::PopupPolicy @model={{@model}} @policyName={{policyName}} />
+        {{/if}}
+      </LF.Item>
+    </Hds::Layout::Flex>
+  </LinkedBlock>
+{{else}}
+  <Hds::ApplicationState class="top-padding-32 is-marginless" as |A|>
+    <A.Header data-test-empty-state-title @title="No policies associated with {{@model.name}} yet" @titleTag="h2" />
+  </Hds::ApplicationState>
+{{/each}}

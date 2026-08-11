@@ -1,0 +1,13 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Mfa::MfaLoginEnforcementHeader @heading="New enforcement" />
+<Mfa::MfaLoginEnforcementForm
+  @form={{this.model.form}}
+  @methods={{this.model.methods}}
+  @onClose={{transition-to "vault.cluster.access.mfa.enforcements"}}
+  @onSave={{transition-to "vault.cluster.access.mfa.enforcements.enforcement" this.model.form.data.name}}
+  class="has-top-margin-l"
+/>

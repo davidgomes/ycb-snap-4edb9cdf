@@ -1,0 +1,56 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Page::Header @title={{@title}}>
+  <:breadcrumbs>
+    {{#unless @isSecondary}}
+      <Page::Breadcrumbs
+        @breadcrumbs={{array (hash label="Vault" route="vault" icon="vault" linkExternal=true) (hash label=@title)}}
+      />
+    {{/unless}}
+  </:breadcrumbs>
+  <:badges>
+    {{#if @data.anyReplicationEnabled}}
+      <Hds::Badge
+        @text={{if @isSecondary "secondary" "primary"}}
+        data-test-badge={{if @isSecondary "secondary" "primary"}}
+      />
+      {{#if @secondaryId}}
+        <Hds::Badge @text={{@secondaryId}} data-test-badge={{@secondaryId}} />
+      {{/if}}
+    {{/if}}
+  </:badges>
+</Page::Header>
+
+{{#if @showTabs}}
+  <div class="tabs-container box is-bottomless is-fullwidth is-paddingless has-bottom-margin-l" data-test-tabs>
+    <nav class="tabs">
+      {{#if @isSummaryDashboard}}
+        <ul>
+          <li class="is-active">
+            <LinkToExternal @route="replication">Summary</LinkToExternal>
+          </li>
+        </ul>
+      {{else}}
+        <ul>
+          <li>
+            <LinkTo @route="vault.cluster.replication-dr-promote.details" data-test-link-to="Details">
+              Details
+            </LinkTo>
+          </li>
+          <li>
+            <LinkTo
+              @route="vault.cluster.replication-dr-promote"
+              @current-when="vault.cluster.replication-dr-promote.index"
+              data-test-link-to="Manage"
+            >
+              Manage
+            </LinkTo>
+          </li>
+        </ul>
+      {{/if}}
+    </nav>
+  </div>
+{{/if}}

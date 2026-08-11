@@ -1,0 +1,60 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Page::Header @title={{@pageTitle}}>
+  <:breadcrumbs>
+    <Page::Breadcrumbs @breadcrumbs={{@breadcrumbs}} />
+  </:breadcrumbs>
+  <:description>
+    {{#if @showTabs}}
+      Configure global banners or modal notifications to display important system updates or compliance reminders to GUI
+      users.
+      <Hds::Link::Inline @isHrefExternal={{true}} @href={{doc-link "/vault/gui/custom-msg"}}>
+        Learn more
+      </Hds::Link::Inline>
+    {{/if}}
+  </:description>
+</Page::Header>
+
+{{#if @showTabs}}
+  <div class="tabs-container box is-bottomless is-marginless is-paddingless">
+    <nav class="tabs" aria-label="custom-messages">
+      <ul>
+        <li>
+          {{! Explicitly setting page to 1 here since we want to reset the page param on transition}}
+          <LinkTo
+            class={{if @authenticated "active"}}
+            @route="messages"
+            @query={{hash authenticated=true page=1 pageFilter=null status=null type=null}}
+            data-test-custom-messages-tab="After user logs in"
+          >
+            After user logs in
+          </LinkTo>
+        </li>
+        <li>
+          <LinkTo
+            class={{unless @authenticated "active"}}
+            @route="messages"
+            @query={{hash authenticated=false page=1 pageFilter=null status=null type=null}}
+            data-test-custom-messages-tab="On login page"
+          >
+            On login page
+          </LinkTo>
+        </li>
+      </ul>
+    </nav>
+  </div>
+
+  {{#if (or (has-block "toolbarFilters") (has-block "toolbarActions"))}}
+    <Toolbar aria-label="Create message">
+      <ToolbarFilters aria-label="Create message">
+        {{yield to="toolbarFilters"}}
+      </ToolbarFilters>
+      <ToolbarActions aria-label="Create message">
+        {{yield to="toolbarActions"}}
+      </ToolbarActions>
+    </Toolbar>
+  {{/if}}
+{{/if}}

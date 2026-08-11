@@ -1,0 +1,52 @@
+@use '../utils/box-shadow_variables';
+@use '../utils/size_variables';
+
+/**
+ * Copyright IBM Corp. 2016, 2025
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+.transit-card-container {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 0.2fr));
+  grid-template-rows: 1fr;
+  align-content: start;
+  grid-gap: 2rem;
+  margin-top: size_variables.$spacing-24;
+}
+
+.transit-card {
+  border-radius: var(--token-border-radius-x-small);
+  box-shadow: 0 0 0 1px rgba(var(--token-color-palette-neutral-300), 0.4);
+  display: grid;
+  grid-template-columns: 0.45fr 2fr;
+  padding: size_variables.$spacing-16;
+  border: none;
+
+  .transit-icon {
+    justify-self: center;
+  }
+
+  .transit-action-description {
+    font-family: var(--token-typography-font-stack-text);
+    font-size: var(--token-typography-body-200-font-size);
+    color: var(--token-color-palette-neutral-400);
+  }
+
+  .title {
+    color: var(--token-color-palette-neutral-400);
+    font-size: size_variables.$size-7;
+    margin-bottom: size_variables.$spacing-4;
+  }
+
+  &:hover {
+    box-shadow:
+      0 0 0 1px var(--token-color-palette-blue-200),
+      box-shadow_variables.$box-shadow-middle;
+    background: var(--token-color-palette-blue-50);
+
+    .title {
+      color: initial;
+    }
+  }
+}

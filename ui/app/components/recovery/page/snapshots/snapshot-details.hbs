@@ -1,0 +1,67 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Page::Header @title="Secrets recovery">
+  <:breadcrumbs>
+    <Page::Breadcrumbs @breadcrumbs={{@breadcrumbs}} />
+  </:breadcrumbs>
+  <:description>
+    Restore specific secrets from cluster snapshots without impacting the availability of the active Vault cluster.
+    <Hds::Link::Inline @isHrefExternal={{true}} @href={{doc-link "/vault/gui/recover-secrets"}}>
+      Learn more
+    </Hds::Link::Inline>
+  </:description>
+  <:actions>
+    <Hds::Button
+      @text="Recover secrets"
+      @icon="reload"
+      @iconPosition="leading"
+      @color="primary"
+      @route="vault.cluster.recovery.snapshots.snapshot.manage"
+      @models={{(array @model.snapshot.snapshot_id)}}
+    />
+  </:actions>
+</Page::Header>
+
+<Hds::Table data-test-table="details">
+  <:head as |H|>
+    <H.Tr>
+      {{#each this.tableColumns as |col|}}
+        <H.Th>{{col.label}}</H.Th>
+      {{/each}}
+      <H.Th>Status</H.Th>
+      <H.Th>Actions</H.Th>
+    </H.Tr>
+  </:head>
+  <:body as |B|>
+    <B.Tr>
+      {{#each this.tableColumns as |item|}}
+        <B.Td>{{item.value}}</B.Td>
+      {{/each}}
+      <B.Td>
+        <Hds::Badge @text={{this.badge.status}} @color={{this.badge.color}} data-test-badge="status" />
+      </B.Td>
+      <B.Td @align="right">
+        <Hds::Dropdown @isInline={{true}} as |dd|>
+          <dd.ToggleIcon
+            @icon="more-horizontal"
+            @text="Overflow Options"
+            @hasChevron={{false}}
+            @size="small"
+            data-test-button="toggle"
+          />
+          <dd.Interactive
+            @icon="key"
+            @route="vault.cluster.recovery.snapshots.snapshot.manage"
+            @models={{array @model.snapshot.snapshot_id}}
+          >Manage secrets</dd.Interactive>
+          {{#if this.namespace.inRootNamespace}}
+            <dd.Interactive @color="critical" @icon="trash" {{on "click" this.unloadSnapshot}}>Unload snapshot</dd.Interactive>
+          {{/if}}
+        </Hds::Dropdown>
+      </B.Td>
+    </B.Tr>
+  </:body>
+</Hds::Table>

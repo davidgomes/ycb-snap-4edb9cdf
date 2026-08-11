@@ -1,0 +1,36 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<KubernetesHeader
+  @model={{@secretsEngine}}
+  @promptConfig={{@promptConfig}}
+  @breadcrumbs={{@breadcrumbs}}
+  @configRoute="configuration"
+>
+  {{#if @config}}
+    <ToolbarLink @route="configure" data-test-secret-backend-configure>
+      Edit configuration
+    </ToolbarLink>
+  {{/if}}
+</KubernetesHeader>
+
+{{#if @config}}
+  {{#if @config.disable_local_ca_jwt}}
+    <InfoTableRow @label="Kubernetes host" @value={{@config.kubernetes_host}} />
+    {{#if @config.kubernetes_ca_cert}}
+      <InfoTableRow @label="Certificate">
+        <EncodedDataCard @data={{@config.kubernetes_ca_cert}} @isPem={{true}} />
+      </InfoTableRow>
+    {{/if}}
+  {{else}}
+    <div class="has-top-margin-l" data-test-inferred-message>
+      <Icon @name="check-circle-fill" class="has-text-success" />
+      <span>
+        These details were successfully inferred from Vault’s kubernetes environment and were not explicity set in this
+        config.
+      </span>
+    </div>
+  {{/if}}
+{{/if}}

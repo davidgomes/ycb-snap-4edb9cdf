@@ -1,0 +1,41 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+{{#if (not-eq this.router.currentRoute.localName "edit")}}
+  <Page::Header @title={{this.model.provider.name}}>
+    <:breadcrumbs>
+      <Page::Breadcrumbs
+        @breadcrumbs={{array
+          (hash label="Vault" route="vault.cluster.dashboard" icon="vault")
+          (hash label="OIDC provider: Providers" route="vault.cluster.access.oidc.providers")
+          (hash label=this.model.provider.name)
+        }}
+      />
+    </:breadcrumbs>
+  </Page::Header>
+
+  <div class="tabs-container box is-sideless is-fullwidth is-paddingless is-marginless">
+    <nav class="tabs" aria-label="tabs">
+      <ul>
+        <LinkTo
+          data-test-oidc-provider-details
+          @route="vault.cluster.access.oidc.providers.provider.details"
+          @model={{this.model.provider.name}}
+        >
+          Details
+        </LinkTo>
+        <LinkTo
+          data-test-oidc-provider-clients
+          @route="vault.cluster.access.oidc.providers.provider.clients"
+          @model={{this.model.provider.name}}
+        >
+          Applications
+        </LinkTo>
+      </ul>
+    </nav>
+  </div>
+{{/if}}
+
+{{outlet}}

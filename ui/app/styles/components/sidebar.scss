@@ -1,0 +1,37 @@
+@use '../utils/size_variables';
+
+/**
+ * Copyright IBM Corp. 2016, 2025
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+.sidebar-user-menu {
+  align-self: center;
+
+  .popup-menu-content {
+    .menu-label {
+      color: hsl(0, 0%, 4%);
+      font-size: var(--token-typography-body-200-font-size);
+      font-weight: var(--token-typography-font-weight-bold);
+      text-transform: unset;
+    }
+    .token-alert {
+      padding: size_variables.$spacing-8;
+    }
+  }
+
+  .confirm-action-message p {
+    padding-top: size_variables.$spacing-4;
+    font-weight: var(--token-typography-font-weight-semibold);
+    color: hsl(0, 0%, 4%);
+  }
+}
+
+// Allows for sibling components of the AppSideNav::Portal::Target to be
+// anchored to the bottom of the AppSideNav.
+// Setting the margin-top to auto on the sibling component will push it
+// to the bottom of the AppSideNav. See .env-banner class for reference.
+.vault-sidebar-nav-body .hds-app-side-nav__wrapper-body {
+  display: flex;
+  flex-direction: column;
+}

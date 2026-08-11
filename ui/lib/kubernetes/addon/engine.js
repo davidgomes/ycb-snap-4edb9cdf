@@ -1,0 +1,24 @@
+/**
+ * Copyright IBM Corp. 2016, 2025
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+import Engine from '@ember/engine';
+
+import loadInitializers from 'ember-load-initializers';
+import Resolver from 'ember-resolver';
+
+import config from './config/environment';
+
+const { modulePrefix } = config;
+
+export default class KubernetesEngine extends Engine {
+  modulePrefix = modulePrefix;
+  Resolver = Resolver;
+  dependencies = {
+    services: ['app-router', 'secret-mount-path', 'flash-messages', 'api', 'capabilities'],
+    externalRoutes: ['secrets', 'secretsGeneralSettingsConfiguration', 'vault'],
+  };
+}
+
+loadInitializers(KubernetesEngine, modulePrefix);

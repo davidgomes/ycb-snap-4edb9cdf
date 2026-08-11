@@ -1,0 +1,142 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<PkiPaginatedList @backend={{@backend}} @listRoute="issuers.index" @list={{@issuers}}>
+  <:actions>
+    <ToolbarLink @route="issuers.import" @model={{@backend}} data-test-generate-issuer="import">
+      Import
+    </ToolbarLink>
+    <BasicDropdown
+      @class="popup-menu"
+      @horizontalPosition="auto-right"
+      @verticalPosition="below"
+      @renderInPlace={{true}}
+      as |D|
+    >
+      <D.Trigger
+        class={{concat "toolbar-link" (if D.isOpen " is-active")}}
+        @htmlTag="button"
+        data-test-issuer-generate-dropdown
+      >
+        Generate
+        <Chevron @direction="down" @isButton={{true}} />
+      </D.Trigger>
+      <D.Content @defaultClass="popup-menu-content">
+        <nav class="box menu" aria-label="generate options">
+          <ul class="menu-list">
+            <li>
+              <LinkTo
+                @route="issuers.generate-root"
+                @model={{@backend}}
+                {{on "click" (fn this.onLinkClick D)}}
+                data-test-generate-issuer="root"
+              >
+                Root
+              </LinkTo>
+            </li>
+            <li>
+              <LinkTo
+                @route="issuers.generate-intermediate"
+                @model={{@backend}}
+                {{on "click" (fn this.onLinkClick D)}}
+                data-test-generate-issuer="intermediate"
+              >
+                Intermediate CSR
+              </LinkTo>
+            </li>
+          </ul>
+        </nav>
+      </D.Content>
+    </BasicDropdown>
+  </:actions>
+  <:list as |issuers|>
+    {{#each issuers as |issuer idx|}}
+      <LinkedBlock
+        class="list-item-row"
+        @params={{array "issuers.issuer.details" @backend issuer.issuer_id}}
+        @linkPrefix={{@mountPoint}}
+      >
+        <div class="level is-mobile">
+          <div class="level-left">
+            <div data-test-issuer-list={{issuer.issuer_id}}>
+              <Icon @name="certificate" class="has-text-grey-light" />
+              <span class="has-text-weight-semibold is-underline">
+                {{or issuer.issuer_name issuer.issuer_id}}
+                {{#if (and issuer.issuer_id issuer.issuer_name)}}
+                  <Hds::Badge @text={{issuer.issuer_id}} />
+                {{/if}}
+              </span>
+              <div class="is-flex-row has-left-margin-l has-top-margin-xs">
+                {{#if issuer.is_default}}
+                  <Hds::Badge @text="default issuer" data-test-is-default={{idx}} class="has-right-margin-8" />
+                {{/if}}
+                {{#if (not-eq issuer.isRoot undefined)}}
+                  <Hds::Badge
+                    @text={{if issuer.isRoot "root" "intermediate"}}
+                    data-test-is-root-tag={{idx}}
+                    class="has-right-margin-8"
+                  />
+                {{/if}}
+                {{#if issuer.serial_number}}
+                  <span class="is-flex-v-centered has-side-padding-8" data-test-serial-number={{idx}}>
+                    <Hds::TooltipButton @text="Serial number" aria-label="This is the serial number">
+                      <Hds::Icon @name="info" />
+                    </Hds::TooltipButton>
+                    {{issuer.serial_number}}
+                  </span>
+                {{/if}}
+                {{#if issuer.parsedCertificate.common_name}}
+                  <span class="is-flex-v-centered has-side-padding-8" data-test-common-name={{idx}}>
+                    <Hds::TooltipButton @text="Common name" aria-label="This is the common name">
+                      <Hds::Icon @name="info" />
+                    </Hds::TooltipButton>
+                    {{issuer.parsedCertificate.common_name}}
+                  </span>
+                {{/if}}
+              </div>
+            </div>
+          </div>
+          <div class="level-right is-flex is-paddingless is-marginless">
+            <div class="level-item">
+              <Hds::Dropdown @isInline={{true}} @listPosition="bottom-right" as |dd|>
+                <dd.ToggleIcon
+                  @icon="more-horizontal"
+                  @text="Manage issuer"
+                  @hasChevron={{false}}
+                  data-test-popup-menu-trigger
+                />
+                <dd.Interactive
+                  @route="issuers.issuer.details"
+                  @models={{array @backend issuer.issuer_id}}
+                  data-test-pki-issuer-details
+                >
+                  Details
+                </dd.Interactive>
+                <dd.Interactive @route="issuers.issuer.edit" @models={{array @backend issuer.issuer_id}}>
+                  Edit
+                </dd.Interactive>
+              </Hds::Dropdown>
+            </div>
+          </div>
+        </div>
+      </LinkedBlock>
+    {{/each}}
+  </:list>
+  <:empty>
+    <Hds::ApplicationState class="top-padding-32 is-marginless" as |A|>
+      <A.Header @title="PKI not configured" @titleTag="h2" data-test-empty-state-title />
+      <A.Body @text={{this.notConfiguredMessage}} data-test-empty-state-message />
+      <A.Footer data-test-empty-state-actions as |F|>
+        <F.LinkStandalone
+          @icon="chevron-right"
+          @iconPosition="trailing"
+          @text="Configure PKI"
+          @route="configuration.create"
+          @model={{@backend}}
+        />
+      </A.Footer>
+    </Hds::ApplicationState>
+  </:empty>
+</PkiPaginatedList>

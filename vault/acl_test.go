@@ -1,0 +1,2504 @@
+// Copyright IBM Corp. 2016, 2025
+// SPDX-License-Identifier: BUSL-1.1
+
+package vault
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"reflect"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/hashicorp/vault/helper/namespace"
+	"github.com/hashicorp/vault/sdk/helper/jsonutil"
+	"github.com/hashicorp/vault/sdk/logical"
+	"github.com/stretchr/testify/require"
+)
+
+func TestACL_NewACL(t *testing.T) {
+	t.Run("root-ns", func(t *testing.T) {
+		t.Parallel()
+		testNewACL(t, namespace.RootNamespace)
+	})
+}
+
+func testNewACL(t *testing.T, ns *namespace.Namespace) {
+	ctx := namespace.ContextWithNamespace(context.Background(), ns)
+	policy := []*Policy{{Name: "root"}}
+	_, err := NewACL(ctx, policy)
+	switch ns.ID {
+	case namespace.RootNamespaceID:
+		if err != nil {
+			t.Fatal(err)
+		}
+	default:
+		if err == nil {
+			t.Fatal("expected an error")
+		}
+	}
+}
+
+func TestACL_MFAMethods(t *testing.T) {
+	t.Run("root-ns", func(t *testing.T) {
+		t.Parallel()
+		testACLMFAMethods(t, namespace.RootNamespace)
+	})
+}
+
+func testACLMFAMethods(t *testing.T, ns *namespace.Namespace) {
+	mfaRules := `
+path "secret/foo/*" {
+	mfa_methods = ["mfa_method_1", "mfa_method_2", "mfa_method_3"]
+}
+path "secret/exact/path" {
+	mfa_methods = ["mfa_method_4", "mfa_method_5"]
+}
+path "secret/split/definition" {
+	mfa_methods = ["mfa_method_6", "mfa_method_7"]
+}
+path "secret/split/definition" {
+	mfa_methods = ["mfa_method_7", "mfa_method_8", "mfa_method_9"]
+}
+	`
+
+	policy, err := ParseACLPolicy(ns, mfaRules)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := namespace.ContextWithNamespace(context.Background(), ns)
+	acl, err := NewACL(ctx, []*Policy{policy})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := &logical.Request{
+		Operation: logical.UpdateOperation,
+		Path:      "secret/foo/testing/glob/pattern",
+	}
+
+	actual := acl.AllowOperation(ctx, request, false).MFAMethods
+	expected := []string{"mfa_method_1", "mfa_method_2", "mfa_method_3"}
+
+	if !reflect.DeepEqual(expected, actual) {
+		t.Fatalf("bad: MFA methods; expected: %#v\n actual: %#v\n", expected, actual)
+	}
+
+	request.Path = "secret/exact/path"
+	actual = acl.AllowOperation(ctx, request, false).MFAMethods
+	expected = []string{"mfa_method_4", "mfa_method_5"}
+
+	if !reflect.DeepEqual(expected, actual) {
+		t.Fatalf("bad: MFA methods; expected: %#v\n actual: %#v\n", expected, actual)
+	}
+
+	request.Path = "secret/split/definition"
+	actual = acl.AllowOperation(ctx, request, false).MFAMethods
+	expected = []string{"mfa_method_6", "mfa_method_7", "mfa_method_8", "mfa_method_9"}
+
+	if !reflect.DeepEqual(expected, actual) {
+		t.Fatalf("bad: MFA methods; expected: %#v\n actual: %#v\n", expected, actual)
+	}
+}
+
+func TestACL_Capabilities(t *testing.T) {
+	t.Run("root-ns", func(t *testing.T) {
+		t.Parallel()
+		policy := []*Policy{{Name: "root"}}
+		ctx := namespace.RootContext(context.Background())
+		acl, err := NewACL(ctx, policy)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		actual := acl.Capabilities(ctx, "any/path")
+		expected := []string{"root"}
+		if !reflect.DeepEqual(actual, expected) {
+			t.Fatalf("bad: got\n%#v\nexpected\n%#v\n", actual, expected)
+		}
+		testACLCapabilities(t, namespace.RootNamespace)
+	})
+}
+
+func testACLCapabilities(t *testing.T, ns *namespace.Namespace) {
+	// Create the root policy ACL
+	ctx := namespace.ContextWithNamespace(context.Background(), ns)
+	policy, err := ParseACLPolicy(ns, aclPolicy)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	acl, err := NewACL(ctx, []*Policy{policy})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	actual := acl.Capabilities(ctx, "dev")
+	expected := []string{"deny"}
+	if !reflect.DeepEqual(actual, expected) {
+		t.Fatalf("bad: path: %s\ngot\n%#v\nexpected\n%#v\n", "deny", actual, expected)
+	}
+
+	actual = acl.Capabilities(ctx, "dev/")
+	expected = []string{"sudo", "read", "list", "update", "delete", "create"}
+	if !reflect.DeepEqual(actual, expected) {
+		t.Fatalf("bad: path: %s\ngot\n%#v\nexpected\n%#v\n", "dev/", actual, expected)
+	}
+
+	actual = acl.Capabilities(ctx, "stage/aws/test")
+	expected = []string{"sudo", "read", "list", "update"}
+	if !reflect.DeepEqual(actual, expected) {
+		t.Fatalf("bad: path: %s\ngot\n%#v\nexpected\n%#v\n", "stage/aws/test", actual, expected)
+	}
+}
+
+func TestACL_Root(t *testing.T) {
+	t.Run("root-ns", func(t *testing.T) {
+		t.Parallel()
+		testACLRoot(t, namespace.RootNamespace)
+	})
+}
+
+func testACLRoot(t *testing.T, ns *namespace.Namespace) {
+	// Create the root policy ACL. Always create on root namespace regardless of
+	// which namespace to ACL check on.
+	policy := []*Policy{{Name: "root"}}
+	acl, err := NewACL(namespace.RootContext(context.Background()), policy)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	request := new(logical.Request)
+	request.Operation = logical.UpdateOperation
+	request.Path = "sys/mount/foo"
+	ctx := namespace.ContextWithNamespace(context.Background(), ns)
+
+	authResults := acl.AllowOperation(ctx, request, false)
+	if !authResults.RootPrivs {
+		t.Fatalf("expected root")
+	}
+	if !authResults.Allowed {
+		t.Fatalf("expected permissions")
+	}
+}
+
+func TestACL_Single(t *testing.T) {
+	t.Run("root-ns", func(t *testing.T) {
+		t.Parallel()
+		testACLSingle(t, namespace.RootNamespace)
+	})
+}
+
+func testACLSingle(t *testing.T, ns *namespace.Namespace) {
+	policy, err := ParseACLPolicy(ns, aclPolicy)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	ctx := namespace.ContextWithNamespace(context.Background(), ns)
+	acl, err := NewACL(ctx, []*Policy{policy})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Type of operation is not important here as we only care about checking
+	// sudo/root
+	ctx = namespace.ContextWithNamespace(context.Background(), ns)
+	request := new(logical.Request)
+	request.Operation = logical.ReadOperation
+	request.Path = "sys/mount/foo"
+
+	authResults := acl.AllowOperation(ctx, request, false)
+	if authResults.RootPrivs {
+		t.Fatalf("unexpected root")
+	}
+
+	type tcase struct {
+		op        logical.Operation
+		path      string
+		allowed   bool
+		rootPrivs bool
+	}
+	tcases := []tcase{
+		{logical.ReadOperation, "root", false, false},
+		{logical.HelpOperation, "root", true, false},
+
+		{logical.ReadOperation, "dev/foo", true, true},
+		{logical.UpdateOperation, "dev/foo", true, true},
+
+		{logical.DeleteOperation, "stage/foo", true, false},
+		{logical.ListOperation, "stage/aws/foo", true, true},
+		{logical.UpdateOperation, "stage/aws/foo", true, true},
+		{logical.UpdateOperation, "stage/aws/policy/foo", true, true},
+
+		{logical.DeleteOperation, "prod/foo", false, false},
+		{logical.UpdateOperation, "prod/foo", false, false},
+		{logical.ReadOperation, "prod/foo", true, false},
+		{logical.ListOperation, "prod/foo", true, false},
+		{logical.ReadOperation, "prod/aws/foo", false, false},
+
+		{logical.ReadOperation, "foo/bar", true, true},
+		{logical.ListOperation, "foo/bar", false, true},
+		{logical.UpdateOperation, "foo/bar", false, true},
+		{logical.CreateOperation, "foo/bar", true, true},
+
+		{logical.ReadOperation, "baz/quux", true, false},
+		{logical.CreateOperation, "baz/quux", true, false},
+		{logical.PatchOperation, "baz/quux", true, false},
+		{logical.ListOperation, "baz/quux", false, false},
+		{logical.UpdateOperation, "baz/quux", false, false},
+
+		// Path segment wildcards
+		{logical.ReadOperation, "test/foo/bar/segment", false, false},
+		{logical.ReadOperation, "test/foo/segment", true, false},
+		{logical.ReadOperation, "test/bar/segment", true, false},
+		{logical.ReadOperation, "test/segment/at/frond", false, false},
+		{logical.ReadOperation, "test/segment/at/front", true, false},
+		{logical.ReadOperation, "test/segment/at/end/foo", true, false},
+		{logical.ReadOperation, "test/segment/at/end/foo/", false, false},
+		{logical.ReadOperation, "test/segment/at/end/v2/foo/", true, false},
+		{logical.ReadOperation, "test/segment/wildcard/at/foo/", true, false},
+		{logical.ReadOperation, "test/segment/wildcard/at/end", true, false},
+		{logical.ReadOperation, "test/segment/wildcard/at/end/", true, false},
+
+		// Path segment wildcards vs glob
+		{logical.ReadOperation, "1/2/3/4", false, false},
+		{logical.ReadOperation, "1/2/3", true, false},
+		{logical.UpdateOperation, "1/2/3", false, false},
+		{logical.UpdateOperation, "1/2/3/4", true, false},
+		{logical.CreateOperation, "1/2/3/4/5", true, false},
+		{logical.RecoverOperation, "1/2/3/4", true, false},
+	}
+
+	for _, tc := range tcases {
+		ctx := namespace.ContextWithNamespace(context.Background(), ns)
+		request := new(logical.Request)
+		request.Operation = tc.op
+		request.Path = tc.path
+
+		authResults := acl.AllowOperation(ctx, request, false)
+		if authResults.Allowed != tc.allowed {
+			t.Fatalf("bad: case %#v: %v, %v", tc, authResults.Allowed, authResults.RootPrivs)
+		}
+		if authResults.RootPrivs != tc.rootPrivs {
+			t.Fatalf("bad: case %#v: %v, %v", tc, authResults.Allowed, authResults.RootPrivs)
+		}
+	}
+}
+
+func TestACL_Layered(t *testing.T) {
+	t.Run("root-ns", func(t *testing.T) {
+		t.Parallel()
+		policy1, err := ParseACLPolicy(namespace.RootNamespace, aclPolicy)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		policy2, err := ParseACLPolicy(namespace.RootNamespace, aclPolicy2)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		acl, err := NewACL(namespace.RootContext(context.Background()), []*Policy{policy1, policy2})
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		testLayeredACL(t, acl, namespace.RootNamespace)
+	})
+}
+
+func testLayeredACL(t *testing.T, acl *ACL, ns *namespace.Namespace) {
+	// Type of operation is not important here as we only care about checking
+	// sudo/root
+	ctx := namespace.ContextWithNamespace(context.Background(), ns)
+	request := new(logical.Request)
+	request.Operation = logical.ReadOperation
+	request.Path = "sys/mount/foo"
+
+	authResults := acl.AllowOperation(ctx, request, false)
+	if authResults.RootPrivs {
+		t.Fatalf("unexpected root")
+	}
+
+	type tcase struct {
+		op        logical.Operation
+		path      string
+		allowed   bool
+		rootPrivs bool
+	}
+	tcases := []tcase{
+		{logical.ReadOperation, "root", false, false},
+		{logical.HelpOperation, "root", true, false},
+
+		{logical.ReadOperation, "dev/foo", true, true},
+		{logical.UpdateOperation, "dev/foo", true, true},
+		{logical.ReadOperation, "dev/hide/foo", false, false},
+		{logical.UpdateOperation, "dev/hide/foo", false, false},
+
+		{logical.DeleteOperation, "stage/foo", true, false},
+		{logical.ListOperation, "stage/aws/foo", true, true},
+		{logical.UpdateOperation, "stage/aws/foo", true, true},
+		{logical.UpdateOperation, "stage/aws/policy/foo", false, false},
+
+		{logical.DeleteOperation, "prod/foo", true, false},
+		{logical.UpdateOperation, "prod/foo", true, false},
+		{logical.ReadOperation, "prod/foo", true, false},
+		{logical.ListOperation, "prod/foo", true, false},
+		{logical.ReadOperation, "prod/aws/foo", false, false},
+
+		{logical.ReadOperation, "sys/status", false, false},
+		{logical.UpdateOperation, "sys/seal", true, true},
+
+		{logical.ReadOperation, "foo/bar", false, false},
+		{logical.ListOperation, "foo/bar", false, false},
+		{logical.UpdateOperation, "foo/bar", false, false},
+		{logical.CreateOperation, "foo/bar", false, false},
+
+		{logical.ReadOperation, "baz/quux", false, false},
+		{logical.ListOperation, "baz/quux", false, false},
+		{logical.UpdateOperation, "baz/quux", false, false},
+		{logical.CreateOperation, "baz/quux", false, false},
+		{logical.PatchOperation, "baz/quux", false, false},
+	}
+
+	for _, tc := range tcases {
+		ctx := namespace.ContextWithNamespace(context.Background(), ns)
+		request := new(logical.Request)
+		request.Operation = tc.op
+		request.Path = tc.path
+
+		authResults := acl.AllowOperation(ctx, request, false)
+		if authResults.Allowed != tc.allowed {
+			t.Fatalf("bad: case %#v: %v, %v", tc, authResults.Allowed, authResults.RootPrivs)
+		}
+		if authResults.RootPrivs != tc.rootPrivs {
+			t.Fatalf("bad: case %#v: %v, %v", tc, authResults.Allowed, authResults.RootPrivs)
+		}
+	}
+}
+
+func TestACL_ParseMalformedPolicy(t *testing.T) {
+	_, err := ParseACLPolicy(namespace.RootNamespace, `name{}`)
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+}
+
+func TestACL_PolicyMerge(t *testing.T) {
+	t.Run("root-ns", func(t *testing.T) {
+		t.Parallel()
+		testACLPolicyMerge(t, namespace.RootNamespace)
+	})
+}
+
+func testACLPolicyMerge(t *testing.T, ns *namespace.Namespace) {
+	policy, err := ParseACLPolicy(ns, mergingPolicies)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	ctx := namespace.ContextWithNamespace(context.Background(), ns)
+	acl, err := NewACL(ctx, []*Policy{policy})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	type tcase struct {
+		path           string
+		minWrappingTTL *time.Duration
+		maxWrappingTTL *time.Duration
+		allowed        map[string][]interface{}
+		denied         map[string][]interface{}
+		required       []string
+	}
+
+	createDuration := func(seconds int) *time.Duration {
+		ret := time.Duration(seconds) * time.Second
+		return &ret
+	}
+
+	tcases := []tcase{
+		{"foo/bar", nil, nil, nil, map[string][]interface{}{"zip": {}, "baz": {}}, []string{"baz"}},
+		{"hello/universe", createDuration(50), createDuration(200), map[string][]interface{}{"foo": {}, "bar": {}}, nil, []string{"foo", "bar"}},
+		{"allow/all", nil, nil, map[string][]interface{}{"*": {}, "test": {}, "test1": {"foo"}}, nil, nil},
+		{"allow/all1", nil, nil, map[string][]interface{}{"*": {}, "test": {}, "test1": {"foo"}}, nil, nil},
+		{"deny/all", nil, nil, nil, map[string][]interface{}{"*": {}, "test": {}}, nil},
+		{"deny/all1", nil, nil, nil, map[string][]interface{}{"*": {}, "test": {}}, nil},
+		{"value/merge", nil, nil, map[string][]interface{}{"test": {3, 4, 1, 2}}, map[string][]interface{}{"test": {3, 4, 1, 2}}, nil},
+		{"value/empty", nil, nil, map[string][]interface{}{"empty": {}}, map[string][]interface{}{"empty": {}}, nil},
+	}
+
+	for _, tc := range tcases {
+		policyPath := ns.Path + tc.path
+		raw, ok := acl.exactRules.Get(policyPath)
+		if !ok {
+			t.Fatalf("Could not find acl entry for path %s", policyPath)
+		}
+
+		p := raw.(*ACLPermissions)
+		if !reflect.DeepEqual(tc.allowed, p.AllowedParameters) {
+			t.Fatalf("Allowed parameters did not match, Expected: %#v, Got: %#v", tc.allowed, p.AllowedParameters)
+		}
+		if !reflect.DeepEqual(tc.denied, p.DeniedParameters) {
+			t.Fatalf("Denied parameters did not match, Expected: %#v, Got: %#v", tc.denied, p.DeniedParameters)
+		}
+		if !reflect.DeepEqual(tc.required, p.RequiredParameters) {
+			t.Fatalf("Required parameters did not match, Expected: %#v, Got: %#v", tc.required, p.RequiredParameters)
+		}
+		if tc.minWrappingTTL != nil && *tc.minWrappingTTL != p.MinWrappingTTL {
+			t.Fatalf("Min wrapping TTL did not match, Expected: %#v, Got: %#v", tc.minWrappingTTL, p.MinWrappingTTL)
+		}
+		if tc.minWrappingTTL != nil && *tc.maxWrappingTTL != p.MaxWrappingTTL {
+			t.Fatalf("Max wrapping TTL did not match, Expected: %#v, Got: %#v", tc.maxWrappingTTL, p.MaxWrappingTTL)
+		}
+	}
+}
+
+// TestACL_SubscribeEventTypesMerge verifies that subscribe_event_types are preserved
+// when merged with another policy stanza for the same path that omits them.
+func TestACL_SubscribeEventTypesMerge(t *testing.T) {
+	t.Run("root-ns", func(t *testing.T) {
+		t.Parallel()
+
+		withSubscribe, err := ParseACLPolicy(namespace.RootNamespace, strings.TrimSpace(`
+			path "secret/foo" {
+				capabilities = ["read", "subscribe"]
+				subscribe_event_types = ["abc", "def"]
+			}
+		`))
+		require.NoError(t, err)
+
+		withoutSubscribeEventTypes, err := ParseACLPolicy(namespace.RootNamespace, strings.TrimSpace(`
+			path "secret/foo" {
+				capabilities = ["read", "update"]
+			}
+		`))
+		require.NoError(t, err)
+
+		testCases := []struct {
+			name     string
+			policies []*Policy
+		}{
+			{
+				name:     "subscribe policy first",
+				policies: []*Policy{withSubscribe, withoutSubscribeEventTypes},
+			},
+			{
+				name:     "subscribe policy second",
+				policies: []*Policy{withoutSubscribeEventTypes, withSubscribe},
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				ctx := namespace.RootContext(context.Background())
+				acl, err := NewACL(ctx, tc.policies)
+				require.NoError(t, err)
+
+				caps, eventTypes := acl.CapabilitiesAndSubscribeEventTypes(ctx, "secret/foo")
+				require.Contains(t, caps, SubscribeCapability)
+				require.ElementsMatch(t, []string{"abc", "def"}, eventTypes)
+			})
+		}
+	})
+}
+
+func TestACL_AllowOperation(t *testing.T) {
+	t.Run("root-ns", func(t *testing.T) {
+		t.Parallel()
+		testACLAllowOperation(t, namespace.RootNamespace)
+	})
+}
+
+func testACLAllowOperation(t *testing.T, ns *namespace.Namespace) {
+	policy, err := ParseACLPolicy(ns, permissionsPolicy)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	ctx := namespace.ContextWithNamespace(context.Background(), ns)
+	acl, err := NewACL(ctx, []*Policy{policy})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	toperations := []logical.Operation{
+		logical.UpdateOperation,
+		logical.CreateOperation,
+	}
+	type tcase struct {
+		path        string
+		wrappingTTL *time.Duration
+		parameters  []string
+		allowed     bool
+	}
+
+	createDuration := func(seconds int) *time.Duration {
+		ret := time.Duration(seconds) * time.Second
+		return &ret
+	}
+
+	tcases := []tcase{
+		{"dev/ops", nil, []string{"zip"}, true},
+		{"foo/bar", nil, []string{"zap"}, false},
+		{"foo/bar", nil, []string{"zip"}, false},
+		{"foo/bar", createDuration(50), []string{"zip"}, false},
+		{"foo/bar", createDuration(450), []string{"zip"}, false},
+		{"foo/bar", createDuration(350), []string{"zip"}, true},
+		{"foo/baz", nil, []string{"hello"}, false},
+		{"foo/baz", createDuration(50), []string{"hello"}, false},
+		{"foo/baz", createDuration(450), []string{"hello"}, true},
+		{"foo/baz", nil, []string{"zap"}, false},
+		{"broken/phone", nil, []string{"steve"}, false},
+		{"working/phone", nil, []string{""}, false},
+		{"working/phone", createDuration(450), []string{""}, false},
+		{"working/phone", createDuration(350), []string{""}, true},
+		{"hello/world", nil, []string{"one"}, false},
+		{"tree/fort", nil, []string{"one"}, true},
+		{"tree/fort", nil, []string{"foo"}, false},
+		{"fruit/apple", nil, []string{"pear"}, false},
+		{"fruit/apple", nil, []string{"one"}, false},
+		{"cold/weather", nil, []string{"four"}, true},
+		{"var/aws", nil, []string{"cold", "warm", "kitty"}, false},
+		{"var/req", nil, []string{"cold", "warm", "kitty"}, false},
+		{"var/req", nil, []string{"cold", "warm", "kitty", "foo"}, true},
+	}
+
+	for _, tc := range tcases {
+		request := &logical.Request{
+			Path: tc.path,
+			Data: make(map[string]interface{}),
+		}
+
+		for _, parameter := range tc.parameters {
+			request.Data[parameter] = ""
+		}
+		if tc.wrappingTTL != nil {
+			request.WrapInfo = &logical.RequestWrapInfo{
+				TTL: *tc.wrappingTTL,
+			}
+		}
+		for _, op := range toperations {
+			request.Operation = op
+			ctx := namespace.ContextWithNamespace(context.Background(), ns)
+			authResults := acl.AllowOperation(ctx, request, false)
+			if authResults.Allowed != tc.allowed {
+				t.Fatalf("bad: case %#v: %v", tc, authResults.Allowed)
+			}
+		}
+	}
+}
+
+func TestACL_ValuePermissions(t *testing.T) {
+	t.Run("root-ns", func(t *testing.T) {
+		t.Parallel()
+		testACLValuePermissions(t, namespace.RootNamespace)
+	})
+}
+
+func testACLValuePermissions(t *testing.T, ns *namespace.Namespace) {
+	policy, err := ParseACLPolicy(ns, valuePermissionsPolicy)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	ctx := namespace.ContextWithNamespace(context.Background(), ns)
+	acl, err := NewACL(ctx, []*Policy{policy})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	toperations := []logical.Operation{
+		logical.UpdateOperation,
+		logical.CreateOperation,
+	}
+	type tcase struct {
+		path       string
+		parameters []string
+		values     []interface{}
+		allowed    bool
+	}
+
+	tcases := []tcase{
+		{"dev/ops", []string{"allow"}, []interface{}{"good"}, true},
+		{"dev/ops", []string{"allow"}, []interface{}{"bad"}, false},
+		{"foo/bar", []string{"deny"}, []interface{}{"bad"}, false},
+		{"foo/bar", []string{"deny"}, []interface{}{"bad glob"}, false},
+		{"foo/bar", []string{"deny"}, []interface{}{"good"}, true},
+		{"foo/bar", []string{"allow"}, []interface{}{"good"}, true},
+		{"foo/bar", []string{"deny"}, []interface{}{nil}, true},
+		{"foo/bar", []string{"allow"}, []interface{}{nil}, true},
+		{"foo/baz", []string{"aLLow"}, []interface{}{"good"}, true},
+		{"foo/baz", []string{"deny"}, []interface{}{"bad"}, false},
+		{"foo/baz", []string{"deny"}, []interface{}{"good"}, false},
+		{"foo/baz", []string{"allow", "deny"}, []interface{}{"good", "bad"}, false},
+		{"foo/baz", []string{"deny", "allow"}, []interface{}{"good", "bad"}, false},
+		{"foo/baz", []string{"deNy", "allow"}, []interface{}{"bad", "good"}, false},
+		{"foo/baz", []string{"aLLow"}, []interface{}{"bad"}, false},
+		{"foo/baz", []string{"Neither"}, []interface{}{"bad"}, false},
+		{"foo/baz", []string{"allow"}, []interface{}{nil}, false},
+		{"fizz/buzz", []string{"allow_multi"}, []interface{}{"good"}, true},
+		{"fizz/buzz", []string{"allow_multi"}, []interface{}{"good1"}, true},
+		{"fizz/buzz", []string{"allow_multi"}, []interface{}{"good2"}, true},
+		{"fizz/buzz", []string{"allow_multi"}, []interface{}{"glob good2"}, false},
+		{"fizz/buzz", []string{"allow_multi"}, []interface{}{"glob good3"}, true},
+		{"fizz/buzz", []string{"allow_multi"}, []interface{}{"bad"}, false},
+		{"fizz/buzz", []string{"allow_multi"}, []interface{}{"bad"}, false},
+		{"fizz/buzz", []string{"allow_multi", "allow"}, []interface{}{"good1", "good"}, true},
+		{"fizz/buzz", []string{"deny_multi"}, []interface{}{"bad2"}, false},
+		{"fizz/buzz", []string{"deny_multi", "allow_multi"}, []interface{}{"good", "good2"}, false},
+		//	{"test/types", []string{"array"}, []interface{}{[1]string{"good"}}, true},
+		{"test/types", []string{"map"}, []interface{}{map[string]interface{}{"good": "one"}}, true},
+		{"test/types", []string{"map"}, []interface{}{map[string]interface{}{"bad": "one"}}, false},
+		{"test/types", []string{"int"}, []interface{}{1}, true},
+		{"test/types", []string{"int"}, []interface{}{3}, false},
+		{"test/types", []string{"bool"}, []interface{}{false}, true},
+		{"test/types", []string{"bool"}, []interface{}{true}, false},
+		{"test/star", []string{"anything"}, []interface{}{true}, true},
+		{"test/star", []string{"foo"}, []interface{}{true}, true},
+		{"test/star", []string{"bar"}, []interface{}{false}, true},
+		{"test/star", []string{"bar"}, []interface{}{true}, false},
+	}
+
+	for _, tc := range tcases {
+		request := &logical.Request{
+			Path: tc.path,
+			Data: make(map[string]interface{}),
+		}
+		ctx := namespace.ContextWithNamespace(context.Background(), ns)
+
+		for i, parameter := range tc.parameters {
+			request.Data[parameter] = tc.values[i]
+		}
+		for _, op := range toperations {
+			request.Operation = op
+			authResults := acl.AllowOperation(ctx, request, false)
+			if authResults.Allowed != tc.allowed {
+				t.Fatalf("bad: case %#v: %v", tc, authResults.Allowed)
+			}
+		}
+	}
+}
+
+func TestACL_SegmentWildcardPriority(t *testing.T) {
+	ns := namespace.RootNamespace
+	ctx := namespace.ContextWithNamespace(context.Background(), ns)
+	type poltest struct {
+		policy string
+		path   string
+	}
+
+	// These test cases should each have a read rule and an update rule, where
+	// the update rule wins out due to being more specific.
+	poltests := []poltest{
+		{
+			// Verify edge conditions.  Here '*' is more specific both because
+			// of first wildcard position (0 vs -1/infinity) and #wildcards.
+			`
+path "+/*" { capabilities = ["read"] }
+path "*" { capabilities = ["update"] }
+`,
+			"foo/bar/bar/baz",
+		},
+		{
+			// Verify edge conditions.  Here '+/*' is less specific because of
+			// first wildcard position.
+			`
+path "+/*" { capabilities = ["read"] }
+path "foo/+/*" { capabilities = ["update"] }
+`,
+			"foo/bar/bar/baz",
+		},
+		{
+			// Verify that more wildcard segments is lower priority.
+			`
+path "foo/+/+/*" { capabilities = ["read"] }
+path "foo/+/bar/baz" { capabilities = ["update"] }
+`,
+			"foo/bar/bar/baz",
+		},
+		{
+			// Verify that more wildcard segments is lower priority.
+			`
+path "foo/+/+/baz" { capabilities = ["read"] }
+path "foo/+/bar/baz" { capabilities = ["update"] }
+`,
+			"foo/bar/bar/baz",
+		},
+		{
+			// Verify that first wildcard position is lower priority.
+			// '(' is used here because it is lexicographically smaller than "+"
+			`
+path "foo/+/(ar/baz" { capabilities = ["read"] }
+path "foo/(ar/+/baz" { capabilities = ["update"] }
+`,
+			"foo/(ar/(ar/baz",
+		},
+
+		{
+			// Verify that a glob has lower priority, even if the prefix is the
+			// same otherwise.
+			`
+path "foo/bar/+/baz*" { capabilities = ["read"] }
+path "foo/bar/+/baz" { capabilities = ["update"] }
+`,
+			"foo/bar/bar/baz",
+		},
+		{
+			// Verify that a shorter prefix has lower priority.
+			`
+path "foo/bar/+/b*" { capabilities = ["read"] }
+path "foo/bar/+/ba*" { capabilities = ["update"] }
+`,
+			"foo/bar/bar/baz",
+		},
+	}
+
+	for i, pt := range poltests {
+		policy, err := ParseACLPolicy(ns, pt.policy)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		acl, err := NewACL(ctx, []*Policy{policy})
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		request := new(logical.Request)
+		request.Path = pt.path
+
+		request.Operation = logical.UpdateOperation
+		authResults := acl.AllowOperation(ctx, request, false)
+		if !authResults.Allowed {
+			t.Fatalf("bad: case %d %#v: %v", i, pt, authResults.Allowed)
+		}
+
+		request.Operation = logical.ReadOperation
+		authResults = acl.AllowOperation(ctx, request, false)
+		if authResults.Allowed {
+			t.Fatalf("bad: case %d %#v: %v", i, pt, authResults.Allowed)
+		}
+	}
+}
+
+// TestACL_ListTrailingSlashDeny exercises the SECVULN-45175 fix: a
+// trailing-slash LIST request must respect more-specific DENY policies even
+// when a broader ALLOW rule is also reachable via the trimmed form of the path.
+// It also guards the VAULT-3825 regression: a segment-wildcard rule without a
+// trailing slash must continue to grant LIST on trailing-slash paths.
+func TestACL_ListTrailingSlashDeny(t *testing.T) {
+	t.Parallel()
+
+	ns := namespace.RootNamespace
+	ctx := namespace.ContextWithNamespace(context.Background(), ns)
+
+	type tc struct {
+		name     string
+		policies []string
+		path     string
+		wantList bool
+	}
+
+	cases := []tc{
+		// CVE core case: a more-specific prefix deny must not be bypassed by
+		// the trimmed-path lookup reaching only the broader allow.
+		{
+			name: "prefix-deny-more-specific-than-prefix-allow",
+			policies: []string{
+				`path "kv1/*"         { capabilities = ["list"] }`,
+				`path "kv1/private/*" { capabilities = ["deny"] }`,
+			},
+			path:     "kv1/private/",
+			wantList: false,
+		},
+		// Inverse: more-specific allow must win over broader deny.
+		{
+			name: "prefix-allow-more-specific-than-prefix-deny",
+			policies: []string{
+				`path "kv1/*"         { capabilities = ["deny"] }`,
+				`path "kv1/private/*" { capabilities = ["list"] }`,
+			},
+			path:     "kv1/private/",
+			wantList: true,
+		},
+		// VAULT-3825 regression: a segment-wildcard policy written without a
+		// trailing slash ("kv1/+") must still grant LIST on trailing-slash paths
+		// ("kv1/private/") — that was the original intent of the slash-stripping
+		// logic.
+		{
+			name: "segwc-allow-no-slash-grants-list-on-slash-path",
+			policies: []string{
+				`path "kv1/+" { capabilities = ["list"] }`,
+			},
+			path:     "kv1/private/",
+			wantList: true,
+		},
+		// CRITICAL regression guard: a segment-wildcard deny "kv1/+" must still
+		// fire on "kv1/private/" even when a broader prefix allow "kv1/*" exists.
+		// If the segwc deny is silently dropped the fix is incomplete.
+		{
+			name: "segwc-deny-preserved-over-prefix-allow",
+			policies: []string{
+				`path "kv1/*" { capabilities = ["list"] }`,
+				`path "kv1/+" { capabilities = ["deny"] }`,
+			},
+			path:     "kv1/private/",
+			wantList: false,
+		},
+		// The LIST trailing-slash branch only fires when the path ends in "/";
+		// requests without one must use the normal (non-trailing-slash) code path.
+		{
+			name: "no-trailing-slash-allow-unchanged",
+			policies: []string{
+				`path "kv1/*" { capabilities = ["list"] }`,
+			},
+			path:     "kv1/private",
+			wantList: true,
+		},
+		// "kv1/private/*" (stored as prefix key "kv1/private/") does NOT match
+		// the query "kv1/private" (no slash) because LongestPrefix requires the
+		// query to start with the key, and "kv1/private" does not start with
+		// "kv1/private/".  The broader allow "kv1/*" wins; this is correct.
+		{
+			name: "no-trailing-slash-no-deny-correct-semantics",
+			policies: []string{
+				`path "kv1/*"         { capabilities = ["list"] }`,
+				`path "kv1/private/*" { capabilities = ["deny"] }`,
+			},
+			path:     "kv1/private",
+			wantList: true,
+		},
+		// The deny on kv1/private/* must not affect the sibling kv1/public/*.
+		{
+			name: "sibling-path-not-affected-by-specific-deny",
+			policies: []string{
+				`path "kv1/*"         { capabilities = ["list"] }`,
+				`path "kv1/private/*" { capabilities = ["deny"] }`,
+			},
+			path:     "kv1/public/",
+			wantList: true,
+		},
+		// Baseline: a plain prefix allow, no deny at all.
+		{
+			name: "allow-only-prefix-slash-path",
+			policies: []string{
+				`path "kv1/*" { capabilities = ["list"] }`,
+			},
+			path:     "kv1/anything/",
+			wantList: true,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var policies []*Policy
+			for i, pstr := range tc.policies {
+				p, err := ParseACLPolicy(ns, pstr)
+				if err != nil {
+					t.Fatalf("policy %d parse error: %v", i, err)
+				}
+				policies = append(policies, p)
+			}
+
+			acl, err := NewACL(ctx, policies)
+			if err != nil {
+				t.Fatalf("NewACL error: %v", err)
+			}
+
+			req := &logical.Request{
+				Operation: logical.ListOperation,
+				Path:      tc.path,
+			}
+			result := acl.AllowOperation(ctx, req, false)
+			if result.Allowed != tc.wantList {
+				t.Errorf("AllowOperation(%q, LIST).Allowed = %v, want %v",
+					tc.path, result.Allowed, tc.wantList)
+			}
+		})
+	}
+}
+
+func TestACL_SegmentWildcardPriority_BareMount(t *testing.T) {
+	ns := namespace.RootNamespace
+	ctx := namespace.ContextWithNamespace(context.Background(), ns)
+	type poltest struct {
+		policy    string
+		mountpath string
+		hasperms  bool
+	}
+	// These test cases should have one or more rules and a mount prefix.
+	// hasperms should be true if there are non-deny perms that apply
+	// to the mount prefix or something below it.
+	poltests := []poltest{
+		{
+			`path "+" { capabilities = ["read"] }`,
+			"foo/",
+			true,
+		},
+		{
+			`path "+/*" { capabilities = ["read"] }`,
+			"foo/",
+			true,
+		},
+		{
+			`path "foo/+/+/*" { capabilities = ["read"] }`,
+			"foo/",
+			true,
+		},
+		{
+			`path "foo/+/+/*" { capabilities = ["read"] }`,
+			"foo/bar/",
+			true,
+		},
+		{
+			`path "foo/+/+/*" { capabilities = ["read"] }`,
+			"foo/bar/bar/",
+			true,
+		},
+		{
+			`path "foo/+/+/*" { capabilities = ["read"] }`,
+			"foo/bar/bar/baz/",
+			true,
+		},
+		{
+			`path "foo/+/+/baz" { capabilities = ["read"] }`,
+			"foo/bar/bar/baz/",
+			true,
+		},
+		{
+			`path "foo/+/bar/baz" { capabilities = ["read"] }`,
+			"foo/bar/bar/baz/",
+			true,
+		},
+		{
+			`path "foo/bar/+/baz*" { capabilities = ["read"] }`,
+			"foo/bar/bar/baz/",
+			true,
+		},
+		{
+			`path "foo/bar/+/b*" { capabilities = ["read"] }`,
+			"foo/bar/bar/baz/",
+			true,
+		},
+		{
+			`path "foo/+" { capabilities = ["read"] }`,
+			"foo/",
+			true,
+		},
+	}
+
+	for i, pt := range poltests {
+		policy, err := ParseACLPolicy(ns, pt.policy)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		acl, err := NewACL(ctx, []*Policy{policy})
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		hasperms := nil != acl.CheckAllowedFromNonExactPaths(pt.mountpath, true)
+		if hasperms != pt.hasperms {
+			t.Fatalf("bad: case %d: %#v", i, pt)
+		}
+
+	}
+}
+
+// NOTE: this test doesn't catch any races ATM
+func TestACL_CreationRace(t *testing.T) {
+	policy, err := ParseACLPolicy(namespace.RootNamespace, valuePermissionsPolicy)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error)
+	stopTime := time.Now().Add(20 * time.Second)
+
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for {
+				if time.Now().After(stopTime) {
+					return
+				}
+				_, err := NewACL(namespace.RootContext(context.Background()), []*Policy{policy})
+				if err != nil {
+					errs <- fmt.Errorf("goroutine %d: %w", i, err)
+				}
+			}
+		}(i)
+	}
+
+	go func() {
+		wg.Wait()
+		close(errs)
+	}()
+
+	for err := range errs {
+		t.Fatalf("err: %v", err)
+	}
+}
+
+func TestACLGrantingPolicies(t *testing.T) {
+	ns := namespace.RootNamespace
+	policy, err := ParseACLPolicy(ns, grantingTestPolicy)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	merged, err := ParseACLPolicy(ns, grantingTestPolicyMerged)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	ctx := namespace.ContextWithNamespace(context.Background(), ns)
+
+	type tcase struct {
+		path     string
+		op       logical.Operation
+		policies []*Policy
+		expected []logical.PolicyInfo
+		allowed  bool
+	}
+
+	policyInfo := logical.PolicyInfo{
+		Name:          "granting_policy",
+		NamespaceId:   "root",
+		NamespacePath: "",
+		Type:          "acl",
+	}
+	mergedInfo := logical.PolicyInfo{
+		Name:          "granting_policy_merged",
+		NamespaceId:   "root",
+		NamespacePath: "",
+		Type:          "acl",
+	}
+
+	tcases := []tcase{
+		{"kv/foo", logical.ReadOperation, []*Policy{policy}, []logical.PolicyInfo{policyInfo}, true},
+		{"kv/foo", logical.UpdateOperation, []*Policy{policy}, []logical.PolicyInfo{policyInfo}, true},
+		{"kv/bad", logical.ReadOperation, []*Policy{policy}, nil, false},
+		{"kv/deny", logical.ReadOperation, []*Policy{policy}, nil, false},
+		{"kv/path/foo", logical.ReadOperation, []*Policy{policy}, []logical.PolicyInfo{policyInfo}, true},
+		{"kv/path/longer", logical.ReadOperation, []*Policy{policy}, []logical.PolicyInfo{policyInfo}, true},
+		{"kv/foo", logical.ReadOperation, []*Policy{policy, merged}, []logical.PolicyInfo{policyInfo, mergedInfo}, true},
+		{"kv/path/longer3", logical.ReadOperation, []*Policy{policy, merged}, []logical.PolicyInfo{mergedInfo}, true},
+		{"kv/bar", logical.ReadOperation, []*Policy{policy, merged}, []logical.PolicyInfo{mergedInfo}, true},
+		{"kv/deny", logical.ReadOperation, []*Policy{policy, merged}, nil, false},
+		{"kv/path/longer", logical.UpdateOperation, []*Policy{policy, merged}, []logical.PolicyInfo{policyInfo}, true},
+		{"kv/path/foo", logical.ReadOperation, []*Policy{policy, merged}, []logical.PolicyInfo{policyInfo, mergedInfo}, true},
+		{"ns1/kv/foo", logical.RecoverOperation, []*Policy{policy, merged}, []logical.PolicyInfo{policyInfo}, true},
+	}
+
+	for _, tc := range tcases {
+		request := &logical.Request{
+			Path:      tc.path,
+			Operation: tc.op,
+		}
+
+		acl, err := NewACL(ctx, tc.policies)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		authResults := acl.AllowOperation(ctx, request, false)
+		if authResults.Allowed != tc.allowed {
+			t.Fatalf("bad: case %#v: %v", tc, authResults.Allowed)
+		}
+		if !reflect.DeepEqual(authResults.GrantingPolicies, tc.expected) {
+			t.Fatalf("bad: case %#v: got\n%#v\nexpected\n%#v\n", tc, authResults.GrantingPolicies, tc.expected)
+		}
+	}
+}
+
+var grantingTestPolicy = `
+name = "granting_policy"
+path "kv/foo" {
+	capabilities = ["update", "read"]
+}
+
+path "kv/path/*" {
+	capabilities = ["read"]
+}
+
+path "kv/path/longer" {
+	capabilities = ["update", "read"]
+}
+
+path "kv/path/longer2" {
+	capabilities = ["update"]
+}
+
+path "kv/deny" {
+	capabilities = ["deny"]
+}
+
+path "ns1/kv/foo" {
+	capabilities = ["update", "read", "recover"]
+}
+`
+
+var grantingTestPolicyMerged = `
+name = "granting_policy_merged"
+path "kv/foo" {
+	capabilities = ["update", "read"]
+}
+
+path "kv/bar" {
+	capabilities = ["update", "read"]
+}
+
+path "kv/path/*" {
+	capabilities = ["read"]
+}
+
+path "kv/path/longer" {
+	capabilities = ["read"]
+}
+
+path "kv/path/longer3" {
+	capabilities = ["read"]
+}
+
+path "kv/deny" {
+	capabilities = ["update"]
+}
+`
+
+var tokenCreationPolicy = `
+name = "tokenCreation"
+path "auth/token/create*" {
+	capabilities = ["update", "create", "sudo"]
+}
+`
+
+var aclPolicy = `
+name = "DeV"
+path "dev/*" {
+	policy = "sudo"
+}
+path "stage/*" {
+	policy = "write"
+}
+path "stage/aws/*" {
+	policy = "read"
+	capabilities = ["update", "sudo"]
+}
+path "stage/aws/policy/*" {
+	policy = "sudo"
+}
+path "prod/*" {
+	policy = "read"
+}
+path "prod/aws/*" {
+	policy = "deny"
+}
+path "sys/*" {
+	policy = "deny"
+}
+path "foo/bar" {
+	capabilities = ["read", "create", "sudo"]
+}
+path "baz/quux" {
+	capabilities = ["read", "create", "patch"]
+}
+path "test/+/segment" {
+	capabilities = ["read"]
+}
+path "+/segment/at/front" {
+	capabilities = ["read"]
+}
+path "test/segment/at/end/+" {
+	capabilities = ["read"]
+}
+path "test/segment/at/end/v2/+/" {
+	capabilities = ["read"]
+}
+path "test/+/wildcard/+/*" {
+	capabilities = ["read"]
+}
+path "test/+/wildcardglob/+/end*" {
+	capabilities = ["read"]
+}
+path "1/2/*" {
+	capabilities = ["create"]
+}
+path "1/2/+" {
+	capabilities = ["read"]
+}
+path "1/2/+/+" {
+	capabilities = ["update", "recover"]
+}
+`
+
+var aclPolicy2 = `
+name = "OpS"
+path "dev/hide/*" {
+	policy = "deny"
+}
+path "stage/aws/policy/*" {
+	policy = "deny"
+	# This should have no effect
+	capabilities = ["read", "update", "sudo"]
+}
+path "prod/*" {
+	policy = "write"
+}
+path "sys/seal" {
+	policy = "sudo"
+}
+path "foo/bar" {
+	capabilities = ["deny"]
+}
+path "baz/quux" {
+	capabilities = ["deny"]
+}
+`
+
+// test merging
+var mergingPolicies = `
+name = "ops"
+path "foo/bar" {
+	policy = "write"
+	denied_parameters = {
+		"baz" = []
+	}
+	required_parameters = ["baz"]
+}
+path "foo/bar" {
+	policy = "write"
+	denied_parameters = {
+		"zip" = []
+	}
+}
+path "hello/universe" {
+	policy = "write"
+	allowed_parameters = {
+		"foo" = []
+	}
+	required_parameters = ["foo"]
+	max_wrapping_ttl = 300
+	min_wrapping_ttl = 100
+}
+path "hello/universe" {
+	policy = "write"
+	allowed_parameters = {
+		"bar" = []
+	}
+	required_parameters = ["bar"]
+	max_wrapping_ttl = 200
+	min_wrapping_ttl = 50
+}
+path "allow/all" {
+	policy = "write"
+	allowed_parameters = {
+		"test" = []
+		"test1" = ["foo"]
+	}
+}
+path "allow/all" {
+	policy = "write"
+	allowed_parameters = {
+		"*" = []
+	}
+}
+path "allow/all1" {
+	policy = "write"
+	allowed_parameters = {
+		"*" = []
+	}
+}
+path "allow/all1" {
+	policy = "write"
+	allowed_parameters = {
+		"test" = []
+		"test1" = ["foo"]
+	}
+}
+path "deny/all" {
+	policy = "write"
+	denied_parameters = {
+		"test" = []
+	}
+}
+path "deny/all" {
+	policy = "write"
+	denied_parameters = {
+		"*" = []
+	}
+}
+path "deny/all1" {
+	policy = "write"
+	denied_parameters = {
+		"*" = []
+	}
+}
+path "deny/all1" {
+	policy = "write"
+	denied_parameters = {
+		"test" = []
+	}
+}
+path "value/merge" {
+	policy = "write"
+	allowed_parameters = {
+		"test" = [1, 2]
+	}
+	denied_parameters = {
+		"test" = [1, 2]
+	}
+}
+path "value/merge" {
+	policy = "write"
+	allowed_parameters = {
+		"test" = [3, 4]
+	}
+	denied_parameters = {
+		"test" = [3, 4]
+	}
+}
+path "value/empty" {
+	policy = "write"
+	allowed_parameters = {
+		"empty" = []
+	}
+	denied_parameters = {
+		"empty" = [1]
+	}
+}
+path "value/empty" {
+	policy = "write"
+	allowed_parameters = {
+		"empty" = [1]
+	}
+	denied_parameters = {
+		"empty" = []
+	}
+}
+`
+
+// allow operation testing
+var permissionsPolicy = `
+name = "dev"
+path "dev/*" {
+	policy = "write"
+	allowed_parameters = {
+		"zip" = []
+	}
+}
+path "foo/bar" {
+	policy = "write"
+	denied_parameters = {
+		"zap" = []
+	}
+	min_wrapping_ttl = 300
+	max_wrapping_ttl = 400
+}
+path "foo/baz" {
+	policy = "write"
+	allowed_parameters = {
+		"hello" = []
+	}
+	denied_parameters = {
+		"zap" = []
+	}
+	min_wrapping_ttl = 300
+}
+path "working/phone" {
+	policy = "write"
+	max_wrapping_ttl = 400
+}
+path "broken/phone" {
+	policy = "write"
+	allowed_parameters = {
+	  "steve" = []
+	}
+	denied_parameters = {
+	  "steve" = []
+	}
+}
+path "hello/world" {
+	policy = "write"
+	allowed_parameters = {
+		"*" = []
+	}
+	denied_parameters = {
+		"*" = []
+	}
+}
+path "tree/fort" {
+	policy = "write"
+	allowed_parameters = {
+		"*" = []
+	}
+	denied_parameters = {
+		"foo" = []
+	}
+}
+path "fruit/apple" {
+	policy = "write"
+	allowed_parameters = {
+		"pear" = []
+	}
+	denied_parameters = {
+		"*" = []
+	}
+}
+path "cold/weather" {
+	policy = "write"
+	allowed_parameters = {}
+	denied_parameters = {}
+}
+path "var/aws" {
+	policy = "write"
+	allowed_parameters = {
+		"*" = []
+	}
+	denied_parameters = {
+		"soft" = []
+		"warm" = []
+		"kitty" = []
+	}
+}
+path "var/req" {
+	policy = "write"
+	required_parameters = ["foo"]
+}
+`
+
+// allow operation testing
+var valuePermissionsPolicy = `
+name = "op"
+path "dev/*" {
+	policy = "write"
+	allowed_parameters = {
+		"allow" = ["good"]
+	}
+}
+path "foo/bar" {
+	policy = "write"
+	denied_parameters = {
+		"deny" = ["bad*"]
+	}
+}
+path "foo/baz" {
+	policy = "write"
+	allowed_parameters = {
+		"ALLOW" = ["good"]
+	}
+	denied_parameters = {
+		"dEny" = ["bad"]
+	}
+}
+path "fizz/buzz" {
+	policy = "write"
+	allowed_parameters = {
+		"allow_multi" = ["good", "good1", "good2", "*good3"]
+		"allow" = ["good"]
+	}
+	denied_parameters = {
+		"deny_multi" = ["bad", "bad1", "bad2"]
+	}
+}
+path "test/types" {
+	policy = "write"
+	allowed_parameters = {
+		"map" = [{"good" = "one"}]
+		"int" = [1, 2]
+		"bool" = [false]
+	}
+	denied_parameters = {
+	}
+}
+path "test/star" {
+	policy = "write"
+	allowed_parameters = {
+		"*" = []
+		"foo" = []
+		"bar" = [false]
+	}
+	denied_parameters = {
+	}
+}
+`
+
+// TestAllowedAndDeniedParameters tests allowed_parameters and denied_parameters against both new and old behaviors
+func TestAllowedAndDeniedParameters(t *testing.T) {
+	type testReq struct {
+		path       string // defaults to "test/path"
+		parameters string // JSON string representation of parameters
+		allowed    bool
+
+		// for behaviors that differ between legacy exact matching and new slice matching one of the following must
+		// be set, otherwise the same test is executed for both modes and must pass in both
+		onlyLegacyExactMatching bool
+		onlyNewSliceMatching    bool
+	}
+
+	// Define test cases
+	testCases := map[string]struct {
+		policy   string
+		requests map[string]testReq
+	}{
+		"neither_allowed_nor_denied_parameters_sets_no_restrictions": {
+			policy: `
+				path "test/path" {
+					capabilities = ["update"]
+				}
+			`,
+			requests: map[string]testReq{
+				"update_with_arbitrary_param_is_allowed": {
+					parameters: `{"arbitrary": "value"}`,
+					allowed:    true,
+				},
+			},
+		},
+		"simple_allowed_parameters": {
+			policy: `
+				path "test/path" {
+					capabilities = ["update"]
+					allowed_parameters = {
+						"allowedParam" = ["allowedValue"]
+					}
+				}
+			`,
+			requests: map[string]testReq{
+				"explicitly_allowed": {
+					parameters: `{"allowedParam": "allowedValue"}`,
+					allowed:    true,
+				},
+				"implicitly_disallowed": {
+					parameters: `{"allowedParam": "disallowedValue"}`,
+					allowed:    false,
+				},
+				"some_other_param_disallowed": {
+					parameters: `{"someOtherParam": "someValue"}`,
+					allowed:    false,
+				},
+				"list_with_allowed_value_denied_on_legacy": {
+					parameters:              `{"allowedParam": ["allowedValue"]}`,
+					allowed:                 false,
+					onlyLegacyExactMatching: true,
+				},
+				"list_with_allowed_value_allowed_on_new": {
+					parameters:           `{"allowedParam": ["allowedValue"]}`,
+					allowed:              true,
+					onlyNewSliceMatching: true,
+				},
+				"lower_level_not_affected_by_allow": {
+					parameters: `{"allowedParam": {"allowedParam": "allowedValue"}}`,
+					allowed:    false,
+				},
+				"empty_parameters_allowed": {
+					parameters: `{}`,
+					allowed:    true,
+				},
+				"case_insensitive_param_matching": {
+					parameters: `{"ALLOWEDPARAM": "allowedValue"}`,
+					allowed:    true,
+				},
+				"case_sensitive_value_matching": {
+					parameters: `{"allowedParam": "ALLOWEDVALUE"}`,
+					allowed:    false, // non-policies params remain case-sensitive
+				},
+			},
+		},
+		"simple_denied_parameters": {
+			policy: `
+				path "test/path" {
+					capabilities = ["update"]
+					denied_parameters = {
+						"deniedParam" = ["deniedValue"]
+					}
+				}
+			`,
+			requests: map[string]testReq{
+				"explicitly_denied": {
+					parameters: `{"deniedParam": "deniedValue"}`,
+					allowed:    false,
+				},
+				"implicitly_allowed": {
+					parameters: `{"deniedParam": "notdeniedValue"}`,
+					allowed:    true,
+				},
+				"some_other_param_allowed": {
+					parameters: `{"someOtherParam": "someValue"}`,
+					allowed:    true,
+				},
+				"list_with_denied_value_allowed_on_legacy_exact_matching": {
+					parameters:              `{"deniedParam": ["deniedValue"]}`,
+					allowed:                 true,
+					onlyLegacyExactMatching: true,
+				},
+				"list_with_denied_value_denied_on_new_slice_matching": {
+					parameters:           `{"deniedParam": ["deniedValue"]}`,
+					allowed:              false,
+					onlyNewSliceMatching: true,
+				},
+				"lower_level_not_affected_by_denial": {
+					parameters: `{"deniedParam": {"deniedParam": "deniedValue"}}`,
+					allowed:    true,
+				},
+				"empty_parameters_allowed": {
+					parameters: `{}`,
+					allowed:    true,
+				},
+				"case_insensitive_param_matching": {
+					parameters: `{"DENIEDPARAM": "deniedValue"}`,
+					allowed:    false,
+				},
+				"case_sensitive_value_matching": {
+					parameters: `{"deniedParam": "DENIEDVALUE"}`,
+					allowed:    true, // non-policies params remain case-sensitive
+				},
+				"mixed_case_value_does_not_match_denied": {
+					parameters: `{"deniedParam": "DeniedValue"}`,
+					allowed:    true, // non-policies params remain case-sensitive
+				},
+			},
+		},
+		"token_policies_denied_parameters_case_folding": {
+			policy: `
+				path "test/path" {
+					capabilities = ["update"]
+					denied_parameters = {
+						"token_policies" = ["super-admin"]
+					}
+				}
+			`,
+			requests: map[string]testReq{
+				// String form — works in both legacy and new slice matching.
+				"exact_lowercase_string_is_denied": {
+					parameters: `{"token_policies": "super-admin"}`,
+					allowed:    false,
+				},
+				"mixed_case_string_is_also_denied": {
+					parameters: `{"token_policies": "Super-Admin"}`,
+					allowed:    false,
+				},
+				"all_caps_string_is_also_denied": {
+					parameters: `{"token_policies": "SUPER-ADMIN"}`,
+					allowed:    false,
+				},
+				"non_denied_string_value_is_allowed": {
+					parameters: `{"token_policies": "default"}`,
+					allowed:    true,
+				},
+				// List form — only meaningful with new slice matching; legacy mode
+				// compares the whole slice value and would never match a string entry.
+				"exact_lowercase_list_is_denied": {
+					parameters:           `{"token_policies": ["super-admin"]}`,
+					allowed:              false,
+					onlyNewSliceMatching: true,
+				},
+				"mixed_case_list_is_also_denied": {
+					parameters:           `{"token_policies": ["Super-Admin"]}`,
+					allowed:              false,
+					onlyNewSliceMatching: true,
+				},
+				"all_caps_list_is_also_denied": {
+					parameters:           `{"token_policies": ["SUPER-ADMIN"]}`,
+					allowed:              false,
+					onlyNewSliceMatching: true,
+				},
+				"non_denied_list_value_is_allowed": {
+					parameters:           `{"token_policies": ["default"]}`,
+					allowed:              true,
+					onlyNewSliceMatching: true,
+				},
+			},
+		},
+		"token_policies_allowed_parameters_case_folding": {
+			policy: `
+				path "test/path" {
+					capabilities = ["update"]
+					allowed_parameters = {
+						"token_policies" = ["read-only"]
+					}
+				}
+			`,
+			requests: map[string]testReq{
+				// String form — works in both legacy and new slice matching.
+				"exact_lowercase_string_is_allowed": {
+					parameters: `{"token_policies": "read-only"}`,
+					allowed:    true,
+				},
+				"mixed_case_string_is_also_allowed": {
+					parameters: `{"token_policies": "Read-Only"}`,
+					allowed:    true,
+				},
+				"non_allowed_string_value_is_denied": {
+					parameters: `{"token_policies": "super-admin"}`,
+					allowed:    false,
+				},
+				// List form — only meaningful with new slice matching.
+				"exact_lowercase_list_is_allowed": {
+					parameters:           `{"token_policies": ["read-only"]}`,
+					allowed:              true,
+					onlyNewSliceMatching: true,
+				},
+				"mixed_case_list_is_also_allowed": {
+					parameters:           `{"token_policies": ["Read-Only"]}`,
+					allowed:              true,
+					onlyNewSliceMatching: true,
+				},
+				"non_allowed_list_value_is_denied": {
+					parameters:           `{"token_policies": ["super-admin"]}`,
+					allowed:              false,
+					onlyNewSliceMatching: true,
+				},
+			},
+		},
+		"allow_and_deny_any_value": {
+			policy: `
+				path "test/allow_all" {
+					capabilities = ["update"]
+					allowed_parameters = {
+						"any" = []
+					}
+				}
+				path "test/deny_all" {
+					capabilities = ["update"]
+					denied_parameters = {
+						"none" = []
+					}
+				}
+			`,
+			requests: map[string]testReq{
+				"any_param_is_allowed": {
+					path:       "test/allow_all",
+					parameters: `{"any": "thing"}`,
+					allowed:    true,
+				},
+				"all_values_denied": {
+					path:       "test/deny_all",
+					parameters: `{"none": "thing"}`,
+					allowed:    false,
+				},
+				"other_param_is_allowed": {
+					path:       "test/deny_all",
+					parameters: `{"other": "thing"}`,
+					allowed:    true,
+				},
+			},
+		},
+		"different_allowed_and_denied_simple_params": {
+			policy: `
+				path "test/path" {
+					capabilities = ["update"]
+					allowed_parameters = {
+						"allowedParam" = ["allowed"]
+					}
+					denied_parameters = {
+						"deniedParam" = ["denied"]
+					}
+				}
+			`,
+			requests: map[string]testReq{
+				"param_in_allowed_parameters_is_allowed": {
+					parameters: `{"allowedParam": "allowed"}`,
+					allowed:    true,
+				},
+				"param_in_denied_parameters_is_denied": {
+					parameters: `{"deniedParam": "denied"}`,
+					allowed:    false,
+				},
+				"denied_param_is_denied_even_if_value_not_denied": {
+					parameters: `{"deniedParam": "notDenied"}`,
+					// this is the expected behavior because allowed_parameters is an allowlist, rendering the deny list moot
+					allowed: false,
+				},
+			},
+		},
+		"same_simple_param_allowed_and_denied": {
+			policy: `
+				path "test/path" {
+					capabilities = ["update"]
+					allowed_parameters = {
+						"allowedAndDeniedParam" = ["allowed"]
+					}
+					denied_parameters = {
+						"allowedAndDeniedParam" = ["denied"]
+					}
+				}
+			`,
+			requests: map[string]testReq{
+				"allowed_value": {
+					parameters: `{"allowedAndDeniedParam": "allowed"}`,
+					allowed:    true,
+				},
+				"denied_value": {
+					parameters: `{"allowedAndDeniedParam": "denied"}`,
+					allowed:    false,
+				},
+				"other_value_denied": {
+					parameters: `{"allowedAndDeniedParam": "other"}`,
+					allowed:    false,
+				},
+				"other_param_denied": {
+					parameters: `{"otherParam": "value"}`,
+					allowed:    false,
+				},
+			},
+		},
+		"same_simple_param_allowed_and_denied_same_value": {
+			policy: `
+				path "test/path" {
+					capabilities = ["update"]
+					allowed_parameters = {
+						"allowedAndDeniedParam" = ["allowedAndDenied"]
+					}
+					denied_parameters = {
+						"allowedAndDeniedParam" = ["allowedAndDenied"]
+					}
+				}
+			`,
+			requests: map[string]testReq{
+				"deny_takes_precedence": {
+					parameters: `{"allowedAndDeniedParam": "allowedAndDenied"}`,
+					allowed:    false,
+				},
+			},
+		},
+		"simple_allowed_and_denied_parameters_with_splat": {
+			// we call the "*" = [] thing "splat" in the docs, not sure why but let's be consistent
+			policy: `
+				path "test/all_allowed" {
+					capabilities = ["update"]
+					allowed_parameters = {
+						"*" = []
+					}
+				}
+				path "test/all_allowed_with_exceptions" {
+					capabilities = ["update"]
+					allowed_parameters = {
+						"*" = []
+						"except" = ["onlyThisValue"]
+					}
+				}
+				path "test/all_denied" {
+					capabilities = ["update"]
+					denied_parameters = {
+						"*" = []
+					}
+				}
+				path "test/all_denied_exception_doesnt_work'" {
+					capabilities = ["update"]
+					denied_parameters = {
+						"except" = ["onlyThisValue"]
+						"*" = []
+					}
+				}
+				path "test/all_allowed_with_denied" {
+					capabilities = ["update"]
+					allowed_parameters = {
+						"*" = []
+					}
+				}
+			`,
+			requests: map[string]testReq{
+				"any_param_is_allowed": {
+					path:       "test/all_allowed",
+					parameters: `{"1": "1", "2": [2], "3": {"4": "4"}}`,
+					allowed:    true,
+				},
+				"splat_allowed_params_allows_empty": {
+					path:       "test/all_allowed",
+					parameters: `{}`,
+					allowed:    true,
+				},
+				"most_params_allowed": {
+					path:       "test/all_allowed_with_exceptions",
+					parameters: `{"1": "1", "2": [2], "3": {"4": "4"}, "except": "onlyThisValue"}`,
+					allowed:    true,
+				},
+				"most_params_allowed_exception": {
+					path:       "test/all_allowed_with_exceptions",
+					parameters: `{"1": "1", "2": [2], "3": {"4": "4"}, "except": "wrongValue"}`,
+					allowed:    false,
+				},
+				"any_param_is_denied": {
+					path:       "test/all_denied",
+					parameters: `{"any": "thing"}`,
+					allowed:    false,
+				},
+				"any_param_is_denied_empty_allowed": {
+					path:       "test/all_denied",
+					parameters: `{}`,
+					allowed:    true,
+				},
+				"exception_doesnt_work_for_splat_denied_parameters": {
+					path:       "test/all_denied_exception_doesnt_work",
+					parameters: `{"except": "onlyThisValue"}`,
+					allowed:    false,
+				},
+			},
+		},
+		"splat_with_non_empty_list_same_as_empty_list": {
+			policy: `
+				path "test/splat_allowed_with_value" {
+					capabilities = ["update"]
+					allowed_parameters = {
+						"*" = ["allowedValue"]
+					}
+				}
+				path "test/splat_denied_with_value" {
+					capabilities = ["update"]
+					denied_parameters = {
+						"*" = ["deniedValue"]
+					}
+				}
+			`,
+			requests: map[string]testReq{
+				"any_allowed": {
+					path:       "test/splat_allowed_with_value",
+					parameters: `{"anyParam": "anyValue"}`,
+					allowed:    true,
+				},
+				"all_denied": {
+					path:       "test/splat_denied_with_value",
+					parameters: `{"param": "deniedValue"}`,
+					allowed:    false,
+				},
+			},
+		},
+		"glob_patterns": {
+			policy: `
+				path "test/path" {
+					capabilities = ["update"]
+					allowed_parameters = {
+						"*" = []
+						"globParam" = ["allowed1*", "allowed2*"]
+					}
+					denied_parameters = {
+						"globParamDeny" = ["denied1*", "denied2*"]
+					}
+				}
+			`,
+			requests: map[string]testReq{
+				"match_allowed": {
+					parameters: `{"globParam": "allowed11111"}`,
+					allowed:    true,
+				},
+				"no_match_denied": {
+					parameters: `{"globParam": "otherValue"}`,
+					allowed:    false,
+				},
+				"match_denied": {
+					parameters: `{"globParamDeny": "denied1111"}`,
+					allowed:    false,
+				},
+				"no_match_allowed": {
+					parameters: `{"globParamDeny": "otherValue"}`,
+					allowed:    true,
+				},
+				"list_with_match_denied_on_new_slice_matching": {
+					parameters:           `{"globParamDeny": ["denied1111", "otherValue"]}`,
+					allowed:              false,
+					onlyNewSliceMatching: true,
+				},
+				"list_with_match_denied_on_new_slice_matching_comma_string_slice_parsing": {
+					parameters:           `{"globParamDeny": "denied1111,otherValue"}`,
+					allowed:              false,
+					onlyNewSliceMatching: true,
+				},
+				"list_with_match_allowed_on_legacy_exact_matching": {
+					parameters:              `{"globParamDeny": ["denied11111", "otherValue"]}`,
+					allowed:                 true,
+					onlyLegacyExactMatching: true,
+				},
+				"list_with_match_denied_on_legacy_exact_matching_comma_string_slice_parsing": {
+					parameters:              `{"globParamDeny": "denied11111,otherValue"}`,
+					allowed:                 false,
+					onlyLegacyExactMatching: true,
+				},
+			},
+		},
+		"splat_allow_and_specific_deny": {
+			policy: `
+				path "test/path" {
+					capabilities = ["update"]
+					allowed_parameters = {
+						"*" = []
+					}
+					denied_parameters = {
+						"specificParam" = ["specificValue"]
+					}
+				}
+			`,
+			requests: map[string]testReq{
+				"splat_allows_any_param_except_specific": {
+					parameters: `{"anyParam": "anyValue"}`,
+					allowed:    true,
+				},
+				"specific_param_denied": {
+					parameters: `{"specificParam": "specificValue"}`,
+					allowed:    false,
+				},
+				"specific_param_with_other_value_allowed": {
+					parameters: `{"specificParam": "otherValue"}`,
+					allowed:    true,
+				},
+			},
+		},
+		"simple_merge": {
+			policy: `
+				path "test/path" {
+					capabilities = ["update"]
+					allowed_parameters = {
+						"*" = []
+						"mergeParam" = ["value1"]
+					}
+					denied_parameters = {
+						"mergeParamDeny" = ["value3"]
+					}
+				}
+				path "test/path" {
+					capabilities = ["update"]
+					allowed_parameters = {
+						"mergeParam" = ["value2"]
+					}
+					denied_parameters = {
+						"mergeParamDeny" = ["value4"]
+					}
+				}
+			`,
+			requests: map[string]testReq{
+				"merged_allowed_values": {
+					parameters: `{"mergeParam": "value1"}`,
+					allowed:    true,
+				},
+				"merged_allowed_values_other": {
+					parameters: `{"mergeParam": "value2"}`,
+					allowed:    true,
+				},
+				"merged_disallowed_values": {
+					parameters: `{"mergeParam": "value3"}`,
+					allowed:    false,
+				},
+				"merged_both_vales_denied_on_legacy_exact_matching": {
+					parameters:              `{"mergeParam": ["value1", "value2"]}`,
+					allowed:                 false,
+					onlyLegacyExactMatching: true,
+				},
+				"merged_both_vales_denied_on_legacy_exact_matching_string_slice": {
+					parameters:              `{"mergeParam": "value1,value2"}`,
+					allowed:                 false,
+					onlyLegacyExactMatching: true,
+				},
+				"merged_both_values_allowed_on_new_slice_matching": {
+					parameters:           `{"mergeParam": ["value1", "value2"]}`,
+					allowed:              true,
+					onlyNewSliceMatching: true,
+				},
+				"merged_both_values_allowed_on_new_slice_matching_string_slice": {
+					parameters:           `{"mergeParam": "value1,value2"}`,
+					allowed:              true,
+					onlyNewSliceMatching: true,
+				},
+				"merged_denied_values": {
+					parameters: `{"mergeParamDeny": "value3"}`,
+					allowed:    false,
+				},
+				"merged_denied_values_other": {
+					parameters: `{"mergeParamDeny": "value4"}`,
+					allowed:    false,
+				},
+				"merged_allowed_values_not_denied": {
+					parameters: `{"mergeParamDeny": "value5"}`,
+					allowed:    true,
+				},
+				"merged_both_denied_values_denied_on_new_slice_matching": {
+					parameters:           `{"mergeParamDeny": ["value3", "value4"]}`,
+					allowed:              false,
+					onlyNewSliceMatching: true,
+				},
+				"merged_both_denied_values_denied_on_new_slice_matching_string_slice": {
+					parameters:           `{"mergeParamDeny": "value3,value4"}`,
+					allowed:              false,
+					onlyNewSliceMatching: true,
+				},
+				"merged_both_denied_values_allowed_on_legacy_exact_matching": {
+					parameters:              `{"mergeParamDeny": ["value3", "value4"]}`,
+					allowed:                 true,
+					onlyLegacyExactMatching: true,
+				},
+				"merged_both_denied_values_allowed_on_legacy_exact_matching_string_slice": {
+					parameters:              `{"mergeParamDeny": "value3,value4"}`,
+					allowed:                 true,
+					onlyLegacyExactMatching: true,
+				},
+			},
+		},
+		"multiple_allowed_values": {
+			policy: `
+				path "test/path" {
+					capabilities = ["update"]
+					allowed_parameters = {
+						"allowed_param" = ["allowedValue1", "allowedValue2"]
+					}
+				}
+			`,
+			requests: map[string]testReq{
+				"single_value_allowed": {
+					parameters: `{"allowed_param": "allowedValue1"}`,
+					allowed:    true,
+				},
+				"other_single_value_allowed": {
+					parameters: `{"allowed_param": "allowedValue2"}`,
+					allowed:    true,
+				},
+				"multiple_values_denied_with_legacy_exact_matching": {
+					parameters:              `{"allowed_param": ["allowedValue1", "allowedValue2"]}`,
+					allowed:                 false,
+					onlyLegacyExactMatching: true,
+				},
+				"multiple_values_denied_with_legacy_exact_matching_string_slice": {
+					parameters:              `{"allowed_param": "allowedValue1,allowedValue2"}`,
+					allowed:                 false,
+					onlyLegacyExactMatching: true,
+				},
+				"multiple_values_allowed_with_new_slice_matching": {
+					parameters:           `{"allowed_param": ["allowedValue1", "allowedValue2"]}`,
+					allowed:              true,
+					onlyNewSliceMatching: true,
+				},
+				"multiple_values_allowed_with_new_slice_matching_string_slice": {
+					parameters:           `{"allowed_param": "allowedValue1,allowedValue2"}`,
+					allowed:              true,
+					onlyNewSliceMatching: true,
+				},
+			},
+		},
+		"multiple_denied_values": {
+			policy: `
+				path "test/path" {
+					capabilities = ["update"]
+					denied_parameters = {
+						"denied_param" = ["deniedValue1", "deniedValue2"]
+					}
+				}
+			`,
+			requests: map[string]testReq{
+				"single_value_denied": {
+					parameters: `{"denied_param": "deniedValue1"}`,
+					allowed:    false,
+				},
+				"other_single_value_denied": {
+					parameters: `{"denied_param": "deniedValue2"}`,
+					allowed:    false,
+				},
+				"multiple_values_allowed_under_legacy_matching": {
+					parameters:              `{"denied_param": ["deniedValue1", "deniedValue2"]}`,
+					allowed:                 true,
+					onlyLegacyExactMatching: true,
+				},
+				"multiple_values_allowed_under_legacy_matching_string_slice": {
+					parameters:              `{"denied_param": "deniedValue1,deniedValue2"}`,
+					allowed:                 true,
+					onlyLegacyExactMatching: true,
+				},
+				"multiple_values_denied_with_new_slice_matching": {
+					parameters:           `{"denied_param": ["deniedValue1", "deniedValue2"]}`,
+					allowed:              false,
+					onlyNewSliceMatching: true,
+				},
+				"multiple_values_denied_with_new_slice_matching_string_slice": {
+					parameters:           `{"denied_param": "deniedValue1,deniedValue2"}`,
+					allowed:              false,
+					onlyNewSliceMatching: true,
+				},
+			},
+		},
+		"multiple_allowed_values_list": {
+			policy: `
+				path "test/path" {
+					capabilities = ["update"]
+					allowed_parameters = {
+						"allowed_param" = ["allowedValue1", ["allowedValue1", "allowedValue2"]]
+					}
+				}
+			`,
+			requests: map[string]testReq{
+				"single_value_allowed": {
+					parameters: `{"allowed_param": "allowedValue1"}`,
+					allowed:    true,
+				},
+				"other_single_value_disallowed": {
+					parameters: `{"allowed_param": "allowedValue2"}`,
+					allowed:    false,
+				},
+				"multiple_values_allowed": {
+					parameters: `{"allowed_param": ["allowedValue1", "allowedValue2"]}`,
+					allowed:    true,
+				},
+				"multiple_values_denied_string_slice_new_matching": {
+					parameters:           `{"allowed_param": "allowedValue1,allowedValue2"}`,
+					allowed:              false,
+					onlyNewSliceMatching: true,
+				},
+				"multiple_values_disallowed_string_slice_legacy_matching": {
+					parameters:              `{"allowed_param": "allowedValue1,allowedValue2"}`,
+					allowed:                 false,
+					onlyLegacyExactMatching: true,
+				},
+			},
+		},
+		"multiple_denied_values_list": {
+			policy: `
+				path "test/path" {
+					capabilities = ["update"]
+					denied_parameters = {
+						"denied_param" = ["deniedValue1", ["deniedValue1", "deniedValue2"]]
+					}
+				}
+			`,
+			requests: map[string]testReq{
+				"single_value_denied": {
+					parameters: `{"denied_param": "deniedValue1"}`,
+					allowed:    false,
+				},
+				"other_single_value_allowed": {
+					parameters: `{"denied_param": "deniedValue2"}`,
+					allowed:    true,
+				},
+				"multiple_values_denied": {
+					parameters: `{"denied_param": ["deniedValue1", "deniedValue2"]}`,
+					allowed:    false,
+				},
+				"multiple_values_denied_string_slice_new_matching": {
+					parameters:           `{"denied_param": "deniedValue1,deniedValue2"}`,
+					allowed:              false,
+					onlyNewSliceMatching: true,
+				},
+				"multiple_values_allowed_string_slice_legacy_matching": {
+					parameters:              `{"denied_param": "deniedValue1,deniedValue2"}`,
+					allowed:                 true,
+					onlyLegacyExactMatching: true,
+				},
+			},
+		},
+		"complex_value_types": {
+			policy: `
+				path "test/path" {
+					capabilities = ["update"]
+					allowed_parameters = {
+						"map_param" = [{"key1" = "value1", "key2" = "value2"}]
+						"int_param" = [1, 2, 3]
+						"bool_param" = [true, false]
+					}
+				}
+			`,
+			requests: map[string]testReq{
+				"map_param_allowed": {
+					parameters: `{"map_param": {"key1": "value1", "key2": "value2"}}`,
+					allowed:    true,
+				},
+				"map_additional_fields_disallowed": {
+					parameters: `{"map_param": {"key1": "value1", "key2": "value2", "key3": "value3"}}`,
+					allowed:    false,
+				},
+				"map_fewer_fields_disallowed": {
+					parameters: `{"map_param": {"key1": "value1"}}`,
+					allowed:    false,
+				},
+				"map_keys_case_sensitive": {
+					parameters: `{"map_param": {"KEY1": "value1", "key2": "value2"}}`,
+					allowed:    false,
+				},
+				"int_param_doesnt_work": {
+					parameters: `{"int_param": 2}`,
+					allowed:    false,
+				},
+				"bool_param_allowed": {
+					parameters: `{"bool_param": false}`,
+					allowed:    true,
+				},
+				"bool_param_disallowed": {
+					parameters: `{"bool_param": "false"}`,
+					allowed:    false,
+				},
+			},
+		},
+		"VAULT-35716_use_case": {
+			policy: `
+				path "identity/group" {
+					capabilities = ["create", "update", "list", "read"]
+					denied_parameters = {
+						"name" = ["admin_group_*", "ADMIN_GROUP_*", "admin_automation", "ADMIN_AUTOMATION"]
+						"policies" = ["*admin-automation-policy*", "*admin-policy*"]
+					}
+				}
+			`,
+			requests: map[string]testReq{
+				"assignment_of_both_policies_and_name_allowed_on_legacy_exact_matching": {
+					path: "identity/group",
+					parameters: `{
+						"name": "test_policy_list",
+						"policies": ["admin-policy", "admin-automation-policy"],
+						"type": "external"
+					}`,
+					allowed:                 true,
+					onlyLegacyExactMatching: true,
+				},
+				"assignment_of_both_policies_and_name_denied_on_new_slice_matching": {
+					path: "identity/group",
+					parameters: `{
+						"name": "test_policy_list",
+						"policies": ["admin-policy", "admin-automation-policy"],
+						"type": "external"
+					}`,
+					allowed:              false,
+					onlyNewSliceMatching: true,
+				},
+			},
+		},
+		"string_slice_edge_cases": {
+			policy: `
+				path "test/path" {
+					capabilities = ["update"]
+					allowed_parameters = {
+						"allowed_param" = ["allowedValue1", "allowedValue2"]
+						"*" = []
+					}
+					denied_parameters = {
+						"denied_param" = ["deniedValue1", "deniedValue2"]
+					}
+				}
+			`,
+			requests: map[string]testReq{
+				"denied_string_slice_counts_spaces_legacy_matching": {
+					parameters:              `{"denied_param": "someValue, deniedValue2"}`,
+					allowed:                 true,
+					onlyLegacyExactMatching: true,
+				},
+				"denied_string_slice_disregards_spaces_new_matching": {
+					parameters:           `{"denied_param": "someValue, deniedValue2"}`,
+					allowed:              false,
+					onlyNewSliceMatching: true,
+				},
+				"allowed_string_slice_counts_spaces_legacy_matching": {
+					parameters:              `{"allowed_param": "allowedValue1, allowedValue2"}`,
+					allowed:                 false,
+					onlyLegacyExactMatching: true,
+				},
+				"allowed_string_slice_disregards_spaces_new_matching": {
+					parameters:           `{"allowed_param": "allowedValue1, allowedValue2"}`,
+					allowed:              true,
+					onlyNewSliceMatching: true,
+				},
+				"denied_string_slice_inside_array_does_not_parse": {
+					parameters: `{"denied_param": ["deniedValue1,deniedValue2"]}`,
+					allowed:    true,
+				},
+				"allowed_string_slice_inside_array_does_not_parse": {
+					parameters: `{"allowed_param": ["allowedValue1,allowedValue2"]}`,
+					allowed:    false,
+				},
+				"denied_string_slice_does_not_merge": {
+					parameters: `{"denied_param": ["deniedValue1,deniedValue2", "someValue"]}`,
+					allowed:    true,
+				},
+				"allowed_string_slice_does_not_merge": {
+					parameters: `{"allowed_param": ["allowedValue1,allowedValue2", "allowedValue1"]}`,
+					allowed:    false,
+				},
+			},
+		},
+		"string_value": {
+			policy: `
+				path "test/path" {
+					capabilities = ["update"]
+					allowed_parameters = {
+						"allowed_param" = ["allowedValue,withComma"]
+						"*" = []
+					}
+					denied_parameters = {
+						"denied_param" = ["deniedValue,withComma"]
+					}
+				}
+			`,
+			requests: map[string]testReq{
+				"substring_does_not_match_allowed": {
+					parameters: `{"allowed_param": "allowedValue"}`,
+					allowed:    false,
+				},
+				"substring_does_not_match_denied": {
+					parameters: `{"denied_param": "deniedValue"}`,
+					allowed:    true,
+				},
+				"full_string_with_comma_matches_allowed": {
+					parameters: `{"allowed_param": "allowedValue,withComma"}`,
+					allowed:    true,
+				},
+				"full_string_with_comma_matches_denied": {
+					parameters: `{"denied_param": "deniedValue,withComma"}`,
+					allowed:    false,
+				},
+			},
+		},
+	}
+
+	ns := namespace.RootNamespace
+	ctx := namespace.ContextWithNamespace(context.Background(), ns)
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			r := require.New(t)
+			policy, err := ParseACLPolicy(ns, tc.policy)
+			r.NoError(err)
+
+			acl, err := NewACL(ctx, []*Policy{policy})
+			r.NoError(err)
+
+			for reqName, req := range tc.requests {
+				if req.onlyNewSliceMatching && req.onlyLegacyExactMatching {
+					t.Fatalf("test case %q cannot be both onlyNewSliceMatching and onlyLegacyExactMatching", reqName)
+				}
+				t.Run(reqName, func(t *testing.T) {
+					test := func(t *testing.T) {
+						r := require.New(t)
+						path := req.path
+						if path == "" {
+							path = "test/path"
+						}
+
+						// Decode JSON string into a map
+						var parameters map[string]any
+						reader := bytes.NewReader([]byte(req.parameters))
+						err := jsonutil.DecodeJSONFromReader(reader, &parameters)
+						r.NoError(err)
+
+						request := &logical.Request{
+							Path:      path,
+							Data:      parameters,
+							Operation: logical.UpdateOperation,
+						}
+
+						authResults := acl.AllowOperation(ctx, request, false)
+						require.Equal(t, req.allowed, authResults.Allowed)
+					}
+					if !req.onlyNewSliceMatching && !req.onlyLegacyExactMatching {
+						t.Setenv("VAULT_LEGACY_EXACT_MATCHING_ON_LIST", "true")
+						t.Run("legacy_exact_matching", test)
+						t.Setenv("VAULT_LEGACY_EXACT_MATCHING_ON_LIST", "")
+						t.Run("new_slice_matching", test)
+					} else {
+						if req.onlyLegacyExactMatching {
+							t.Setenv("VAULT_LEGACY_EXACT_MATCHING_ON_LIST", "true")
+						} else {
+							t.Setenv("VAULT_LEGACY_EXACT_MATCHING_ON_LIST", "")
+						}
+						test(t)
+					}
+				})
+			}
+		})
+	}
+}

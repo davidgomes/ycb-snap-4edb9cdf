@@ -1,0 +1,12 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+{{! renders a human readable date with a tooltip containing the API timestamp}}
+<Hds::TooltipButton @text={{@timestamp}} aria-label="API timestamp" data-test-tooltip="kv-version">
+  {{#if @text}}
+    {{@text}}
+  {{/if}}
+  {{date-format @timestamp "MMM dd, yyyy hh:mm a"}}
+</Hds::TooltipButton>

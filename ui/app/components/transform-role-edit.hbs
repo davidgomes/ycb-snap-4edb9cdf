@@ -1,0 +1,110 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Page::Header @title={{this.title}} @subtitle={{this.subtitle}}>
+  <:breadcrumbs>
+    <Page::Breadcrumbs @breadcrumbs={{this.breadcrumbs}} />
+  </:breadcrumbs>
+</Page::Header>
+
+{{#if (eq @mode "show")}}
+  <Toolbar>
+    <ToolbarActions>
+      {{#if @capabilities.canDelete}}
+        <Hds::Button
+          @text="Delete role"
+          @color="secondary"
+          class="toolbar-button"
+          data-test-delete
+          {{on "click" this.onDelete}}
+        />
+        <div class="toolbar-separator"></div>
+      {{/if}}
+      {{#if @capabilities.canUpdate}}
+        <ToolbarSecretLink
+          @secret={{concat "role/" @form.data.name}}
+          @backend={{@form.data.backend}}
+          @mode="edit"
+          @replace={{true}}
+          data-test-edit-link
+        >
+          Edit role
+        </ToolbarSecretLink>
+      {{/if}}
+    </ToolbarActions>
+  </Toolbar>
+{{/if}}
+
+{{#if (or (eq @mode "edit") (eq @mode "create"))}}
+  <form {{on "submit" this.createOrUpdate}}>
+    <div class="box is-sideless is-fullwidth is-marginless">
+      <NamespaceReminder @mode={{@mode}} @noun="transform role" />
+      <MessageError @errorMessage={{this.errorMessage}} />
+      {{#each @form.formFields as |field|}}
+        {{#if (eq field.name "transformations")}}
+          <div class="form-section">
+            <SearchSelect
+              @id="transformations"
+              @label={{field.options.label}}
+              @labelClass="title is-4"
+              @subText={{field.options.subText}}
+              @options={{this.transformations}}
+              @inputValue={{@form.data.transformations}}
+              @onChange={{fn (mut @form.transformations)}}
+              @disallowNewItems={{true}}
+              @fallbackComponent="string-list"
+              data-test-field
+            />
+            {{#if (and this.modelValidations.transformations (not this.modelValidations.transformations.isValid))}}
+              <Hds::Form::Error data-test-validation-error="transformations">
+                {{this.modelValidations.transformations.errors}}
+              </Hds::Form::Error>
+            {{/if}}
+          </div>
+        {{else}}
+          <FormField
+            data-test-field
+            @attr={{field}}
+            @model={{@form}}
+            @mode={{@mode}}
+            @modelValidations={{this.modelValidations}}
+          />
+        {{/if}}
+      {{/each}}
+    </div>
+    <div class="field is-grouped-split box is-fullwidth is-bottomless">
+      <Hds::ButtonSet>
+        <Hds::Button @text={{if (eq @mode "create") "Create role" "Save"}} type="submit" data-test-submit />
+        {{#if (eq @mode "create")}}
+          <Hds::Button
+            @text="Cancel"
+            @color="secondary"
+            @route="vault.cluster.secrets.backend.list-root"
+            @model={{@form.data.backend}}
+            @query={{hash tab="role"}}
+          />
+        {{else}}
+          <Hds::Button
+            @text="Cancel"
+            @color="secondary"
+            @route="vault.cluster.secrets.backend.show"
+            @models={{array @form.data.backend (concat "role/" @form.data.name)}}
+          />
+        {{/if}}
+      </Hds::ButtonSet>
+    </div>
+  </form>
+{{else}}
+  <div class="box is-fullwidth is-sideless is-paddingless is-marginless">
+    {{#each @form.formFields as |field|}}
+      <InfoTableRow
+        @label={{capitalize (or field.options.label (humanize (dasherize field.name)))}}
+        @value={{get @form.data field.name}}
+        @type={{field.type}}
+        @isLink={{eq field.name "transformations"}}
+      />
+    {{/each}}
+  </div>
+{{/if}}

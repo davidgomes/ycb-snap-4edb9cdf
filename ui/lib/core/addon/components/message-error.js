@@ -1,0 +1,65 @@
+/**
+ * Copyright IBM Corp. 2016, 2025
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+import Component from '@glimmer/component';
+
+/**
+ * @module MessageError
+ * Renders form errors using the Hds::Alert component and extracts errors from
+ * a model, passed errorMessage or array of errors and displays each in a separate banner.
+ *
+ * @example
+ * <MessageError @errorMessage="oh no there is a problem" />
+ *
+ * @param {object} [model=null] - An Ember data model that will be used to bind error states to the internal `errors` property.
+ * @param {array} [errors=null] - An array of error strings to show.
+ * @param {string} [errorMessage=null] - An Error string to display.
+ * @param {array} [errorDetails=null] - Renders a list of errors when error is not from the API. Helpful for rendering a list of client-side validation errors.
+ */
+
+export default class MessageError extends Component {
+  get displayErrors() {
+    const { errorMessage, errors, model } = this.args;
+    if (errorMessage) {
+      return [errorMessage];
+    }
+
+    if (errors && errors.length > 0) {
+      return errors;
+    }
+
+    if (model?.isError) {
+      const adapterError = model?.adapterError;
+      if (!adapterError) {
+        return null;
+      }
+      if (adapterError.errors?.length > 0) {
+        return adapterError.errors.map((e) => {
+          if (typeof e === 'object') return e.title || e.message || JSON.stringify(e);
+          return e;
+        });
+      }
+      return [adapterError.message];
+    }
+    return null;
+  }
+
+  get formattedError() {
+    if (this.args.errorMessage?.includes('*') && this.args.errorMessage?.includes('error: ')) {
+      try {
+        const lines = this.args.errorMessage.split('\n');
+        const [message] = lines[0].split('. error:');
+        const details = lines
+          .filter((line) => line.includes('* '))
+          .map((line) => line.replace(/\t\* /, ''))
+          .filter(Boolean);
+        return message && details ? { message, details } : null;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+}

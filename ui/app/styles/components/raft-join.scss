@@ -1,0 +1,19 @@
+@use '../utils/size_variables';
+
+/**
+ * Copyright IBM Corp. 2016, 2025
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+.raft-join .field {
+  margin-bottom: 0;
+}
+.raft-join .box.is-fullwidth {
+  padding-top: size_variables.$spacing-12;
+  padding-bottom: size_variables.$spacing-12;
+}
+.raft-join-unseal {
+  color: var(--token-color-foreground-warning);
+  font-size: var(--token-typography-body-300-font-size);
+  display: inline-block;
+}

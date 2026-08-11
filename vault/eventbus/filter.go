@@ -1,0 +1,498 @@
+// Copyright IBM Corp. 2016, 2025
+// SPDX-License-Identifier: BUSL-1.1
+
+package eventbus
+
+import (
+	"context"
+	"fmt"
+	"maps"
+	"slices"
+	"sort"
+	"strings"
+	"sync"
+
+	"github.com/hashicorp/go-secure-stdlib/strutil"
+	"github.com/hashicorp/vault/helper/namespace"
+	"github.com/hashicorp/vault/sdk/logical"
+	"github.com/ryanuber/go-glob"
+)
+
+// clusterWide is used to collect and keep track of subscriber patterns from all
+// nodes within a cluster
+const clusterWide = "__cluster_wide__"
+
+// Filters keeps track of all the event patterns that each cluster node is interested in.
+type Filters struct {
+	lock    sync.RWMutex
+	self    clusterNodeID
+	filters map[clusterNodeID]*ClusterNodeFilter
+
+	// notifyChanges is used to notify about changes to filters. The condition variables are tied to single lock above.
+	notifyChanges map[clusterNodeID]*sync.Cond
+}
+
+// clusterNodeID is used to syntactically indicate that the string is a cluster nodes's identifier.
+type clusterNodeID string
+
+// pattern is used to represent one or more combinations of patterns
+type pattern struct {
+	namespacePatterns string // space-separated (spaces are not allowed in namespaces, and slices are not comparable)
+	eventTypePattern  string
+}
+
+func (p pattern) String() string {
+	return fmt.Sprintf("{ns=%s,ev=%s}", p.namespacePatterns, p.eventTypePattern)
+}
+
+func (p pattern) isEmpty() bool {
+	return p.namespacePatterns == "" && p.eventTypePattern == ""
+}
+
+// patternSet is a map of patterns to subscription id's
+type patternSet map[pattern][]string
+
+func newPatternSet() patternSet {
+	return make(patternSet)
+}
+
+// Insert a pattern into the pattern set for the given subscription ID,
+// maintaining subscription IDs in sorted order for search efficiency when
+// inserting.
+func (ps patternSet) Insert(p pattern, subscriptionID string) patternSet {
+	position, found := slices.BinarySearch(ps[p], subscriptionID)
+	if !found {
+		ps[p] = slices.Insert(ps[p], position, subscriptionID)
+	}
+	return ps
+}
+
+// Delete removes the given subscriptionID from the pattern, if that association
+// exists.
+func (ps patternSet) Delete(p pattern, subscriptionID string) patternSet {
+	if ps == nil {
+		return nil
+	}
+	if ids, ok := ps[p]; ok {
+		if i := slices.Index(ids, subscriptionID); i >= 0 {
+			ps[p] = append(ids[:i], ids[i+1:]...)
+		}
+		if len(ps[p]) == 0 {
+			delete(ps, p)
+		}
+	}
+	return ps
+}
+
+func (ps patternSet) Clear() {
+	clear(ps)
+}
+
+// Difference returns the set of patterns from ps not in check. The subscriber
+// ID slices are also considered when checking for differences.
+func (ps patternSet) Difference(check patternSet) patternSet {
+	diff := newPatternSet()
+	for p := range ps {
+		if _, ok := check[p]; !ok {
+			diff[p] = ps[p]
+		} else {
+			subIDdiff := strutil.Difference(ps[p], check[p], false)
+			if len(subIDdiff) > 0 {
+				diff[p] = subIDdiff
+			}
+		}
+	}
+	return diff
+}
+
+// ClusterNodeFilter keeps track of all patterns that a particular cluster node is interested in.
+type ClusterNodeFilter struct {
+	patterns patternSet
+}
+
+// match checks if the given ns and eventType matches any pattern in the cluster node's filter.
+// Must be called while holding a (read) lock for the filter.
+func (nf *ClusterNodeFilter) match(ns *namespace.Namespace, eventType logical.EventType) bool {
+	if nf == nil {
+		return false
+	}
+	for p := range nf.patterns {
+		if glob.Glob(p.eventTypePattern, string(eventType)) {
+			for _, nsp := range strings.Split(p.namespacePatterns, " ") {
+				if glob.Glob(nsp, ns.Path) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// NewFilters creates an empty set of filters to keep track of each cluster node's pattern interests.
+func NewFilters(self string) *Filters {
+	f := &Filters{
+		self:          clusterNodeID(self),
+		filters:       map[clusterNodeID]*ClusterNodeFilter{},
+		notifyChanges: map[clusterNodeID]*sync.Cond{},
+	}
+	f.notifyChanges[clusterNodeID(self)] = sync.NewCond(&f.lock)
+	f.notifyChanges[clusterWide] = sync.NewCond(&f.lock)
+	return f
+}
+
+func (f *Filters) String() string {
+	x := "Filters {\n"
+	for k, v := range f.filters {
+		x += fmt.Sprintf("  %s: {%s}\n", k, v)
+	}
+	return x
+}
+
+func (nf *ClusterNodeFilter) String() string {
+	var x []string
+	for p, subscriberIDs := range nf.patterns {
+		x = append(x, fmt.Sprintf("%s: %v", p.String(), subscriberIDs))
+	}
+	slices.Sort(x)
+	return strings.Join(x, ",")
+}
+
+func (f *Filters) addClusterWidePattern(namespacePatterns []string, eventTypePattern string) {
+	f.addPattern(clusterWide, namespacePatterns, eventTypePattern, clusterWide)
+}
+
+func (f *Filters) removeClusterWidePattern(namespacePatterns []string, eventTypePattern string) {
+	f.removePattern(clusterWide, namespacePatterns, eventTypePattern, clusterWide)
+}
+
+func (f *Filters) clearClusterWidePatterns() {
+	defer f.notify(clusterWide)
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	delete(f.filters, clusterWide)
+}
+
+func (f *Filters) getOrCreateNotify(c clusterNodeID) *sync.Cond {
+	// fast check when we don't need to create the Cond
+	f.lock.RLock()
+	n, ok := f.notifyChanges[c]
+	f.lock.RUnlock()
+	if ok {
+		return n
+	}
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	// check again to avoid race condition
+	n, ok = f.notifyChanges[c]
+	if ok {
+		return n
+	}
+	n = sync.NewCond(&f.lock)
+	f.notifyChanges[c] = n
+	return n
+}
+
+func (f *Filters) notify(c clusterNodeID) {
+	f.lock.RLock()
+	defer f.lock.RUnlock()
+	if notifier, ok := f.notifyChanges[c]; ok {
+		notifier.Broadcast()
+	}
+}
+
+func (f *Filters) clearClusterNodePatterns(c clusterNodeID) {
+	defer f.notify(c)
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	delete(f.filters, c)
+}
+
+// copyPatternWithLock gets a copy of a cluster node's filters
+func (f *Filters) copyPatternWithLock(c clusterNodeID) *ClusterNodeFilter {
+	filters := &ClusterNodeFilter{}
+	if got, ok := f.filters[c]; ok {
+		filters.patterns = maps.Clone(got.patterns)
+		for key, slice := range filters.patterns {
+			filters.patterns[key] = slices.Clone(slice)
+		}
+	} else {
+		filters.patterns = newPatternSet()
+	}
+	return filters
+}
+
+func (f *Filters) makeClusterWideFilters() {
+	defer f.notify(clusterWide)
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	newPatterns := newPatternSet()
+	for c, cf := range f.filters {
+		if c == clusterWide {
+			continue
+		}
+		for p := range cf.patterns {
+			// The set of cluster-wide patterns doesn't need to keep track of all
+			// the subscription id's, so we just use the cluster-wide pattern uuid
+			newPatterns.Insert(p, clusterWide)
+		}
+	}
+	f.filters[clusterWide] = &ClusterNodeFilter{patterns: newPatterns}
+}
+
+// applyChanges applies the changes in the given list, atomically.
+func (f *Filters) applyChanges(c clusterNodeID, changes []FilterChange) {
+	defer f.notify(c)
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	var newPatterns patternSet
+	if existing, ok := f.filters[c]; ok {
+		newPatterns = existing.patterns
+	} else {
+		newPatterns = newPatternSet()
+	}
+	for _, change := range changes {
+		applyChange(newPatterns, &change)
+	}
+	f.filters[c] = &ClusterNodeFilter{patterns: newPatterns}
+}
+
+// applyChange applies a single filter change to the given set.
+func applyChange(s patternSet, change *FilterChange) {
+	switch change.Operation {
+	case FilterChangeAdd:
+		nsPatterns := slices.Clone(change.NamespacePatterns)
+		sort.Strings(nsPatterns)
+		p := pattern{eventTypePattern: change.EventTypePattern, namespacePatterns: cleanJoinNamespaces(nsPatterns)}
+		s.Insert(p, change.SubscriberID)
+	case FilterChangeRemove:
+		nsPatterns := slices.Clone(change.NamespacePatterns)
+		sort.Strings(nsPatterns)
+		check := pattern{eventTypePattern: change.EventTypePattern, namespacePatterns: cleanJoinNamespaces(nsPatterns)}
+		s.Delete(check, change.SubscriberID)
+	case FilterChangeClear:
+		s.Clear()
+	}
+}
+
+func cleanJoinNamespaces(nsPatterns []string) string {
+	trimmed := make([]string, len(nsPatterns))
+	for i := 0; i < len(nsPatterns); i++ {
+		trimmed[i] = strings.TrimSpace(nsPatterns[i])
+	}
+	// sort and uniq
+	sort.Strings(trimmed)
+	trimmed = slices.Compact(trimmed)
+	return strings.Join(trimmed, " ")
+}
+
+// addPattern adds a pattern to a cluster node's list.
+func (f *Filters) addPattern(c clusterNodeID, namespacePatterns []string, eventTypePattern string, subscriptionID string) {
+	defer f.notify(c)
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	if _, ok := f.filters[c]; !ok {
+		f.filters[c] = &ClusterNodeFilter{
+			patterns: newPatternSet(),
+		}
+	}
+	nsPatterns := slices.Clone(namespacePatterns)
+	sort.Strings(nsPatterns)
+	p := pattern{
+		eventTypePattern:  eventTypePattern,
+		namespacePatterns: cleanJoinNamespaces(nsPatterns),
+	}
+	f.filters[c].patterns.Insert(p, subscriptionID)
+}
+
+// removePattern removes a pattern from a cluster node's list.
+func (f *Filters) removePattern(c clusterNodeID, namespacePatterns []string, eventTypePattern, subscriptionID string) {
+	defer f.notify(c)
+	nsPatterns := slices.Clone(namespacePatterns)
+	sort.Strings(nsPatterns)
+	check := pattern{eventTypePattern: eventTypePattern, namespacePatterns: cleanJoinNamespaces(nsPatterns)}
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	filters, ok := f.filters[c]
+	if !ok {
+		return
+	}
+	filters.patterns.Delete(check, subscriptionID)
+}
+
+// anyMatch returns true if any cluster node's pattern list matches the arguments.
+func (f *Filters) anyMatch(ns *namespace.Namespace, eventType logical.EventType) bool {
+	f.lock.RLock()
+	defer f.lock.RUnlock()
+	for _, cf := range f.filters {
+		if cf.match(ns, eventType) {
+			return true
+		}
+	}
+	return false
+}
+
+// clusterWideMatch returns true if the cluster-wide's pattern list matches the arguments.
+func (f *Filters) clusterWideMatch(ns *namespace.Namespace, eventType logical.EventType) bool {
+	return f.clusterNodeMatch(clusterWide, ns, eventType)
+}
+
+// clusterNodeMatch returns true if the given cluster node's pattern list matches the arguments.
+func (f *Filters) clusterNodeMatch(c clusterNodeID, ns *namespace.Namespace, eventType logical.EventType) bool {
+	f.lock.RLock()
+	defer f.lock.RUnlock()
+	return f.filters[c].match(ns, eventType)
+}
+
+// localMatch returns true if the local cluster node's pattern list matches the arguments.
+func (f *Filters) localMatch(ns *namespace.Namespace, eventType logical.EventType) bool {
+	return f.clusterNodeMatch(f.self, ns, eventType)
+}
+
+// watch creates a notification channel that receives changes for the given cluster node.
+func (f *Filters) watch(ctx context.Context, clusterNode clusterNodeID) (<-chan []FilterChange, context.CancelFunc) {
+	notify := f.getOrCreateNotify(clusterNode)
+	ctx, cancelFunc := context.WithCancel(ctx)
+	doneCh := ctx.Done()
+	ch := make(chan []FilterChange)
+
+	// ensure that the sleeping goroutine wakes up if the channel is closed
+	go func() {
+		select {
+		case <-doneCh:
+			notify.Broadcast()
+		}
+	}()
+
+	sendToNotify := make(chan *ClusterNodeFilter)
+
+	// goroutine for polling the condition variable.
+	// it's necessary to hold the lock the entire time to ensure there are no race conditions.
+	go func() {
+		// use a WG to ensure we don't try to send to a closed channel
+		senders := sync.WaitGroup{}
+		defer func() {
+			senders.Wait()
+			close(sendToNotify)
+		}()
+		f.lock.Lock()
+		defer f.lock.Unlock()
+		for {
+			select {
+			case <-doneCh:
+				return
+			default:
+			}
+			next := f.copyPatternWithLock(clusterNode)
+			senders.Add(1)
+			// don't block to send since we hold the lock
+			go func() {
+				sendToNotify <- next
+				senders.Done()
+			}()
+			notify.Wait()
+		}
+	}()
+
+	// calculate changes and forward to notification channel
+	go func() {
+		defer close(ch)
+		var current *ClusterNodeFilter
+		for {
+			next, ok := <-sendToNotify
+			if !ok {
+				return
+			}
+			changes := calculateChanges(current, next)
+			if len(changes) == 0 {
+				// If there are no changes, don't notify
+				continue
+			}
+			current = next
+			// check if the context is finished before sending
+			select {
+			case <-doneCh:
+				return
+			default:
+				ch <- changes
+			}
+		}
+	}()
+
+	return ch, cancelFunc
+}
+
+// FilterChange represents a change to a cluster node's filters.
+type FilterChange struct {
+	Operation         int
+	NamespacePatterns []string
+	EventTypePattern  string
+	SubscriberID      string
+}
+
+const (
+	FilterChangeAdd    = 0
+	FilterChangeRemove = 1
+	FilterChangeClear  = 2
+)
+
+// appendPatternChanges is the shared helper that both getFilterAdditions and calculateChanges use
+// to turn a patternSet into FilterChange entries.
+// It appends a FilterChange with the given operation to "changes" for every pattern:subscriberID
+// pair in patterns.
+// It skips empty patterns.
+func appendPatternChanges(changes []FilterChange, op int, patterns patternSet) []FilterChange {
+	for p, subscriberIDs := range patterns {
+		if p.isEmpty() {
+			continue
+		}
+		for _, subscriberID := range subscriberIDs {
+			changes = append(changes, FilterChange{
+				Operation:         op,
+				NamespacePatterns: strings.Split(p.namespacePatterns, " "),
+				EventTypePattern:  p.eventTypePattern,
+				SubscriberID:      subscriberID,
+			})
+		}
+	}
+	return changes
+}
+
+// getFilterAdditions returns the current filter for the given cluster node as
+// add-only FilterChange operations.
+// Unlike calculateChanges, it does not first clear the filters, so re-sending getFilterAdditions can
+// only add filters and never remove any. It is primarily used to resync the full filter state after
+// reconnecting to a node which holds filters in-memory.
+func (f *Filters) getFilterAdditions(c clusterNodeID) []FilterChange {
+	f.lock.RLock()
+	defer f.lock.RUnlock()
+	filter := f.filters[c]
+	if filter == nil {
+		return nil
+	}
+	return appendPatternChanges(nil, FilterChangeAdd, filter.patterns)
+}
+
+// calculateChanges returns the FilterChange operations needed to transform the
+// "from" filter into the "to" filter.
+// A nil "to" clears the remote entirely.
+// A nil "from" clears the remote then adds every pattern in "to".
+// Otherwise, it emits adds for patterns only in "to" and removes for patterns only in "from".
+func calculateChanges(from *ClusterNodeFilter, to *ClusterNodeFilter) []FilterChange {
+	var changes []FilterChange
+	if to == nil {
+		changes = append(changes, FilterChange{
+			Operation: FilterChangeClear,
+		})
+	} else if from == nil {
+		changes = append(changes, FilterChange{
+			Operation: FilterChangeClear,
+		})
+		changes = appendPatternChanges(changes, FilterChangeAdd, to.patterns)
+	} else {
+		additions := to.patterns.Difference(from.patterns)
+		subtractions := from.patterns.Difference(to.patterns)
+		changes = appendPatternChanges(changes, FilterChangeAdd, additions)
+		changes = appendPatternChanges(changes, FilterChangeRemove, subtractions)
+	}
+	return changes
+}

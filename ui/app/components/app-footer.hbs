@@ -1,0 +1,20 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Hds::AppFooter class="has-margin-top-auto" data-test-app-footer as |AF|>
+  <AF.Link @href={{changelog-url-for this.version.version}} data-test-footer-version>
+    Vault
+    {{this.version.version}}
+  </AF.Link>
+  {{#if this.version.isCommunity}}
+    <AF.Link @href="https://hashicorp.com/products/vault/trial?source=vaultui" data-test-footer-upgrade-link>
+      Upgrade to Vault Enterprise
+    </AF.Link>
+  {{/if}}
+  <AF.Link @href={{doc-link "/vault"}} data-test-footer-documentation-link>
+    Documentation
+  </AF.Link>
+  <AF.LegalLinks />
+</Hds::AppFooter>

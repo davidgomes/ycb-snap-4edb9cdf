@@ -1,0 +1,36 @@
+@use '../utils/size_variables';
+
+/**
+ * Copyright IBM Corp. 2016, 2025
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+.menu {
+  font-size: var(--token-typography-body-300-font-size);
+}
+
+.menu a {
+  display: block;
+  padding: size_variables.$spacing-8 size_variables.$spacing-10;
+  text-decoration: none;
+}
+
+.menu-label {
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.menu-list {
+  line-height: 1.25;
+}
+
+.column .menu-list a {
+  border-radius: 0;
+  border-right: 0 solid transparent;
+  font-weight: var(--token-typography-font-weight-semibold);
+
+  &:hover,
+  &.is-active {
+    color: var(--token-color-foreground-action);
+  }
+}

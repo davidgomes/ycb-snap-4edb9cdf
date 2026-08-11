@@ -1,0 +1,73 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+<div ...attributes>
+  {{#if @readOnly}}
+    <Hds::CodeBlock @hasCopyButton={{true}} @language={{@mode}} @value={{or @value @example}} as |CB|>
+      {{#if @title}}
+        <CB.Title data-test-component="json-editor-title">
+          {{@title}}
+        </CB.Title>
+      {{/if}}
+
+      {{#if @helpText}}
+        <CB.Description>
+          {{@helpText}}
+        </CB.Description>
+      {{/if}}
+    </Hds::CodeBlock>
+  {{else}}
+    <Hds::CodeEditor
+      @ariaLabel={{this.ariaLabel}}
+      @cspNonce={{this.cspNonce}}
+      @extraKeys={{@extraKeys}}
+      @hasCopyButton={{true}}
+      @hasFullScreenButton={{@hasFullScreenButton}}
+      @isLintingEnabled={{eq this.mode "json"}}
+      @language={{this.mode}}
+      @onBlur={{@onBlur}}
+      @onInput={{@valueUpdated}}
+      @onLint={{@onLint}}
+      @onSetup={{this.onSetup}}
+      @value={{or @value @example}}
+      data-test-component="code-mirror-modifier"
+      as |CE|
+    >
+      {{#if this.getShowToolbar}}
+        {{#if @title}}
+          <CE.Title data-test-component="json-editor-title">
+            {{@title}}
+          </CE.Title>
+        {{/if}}
+
+        {{#if @helpText}}
+          <CE.Description>
+            {{@helpText}}
+          </CE.Description>
+        {{/if}}
+
+        {{#if (has-block "description")}}
+          <CE.Description>
+            {{yield to="description"}}
+          </CE.Description>
+        {{/if}}
+
+        <CE.Generic>
+          {{yield}}
+
+          {{#if @example}}
+            <Hds::Button
+              @color="secondary"
+              @icon="reload"
+              @text="Restore example"
+              disabled={{not @value}}
+              {{on "click" this.restoreExample}}
+              data-test-restore-example
+            />
+          {{/if}}
+        </CE.Generic>
+      {{/if}}
+    </Hds::CodeEditor>
+  {{/if}}
+</div>

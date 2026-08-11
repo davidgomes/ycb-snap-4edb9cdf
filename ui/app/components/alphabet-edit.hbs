@@ -1,0 +1,91 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+<Page::Header @title={{this.title}} @subtitle={{this.subtitle}}>
+  <:breadcrumbs>
+    <Page::Breadcrumbs @breadcrumbs={{this.breadcrumbs}} />
+  </:breadcrumbs>
+</Page::Header>
+
+{{#if (eq @mode "show")}}
+  <Toolbar>
+    <ToolbarActions>
+      {{#if @capabilities.canDelete}}
+        <Hds::Button
+          @text="Delete alphabet"
+          @color="secondary"
+          class="toolbar-button"
+          data-test-delete
+          {{on "click" this.onDelete}}
+        />
+        <div class="toolbar-separator"></div>
+      {{/if}}
+      {{#if @capabilities.canUpdate}}
+        <ToolbarSecretLink
+          @secret={{concat "alphabet/" @form.data.name}}
+          @mode="edit"
+          data-test-edit-link={{true}}
+          @replace={{true}}
+        >
+          Edit alphabet
+        </ToolbarSecretLink>
+      {{/if}}
+    </ToolbarActions>
+  </Toolbar>
+{{/if}}
+
+{{#if (or (eq @mode "edit") (eq @mode "create"))}}
+  <form onsubmit={{this.createOrUpdate}}>
+    <div class="box is-sideless is-fullwidth is-marginless">
+      <MessageError @errorMessage={{this.errorMessage}} />
+      <NamespaceReminder @mode={{@mode}} @noun="transform alphabet" />
+      {{#each @form.formFields as |field|}}
+        <FormField data-test-field @attr={{field}} @model={{@form}} @mode={{@mode}} />
+      {{/each}}
+    </div>
+    <div class="field is-grouped-split box is-fullwidth is-bottomless">
+      <Hds::ButtonSet>
+        <Hds::Button @text={{if (eq @mode "create") "Create alphabet" "Save"}} type="submit" data-test-submit />
+        {{#if (eq @mode "create")}}
+          <Hds::Button
+            @text="Cancel"
+            @color="secondary"
+            @route="vault.cluster.secrets.backend.list-root"
+            @model={{@form.data.backend}}
+            @query={{hash tab="alphabet"}}
+          />
+        {{else}}
+          <Hds::Button
+            @text="Cancel"
+            @color="secondary"
+            @route="vault.cluster.secrets.backend.show"
+            @models={{array @form.data.backend (concat "alphabet/" @form.data.name)}}
+          />
+        {{/if}}
+      </Hds::ButtonSet>
+    </div>
+  </form>
+{{else}}
+  <div class="box is-fullwidth is-sideless is-paddingless is-marginless">
+    {{#each @form.formFields as |field|}}
+      {{#if (eq field.type "object")}}
+        <InfoTableRow
+          @label={{capitalize (or field.options.label (humanize (dasherize field.name)))}}
+          @value={{stringify (get @form.data field.name)}}
+        />
+      {{else if (eq field.type "array")}}
+        <InfoTableRow
+          @label={{capitalize (or field.options.label (humanize (dasherize field.name)))}}
+          @value={{get @form.data field.name}}
+          @type={{field.type}}
+        />
+      {{else}}
+        <InfoTableRow
+          @label={{capitalize (or field.options.label (humanize (dasherize field.name)))}}
+          @value={{get @form.data field.name}}
+        />
+      {{/if}}
+    {{/each}}
+  </div>
+{{/if}}

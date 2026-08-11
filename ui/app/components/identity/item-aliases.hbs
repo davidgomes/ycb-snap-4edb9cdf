@@ -1,0 +1,39 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+{{#each (if @model.alias.id (array @model.alias) @model.aliases) as |item|}}
+  <LinkedBlock @params={{array "vault.cluster.access.identity.aliases.show" item.id "details"}} class="list-item-row">
+    <Hds::Layout::Flex @direction="row" @align="center" @gap="16" as |LF|>
+      <LF.Item @grow={{true}} @shrink={{true}}>
+        <LinkTo
+          @route="vault.cluster.access.identity.aliases.show"
+          @models={{array item.id "details"}}
+          class="has-text-black has-text-weight-semibold"
+        >
+          <Icon @name="user" class="has-text-grey-light" />
+          <span class="has-text-weight-semibold">{{item.name}}</span>
+        </LinkTo>
+        <div class="has-text-grey">
+          {{item.id}}
+        </div>
+        <Hds::Badge @text={{item.mount_type}} />
+        <span class="has-text-grey is-size-8">
+          {{item.mount_accessor}}
+        </span>
+      </LF.Item>
+      <LF.Item>
+        <Identity::PopupAlias @item={{item}} />
+      </LF.Item>
+    </Hds::Layout::Flex>
+  </LinkedBlock>
+{{else}}
+  <Hds::ApplicationState class="top-padding-32 is-marginless" as |A|>
+    <A.Header
+      data-test-empty-state-title
+      @title="No {{@model.identityType}} aliases for {{@model.name}} yet"
+      @titleTag="h2"
+    />
+  </Hds::ApplicationState>
+{{/each}}
