@@ -1,0 +1,15 @@
+services:
+  whoami1:
+    image: traefik/whoami
+
+  whoami2:
+    image: traefik/whoami
+
+  whoami3:
+    image: traefik/whoami
+
+  whoami4:
+    image: traefik/whoami
+
+  whoami5:
+    image: traefik/whoami
