@@ -426,6 +426,11 @@ func (z *erasureServerPools) listAndSave(ctx context.Context, o *listPathOptions
 	go func() {
 		var returned bool
 		for entry := range inCh {
+			if o.Lifecycle != nil || o.Replication.Config != nil {
+				if triggerExpiryAndRepl(ctx, *o, entry) {
+					continue
+				}
+			}
 			if !returned {
 				funcReturnedMu.Lock()
 				returned = funcReturned

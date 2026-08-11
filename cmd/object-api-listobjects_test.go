@@ -1938,8 +1938,11 @@ func TestListObjectsWithILM(t *testing.T) {
 }
 
 func testListObjectsWithILM(obj ObjectLayer, instanceType string, t1 TestErrHandler) {
-	// Prepare lifecycle expiration workers
-	es := newExpiryState(t1.Context(), obj, 0)
+	// Prepare lifecycle expiry state without workers so listing does not
+	// delete objects mid-test.
+	es := &expiryState{ctx: t1.Context(), objAPI: obj}
+	workers := make([]chan expiryOp, 0)
+	es.workers.Store(&workers)
 	globalExpiryState = es
 
 	t, _ := t1.(*testing.T)
