@@ -1,0 +1,291 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+load("//bazel/tools:brpc_proto_library.bzl", "brpc_proto_library")
+load("@hedron_compile_commands//:refresh_compile_commands.bzl", "refresh_compile_commands")
+load("//test:generate_unittests.bzl", "generate_unittests")
+load("//test:root_runfiles.bzl", "root_runfiles")
+
+COPTS = [
+    "-fPIC",
+    "-Wno-unused-parameter",
+    "-fno-omit-frame-pointer",
+    "-fno-access-control",
+]
+
+TEST_BUTIL_SOURCES = [
+    "at_exit_unittest.cc",
+    "atomicops_unittest.cc",
+    "base64_unittest.cc",
+    "base64url_unittest.cc",
+    "big_endian_unittest.cc",
+    "bits_unittest.cc",
+    "hash_tables_unittest.cc",
+    "linked_list_unittest.cc",
+    "mru_cache_unittest.cc",
+    "small_map_unittest.cc",
+    "stack_container_unittest.cc",
+    "mpsc_queue_unittest.cc",
+    "cpu_unittest.cc",
+    "crash_logging_unittest.cc",
+    "leak_tracker_unittest.cc",
+    "stack_trace_unittest.cc",
+    "environment_unittest.cc",
+    "file_util_unittest.cc",
+    "dir_reader_posix_unittest.cc",
+    "file_path_unittest.cc",
+    "file_unittest.cc",
+    "scoped_temp_dir_unittest.cc",
+    "guid_unittest.cc",
+    "hash_unittest.cc",
+    "lazy_instance_unittest.cc",
+    "aligned_memory_unittest.cc",
+    "linked_ptr_unittest.cc",
+    "ref_counted_memory_unittest.cc",
+    "ref_counted_unittest.cc",
+    "scoped_ptr_unittest.cc",
+    "scoped_vector_unittest.cc",
+    "singleton_unittest.cc",
+    "weak_ptr_unittest.cc",
+    "observer_list_unittest.cc",
+    "file_descriptor_shuffle_unittest.cc",
+    "rand_util_unittest.cc",
+    "safe_numerics_unittest.cc",
+    "scoped_clear_errno_unittest.cc",
+    "scoped_generic_unittest.cc",
+    "security_unittest.cc",
+    "sha1_unittest.cc",
+    "stl_util_unittest.cc",
+    "nullable_string16_unittest.cc",
+    "safe_sprintf_unittest.cc",
+    "string16_unittest.cc",
+    "stringprintf_unittest.cc",
+    "string_number_conversions_unittest.cc",
+    "string_piece_unittest.cc",
+    "string_split_unittest.cc",
+    "string_tokenizer_unittest.cc",
+    "string_util_unittest.cc",
+    "stringize_macros_unittest.cc",
+    "sys_string_conversions_unittest.cc",
+    "utf_offset_string_conversions_unittest.cc",
+    "utf_string_conversions_unittest.cc",
+    "cancellation_flag_unittest.cc",
+    "condition_variable_unittest.cc",
+    "lock_unittest.cc",
+    "waitable_event_unittest.cc",
+    "type_traits_unittest.cc",
+    "non_thread_safe_unittest.cc",
+    "platform_thread_unittest.cc",
+    "simple_thread_unittest.cc",
+    "thread_checker_unittest.cc",
+    "thread_collision_warner_unittest.cc",
+    "thread_id_name_manager_unittest.cc",
+    "thread_local_storage_unittest.cc",
+    "thread_local_unittest.cc",
+    "watchdog_unittest.cc",
+    "time_unittest.cc",
+    "version_unittest.cc",
+    "logging_unittest.cc",
+    "cacheline_unittest.cpp",
+    "class_name_unittest.cpp",
+    "endpoint_unittest.cpp",
+    "unique_ptr_unittest.cpp",
+    "errno_unittest.cpp",
+    "fd_guard_unittest.cpp",
+    "file_watcher_unittest.cpp",
+    "find_cstr_unittest.cpp",
+    "scoped_lock_unittest.cpp",
+    "status_unittest.cpp",
+    "string_printf_unittest.cpp",
+    "string_splitter_unittest.cpp",
+    "synchronous_event_unittest.cpp",
+    "temp_file_unittest.cpp",
+    "baidu_thread_local_unittest.cpp",
+    "thread_key_unittest.cpp",
+    "baidu_time_unittest.cpp",
+    "flat_map_unittest.cpp",
+    "crc32c_unittest.cc",
+    "iobuf_unittest.cpp",
+    "object_pool_unittest.cpp",
+    "test_switches.cc",
+    "scoped_locale.cc",
+    "recordio_unittest.cpp",
+    #"popen_unittest.cpp",
+    "bounded_queue_unittest.cc",
+    "butil_unittest_main.cpp",
+    "scope_guard_unittest.cpp",
+    "optional_unittest.cpp",
+] + select({
+    "@bazel_tools//tools/osx:darwin_x86_64": [],
+    "//conditions:default": [
+        "test_file_util_linux.cc",
+        "proc_maps_linux_unittest.cc",
+    ],
+})
+
+brpc_proto_library(
+    name = "cc_test_proto",
+    srcs = glob(["*.proto"]),
+    deps = ["//:brpc_idl_options_cc_proto"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "sstream_workaround",
+    hdrs = [
+        "sstream_workaround.h",
+    ],
+)
+
+cc_library(
+    name = "gperftools_helper",
+    hdrs = [
+        "gperftools_helper.h",
+    ],
+)
+
+# tcmalloc and AddressSanitizer both intercept malloc/free, so linking
+# both produces undefined behaviour at runtime (typically a hard hang
+# at process start, or random allocator errors). When `brpc_with_asan`
+# is active we drop the @gperftools//:tcmalloc dep entirely; the
+# gperftools_helper header above already no-ops gracefully when
+# BRPC_ENABLE_CPU_PROFILER is not defined.
+#
+# Activation: `--config=asan` in .bazelrc also sets
+# `--define=with_asan=true`, which flips this config_setting.
+TCMALLOC_DEP_UNLESS_ASAN = select({
+    "//bazel/config:brpc_with_asan": [],
+    "//conditions:default": ["@gperftools//:tcmalloc"],
+})
+
+cc_test(
+    name = "butil_unittests",
+    srcs = TEST_BUTIL_SOURCES + [
+        "scoped_locale.h",
+        "multiprocess_func_list.h",
+        "test_switches.h",
+    ],
+    copts = COPTS,
+    defines = ["HAS_NLOHMANN_JSON=1"],
+    deps = [
+        ":cc_test_proto",
+        ":sstream_workaround",
+        ":gperftools_helper",
+        "//:butil",
+        "//:bthread",
+        "@nlohmann_json//:json",
+        "@com_google_googletest//:gtest",
+    ],
+)
+
+cc_test(
+    name = "bvar_unittests",
+    srcs = glob(["bvar_*_unittest.cpp"]),
+    deps = [
+        ":sstream_workaround",
+        ":gperftools_helper",
+        "//:bvar",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ] + TCMALLOC_DEP_UNLESS_ASAN,
+    copts = COPTS,
+)
+
+generate_unittests(
+    name = "bthread_unittests",
+    srcs = glob([
+        "bthread*_unittest.cpp",
+    ]),
+    deps = [
+        ":sstream_workaround",
+        ":gperftools_helper",
+        "//:bthread",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ] + TCMALLOC_DEP_UNLESS_ASAN,
+    copts = COPTS,
+)
+
+# Expose unit-test data files (cert*, jsonout) at the runfiles workspace root
+# so that tests can open them via plain relative paths like "cert1.crt".
+# See test/root_runfiles.bzl for why a genrule does NOT work here.
+root_runfiles(
+    name = "test_runfiles_root_data",
+    srcs = [
+        "cert1.crt",
+        "cert1.key",
+        "cert2.crt",
+        "cert2.key",
+        "jsonout",
+    ],
+)
+
+generate_unittests(
+    name = "brpc_unittests",
+    srcs = glob([
+        "brpc_*_unittest.cpp",
+    ]),
+    deps = [
+        ":sstream_workaround",
+        ":gperftools_helper",
+        "//:brpc",
+        ":cc_test_proto",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ] + TCMALLOC_DEP_UNLESS_ASAN,
+    copts = COPTS,
+    # Place cert*/jsonout at <runfiles>/_main/<file> (the cwd of `bazel test`)
+    # via :test_runfiles_root_data so test code can open them with plain
+    # relative paths like "cert1.crt".
+    data = [
+        ":test_runfiles_root_data",
+    ],
+    # brpc_redis_unittest forks a real redis-server located via PATH. Tag it
+    # "external" so bazel always re-runs it (never serves a cached pass that
+    # actually skipped) and "local" so it runs outside the sandbox, where the
+    # apt-installed redis-server is visible and loopback works. The CI bazel
+    # jobs install redis-server via the install-essential-dependencies action.
+    per_test_tags = {
+        "brpc_redis_unittest.cpp": ["external", "local"],
+    },
+    # brpc_channel_unittest packs dozens of timing-sensitive TEST_F (backup
+    # request, retry/backoff, timeouts) into one binary whose cumulative
+    # real-time waits exceed Bazel's default per-test 300s (size=medium) limit
+    # on contended CI runners, causing TIMEOUT failures. Raise its limit to
+    # size=large (900s).
+    #
+    # NB: do NOT shard this binary. Its TEST_F share fixed loopback endpoints
+    # and global state; running shards as parallel processes makes a
+    # "connection should be refused" test observe another shard's live server
+    # on the same port and fail. size=large is the only safe lever here.
+    per_test_size = {
+        "brpc_channel_unittest.cpp": "large",
+    },
+)
+
+refresh_compile_commands(
+    name = "brpc_test_compdb",
+    # Specify the targets of interest.
+    # For example, specify a dict of targets and their arguments:
+    targets = {
+        "//:brpc": "",
+        ":butil_unittests": "",
+        ":bvar_unittests": "",
+        ":bthread_unittests": "",
+        ":brpc_unittests": "",
+    },
+    # For more details, feel free to look into refresh_compile_commands.bzl if you want.
+)
