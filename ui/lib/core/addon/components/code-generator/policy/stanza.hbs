@@ -1,0 +1,78 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Hds::Card::Container
+  class="has-top-padding-m has-bottom-padding-m side-padding-24"
+  @hasBorder={{true}}
+  @level="mid"
+  ...attributes
+  data-test-card-container={{@index}}
+>
+  <Hds::Layout::Flex @justify="space-between" class="has-bottom-margin-xs">
+    <Hds::Text::Body @tag="p" @weight="semibold" @color="strong">
+      Path
+    </Hds::Text::Body>
+    <Hds::Form::Toggle::Field {{on "input" this.togglePreview}} data-test-toggle-input="preview" as |F|>
+      <F.Label data-test-form-field-label="preview">{{if this.showPreview "Hide" "Show"}} preview</F.Label>
+    </Hds::Form::Toggle::Field>
+  </Hds::Layout::Flex>
+
+  {{#if this.showPreview}}
+    <Hds::CodeBlock
+      @language="hcl"
+      @value={{@stanza.preview}}
+      @hasLineNumbers={{false}}
+      @hasCopyButton={{true}}
+      data-test-field="preview"
+    />
+  {{else}}
+    <Hds::Layout::Flex @align="start" @gap="8">
+      <Hds::Form::TextInput::Field
+        @type="text"
+        @value={{@stanza.path}}
+        @isInvalid={{and @renderValidations @stanza.invalidPath}}
+        aria-label="Resource path"
+        name="path-{{@index}}"
+        {{on "input" this.setPath}}
+        autocomplete="off"
+        placeholder="Enter a resource path"
+        data-test-input="path"
+        as |F|
+      >
+        {{#if (and @renderValidations @stanza.invalidPath)}}
+          <F.Error data-test-validation-error="path-{{@index}}">{{@stanza.invalidPath}}</F.Error>
+        {{/if}}
+      </Hds::Form::TextInput::Field>
+      <Hds::Button
+        @icon="trash"
+        @isIconOnly={{true}}
+        @text="Delete"
+        @color="critical"
+        {{on "click" @onDelete}}
+        data-test-button="Delete"
+      />
+    </Hds::Layout::Flex>
+
+    <Hds::Form::Checkbox::Group @layout="horizontal" @name="capabilities-{{@index}}" as |G|>
+      <G.Legend class="has-top-padding-m">Capabilities</G.Legend>
+      {{#each this.permissions as |capability|}}
+        <G.CheckboxField
+          checked={{this.hasCapability capability}}
+          @value={{capability}}
+          @isInvalid={{and @renderValidations @stanza.invalidCapabilities}}
+          {{on "input" this.setPermissions}}
+          data-test-checkbox={{capability}}
+          as |F|
+        >
+          <F.Label data-test-form-field-label={{capability}}>{{capability}}</F.Label>
+        </G.CheckboxField>
+      {{/each}}
+      {{#if (and @renderValidations @stanza.invalidCapabilities)}}
+        <G.Error data-test-validation-error="capabilities-{{@index}}">{{@stanza.invalidCapabilities}}</G.Error>
+      {{/if}}
+    </Hds::Form::Checkbox::Group>
+  {{/if}}
+
+</Hds::Card::Container>

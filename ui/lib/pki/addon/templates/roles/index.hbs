@@ -1,0 +1,83 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<PkiPageHeader @backend={{this.model.parentModel}} />
+
+<PkiPaginatedList
+  @backend={{this.model.parentModel.id}}
+  @listRoute="roles.index"
+  @list={{this.model.roles}}
+  @hasConfig={{this.model.hasConfig}}
+>
+  <:actions>
+    {{#if this.model.hasConfig}}
+      <ToolbarLink @type="add" @route="roles.create" @model={{this.model.parentModel.id}} data-test-pki-role-create-link>
+        Create role
+      </ToolbarLink>
+    {{/if}}
+  </:actions>
+  <:list as |roles|>
+    {{#each roles as |role|}}
+      <LinkedBlock
+        class="list-item-row"
+        @params={{array "roles.role.details" this.model.parentModel.id role}}
+        @linkPrefix={{this.mountPoint}}
+      >
+        <div class="level is-mobile">
+          <div class="level-left">
+            <div>
+              <Icon @name="user" class="has-text-grey-light" />
+              <span class="has-text-weight-semibold is-underline">
+                {{role}}
+              </span>
+            </div>
+          </div>
+          <div class="level-right is-flex is-paddingless is-marginless">
+            <div class="level-item">
+              <Hds::Dropdown @isInline={{true}} @listPosition="bottom-right" as |dd|>
+                <dd.ToggleIcon
+                  @icon="more-horizontal"
+                  @text="Manage role"
+                  @hasChevron={{false}}
+                  data-test-popup-menu-trigger
+                />
+                <dd.Interactive @route="roles.role.details" @models={{array this.model.parentModel.id role}}>
+                  Details
+                </dd.Interactive>
+                <dd.Interactive @route="roles.role.edit" @models={{array this.model.parentModel.id role}}>
+                  Edit
+                </dd.Interactive>
+              </Hds::Dropdown>
+            </div>
+          </div>
+        </div>
+      </LinkedBlock>
+    {{/each}}
+  </:list>
+  <:empty>
+    <Hds::ApplicationState class="top-padding-32 is-marginless" as |A|>
+      <A.Header @title="No roles yet" @titleTag="h2" data-test-empty-state-title />
+      <A.Body
+        @text="When created, roles will be listed here. Create a role to start generating certificates."
+        data-test-empty-state-message
+      />
+    </Hds::ApplicationState>
+  </:empty>
+  <:configure>
+    <Hds::ApplicationState class="top-padding-32 is-marginless" as |A|>
+      <A.Header @title="PKI not configured" @titleTag="h2" data-test-empty-state-title />
+      <A.Body @text={{this.notConfiguredMessage}} data-test-empty-state-message />
+      <A.Footer data-test-empty-state-actions as |F|>
+        <F.LinkStandalone
+          @icon="chevron-right"
+          @iconPosition="trailing"
+          @text="Configure PKI"
+          @route="configuration.create"
+          @model={{this.model.parentModel.id}}
+        />
+      </A.Footer>
+    </Hds::ApplicationState>
+  </:configure>
+</PkiPaginatedList>

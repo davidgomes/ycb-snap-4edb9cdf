@@ -1,0 +1,46 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+<Page::Header @title={{if @form.isNew "Create Library" "Edit Library"}}>
+  <:breadcrumbs>
+    <Page::Breadcrumbs @breadcrumbs={{@breadcrumbs}} />
+  </:breadcrumbs>
+</Page::Header>
+
+<hr class="is-marginless has-background-gray-200" />
+
+<form {{on "submit" (perform this.save)}} class="has-top-margin-m">
+  <MessageError @errorMessage={{this.error}} />
+
+  {{#each @form.formFields as |field|}}
+    <FormField @attr={{field}} @model={{@form}} @modelValidations={{this.modelValidations}} />
+  {{/each}}
+
+  <hr class="has-background-gray-200 has-top-margin-l" />
+
+  <div class="has-top-margin-l has-bottom-margin-l is-flex">
+    <Hds::Button
+      @text={{if @form.isNew "Create library" "Save"}}
+      data-test-submit
+      type="submit"
+      disabled={{this.save.isRunning}}
+    />
+    <Hds::Button
+      @text="Cancel"
+      @color="secondary"
+      class="has-left-margin-xs"
+      data-test-cancel
+      disabled={{this.save.isRunning}}
+      {{on "click" this.cancel}}
+    />
+    {{#if this.invalidFormMessage}}
+      <AlertInline
+        @type="danger"
+        class="has-top-padding-s"
+        @message={{this.invalidFormMessage}}
+        data-test-invalid-form-message
+      />
+    {{/if}}
+  </div>
+</form>

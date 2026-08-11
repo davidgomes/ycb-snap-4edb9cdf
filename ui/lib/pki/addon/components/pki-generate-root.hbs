@@ -1,0 +1,131 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+{{! Show results if config is provided, else show form to generate root CA }}
+{{#if this.config}}
+  {{#if (and (not @rotateCertData) this.config.private_key)}}
+    <div class="has-top-margin-m">
+      <Hds::Alert data-test-config-next-steps @type="inline" @color="highlight" class="has-bottom-margin-s" as |A|>
+        <A.Title>Next steps</A.Title>
+        <A.Description>
+          The
+          <code>private_key</code>
+          is only available once. Make sure you copy and save it now.
+        </A.Description>
+      </Hds::Alert>
+    </div>
+  {{/if}}
+
+  <main class="box is-fullwidth is-sideless is-paddingless is-marginless">
+    {{#each this.returnedFields as |fieldName|}}
+      {{#let (this.valueForField fieldName) as |value|}}
+        {{#if (this.linkForField fieldName)}}
+          <InfoTableRow @label={{this.detailLabel fieldName}} @addCopyButton={{true}}>
+            <LinkTo
+              @route={{this.linkForField fieldName}}
+              @models={{array this.secretMountPath.currentPath (get this.config fieldName)}}
+            >
+              {{value}}
+            </LinkTo>
+          </InfoTableRow>
+        {{else if (this.isCertificateField fieldName)}}
+          <InfoTableRow @label={{this.detailLabel fieldName}}>
+            <EncodedDataCard @data={{value}} />
+          </InfoTableRow>
+        {{else}}
+          <InfoTableRow @label={{this.detailLabel fieldName}} @value={{value}} />
+        {{/if}}
+      {{/let}}
+    {{/each}}
+
+    <InfoTableRow @label="Private key">
+      {{#if this.config.private_key}}
+        <EncodedDataCard @data={{this.config.private_key}} />
+      {{else}}
+        <Hds::Badge @text="internal" />
+      {{/if}}
+    </InfoTableRow>
+
+    <InfoTableRow @label="Private key type">
+      {{#if this.config.private_key_type}}
+        {{this.config.private_key_type}}
+      {{else}}
+        <Hds::Badge @text="internal" />
+      {{/if}}
+    </InfoTableRow>
+
+    <ParsedCertificateInfoRows @model={{this.parsedCertificate}} />
+  </main>
+  <footer>
+    <div class="field is-grouped is-fullwidth has-top-margin-l">
+      <Hds::Button @text="Done" {{on "click" @onComplete}} data-test-done />
+    </div>
+  </footer>
+{{else}}
+  <form {{on "submit" (perform this.save)}} data-test-pki-config-generate-root-form>
+    <MessageError @errorMessage={{this.errorBanner}} class="has-top-margin-s" />
+    <h2 class="title is-size-5 has-border-bottom-light page-header" data-test-generate-root-title="Root parameters">
+      Root parameters
+    </h2>
+    {{#each this.defaultFields as |fieldName|}}
+      {{#let (find-by "name" fieldName this.form.formFields) as |field|}}
+        <FormField @attr={{field}} @model={{this.form}} @modelValidations={{this.modelValidations}} data-test-field>
+          {{#if (eq fieldName "customTtl")}}
+            {{! custom_ttl field has editType yield, which will render this }}
+            <PkiNotValidAfterForm @form={{this.form}} />
+          {{/if}}
+        </FormField>
+      {{/let}}
+    {{/each}}
+
+    <PkiGenerateToggleGroups @form={{this.form}} @actionType="generate-root" @modelValidations={{this.modelValidations}} />
+
+    {{#if @withUrls}}
+      <fieldset class="box is-shadowless is-marginless is-borderless is-fullwidth" data-test-urls-section>
+        <h2
+          class="title is-size-5 page-header {{if @canSetUrls 'has-border-bottom-light' 'is-borderless'}}"
+          data-test-generate-root-title="Issuer URLs"
+        >
+          Issuer URLs
+        </h2>
+        {{#if @canSetUrls}}
+          {{#each this.urlsForm.formFields as |field|}}
+            <FormField
+              @attr={{field}}
+              @mode="create"
+              @model={{this.urlsForm}}
+              @showHelpText={{field.options.showHelpText}}
+              data-test-urls-field
+            />
+          {{/each}}
+        {{else}}
+          <Hds::ApplicationState class="top-padding-32 is-marginless" as |A|>
+            <A.Header @title="You do not have permissions to set URLs." @titleTag="h2" data-test-empty-state-title />
+            <A.Body
+              @text="These are not required but will need to be configured later. You can do this via the CLI or by changing your permissions and returning to this form."
+              data-test-empty-state-message
+            />
+          </Hds::ApplicationState>
+        {{/if}}
+      </fieldset>
+    {{/if}}
+
+    <hr class="has-background-gray-100" />
+    <Hds::ButtonSet>
+      <Hds::Button @text="Done" type="submit" data-test-submit />
+      <Hds::Button @text="Cancel" @color="secondary" {{on "click" @onCancel}} data-test-cancel />
+    </Hds::ButtonSet>
+    {{#if this.invalidFormAlert}}
+      <div class="control">
+        <AlertInline
+          @type="danger"
+          class="has-top-padding-s"
+          @message={{this.invalidFormAlert}}
+          data-test-pki-generate-root-validation-error
+        />
+      </div>
+    {{/if}}
+  </form>
+{{/if}}

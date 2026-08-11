@@ -1,0 +1,27 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+{{#if (or (and @items.meta @items.meta.filteredTotal) @items.length)}}
+  <div class="box is-fullwidth is-bottomless is-sideless is-paddingless" data-test-list-view-list>
+    {{#each @items as |item|}}
+      {{yield (hash item=item)}}
+    {{else}}
+      {{yield}}
+    {{/each}}
+    {{#if @paginationRouteName}}
+      <Hds::Pagination::Numbered
+        @currentPage={{@items.meta.currentPage}}
+        @currentPageSize={{@items.meta.pageSize}}
+        @route={{@paginationRouteName}}
+        @models={{@paginationRouteParams}}
+        @showSizeSelector={{false}}
+        @totalItems={{@items.meta.total}}
+        @queryFunction={{this.paginationQueryParams}}
+        @onPageChange={{@onPageChange}}
+      />
+    {{/if}}
+  </div>
+{{else}}
+  {{yield (hash empty=(component "hds/application-state") emptyTitle=this.emptyTitle emptyMessage=this.emptyMessage)}}
+{{/if}}

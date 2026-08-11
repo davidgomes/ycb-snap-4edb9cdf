@@ -1,0 +1,22 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+{{#if this.showMessage}}
+  {{#if (has-block)}}
+    <p class="has-top-bottom-margin-xxs" id="namespace-reminder">
+      {{yield (hash namespace=this.namespace)}}
+    </p>
+  {{else}}
+    <p class="has-top-bottom-margin-xxs" id="namespace-reminder">
+      This
+      {{@noun}}
+      will be
+      {{this.modeVerb}}
+      in the
+      <Hds::Badge @text="{{this.namespace.path}}/" />
+      namespace.
+    </p>
+  {{/if}}
+{{/if}}

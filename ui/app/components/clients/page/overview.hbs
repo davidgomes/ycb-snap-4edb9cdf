@@ -1,0 +1,46 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Clients::RunningTotal @byMonthClients={{this.byMonthClients}} @runningTotals={{@activity.total}} />
+
+{{! by_namespace is an empty array when there is no client count activity data }}
+{{#if @activity.by_namespace}}
+  <Clients::CountsCard @title="Client attribution">
+    <:subheader>
+      <Clients::FilterToolbar
+        @dataset={{this.activityData}}
+        @onFilter={{this.handleFilter}}
+        @filterQueryParams={{@filterQueryParams}}
+        @dropdownMonths={{this.months}}
+      />
+    </:subheader>
+
+    <:table>
+      <Clients::Table
+        data-test-table="attribution"
+        @data={{this.tableData}}
+        @columns={{this.tableColumns}}
+        @initiallySortBy={{hash column="clients" direction="desc"}}
+        @setPageSize={{10}}
+        @showPaginationSizeSelector={{true}}
+      >
+        <:emptyState>
+          <Hds::ApplicationState class="is-marginless" as |A|>
+            <A.Header @title="No data found" @titleTag="h2" data-test-empty-state-title />
+            <A.Body @text="Clear or change filters to view client count data." data-test-empty-state-message />
+            <A.Footer data-test-empty-state-actions as |F|>
+              <F.LinkStandalone
+                @icon="file-text"
+                @text="Client count documentation"
+                @href="https://developer.hashicorp.com/vault/docs/concepts/client-count"
+                @iconPosition="trailing"
+              />
+            </A.Footer>
+          </Hds::ApplicationState>
+        </:emptyState>
+      </Clients::Table>
+    </:table>
+  </Clients::CountsCard>
+{{/if}}

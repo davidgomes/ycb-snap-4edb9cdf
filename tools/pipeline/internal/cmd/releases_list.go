@@ -1,0 +1,21 @@
+// Copyright IBM Corp. 2016, 2025
+// SPDX-License-Identifier: BUSL-1.1
+
+package cmd
+
+import "github.com/spf13/cobra"
+
+func newReleasesListCmd() *cobra.Command {
+	listCmd := &cobra.Command{
+		Use:   "list",
+		Short: "Releases list commands",
+		Long:  "Releases list commands",
+	}
+
+	listCmd.AddCommand(newReleasesVersionsBetweenCmd())
+	listCmd.AddCommand(newReleasesListBinaryVersionsCmd())
+	listCmd.AddCommand(newReleasesListActiveVersionsCmd())
+	listCmd.AddCommand(newReleasesListUpdatedVersionsCmd())
+
+	return listCmd
+}

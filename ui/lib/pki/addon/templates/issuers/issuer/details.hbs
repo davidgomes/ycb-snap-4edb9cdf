@@ -1,0 +1,22 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Page::Header @icon="file-text" @title="View Issuer Certificate">
+  <:breadcrumbs>
+    <Page::Breadcrumbs @breadcrumbs={{this.breadcrumbs}} />
+  </:breadcrumbs>
+</Page::Header>
+
+<Page::PkiIssuerDetails
+  @issuer={{this.model.issuer}}
+  @pem={{this.model.pem}}
+  @der={{this.model.der}}
+  @isRotatable={{this.model.isRotatable}}
+  @canRotate={{this.model.canRotate}}
+  @canCrossSign={{this.model.canCrossSign}}
+  @canSignIntermediate={{this.model.canSignIntermediate}}
+  @canConfigure={{this.model.canConfigure}}
+  @backend={{this.model.backend}}
+/>

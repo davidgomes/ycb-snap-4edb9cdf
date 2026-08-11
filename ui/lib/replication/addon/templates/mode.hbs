@@ -1,0 +1,51 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<section class="section">
+  <div class="is-widescreen">
+    {{#if (and (eq this.model.drMode "secondary") (eq this.model.drModeInit "primary"))}}
+      <LayoutLoading />
+    {{else}}
+      {{#if this.model.replicationAttrs.replicationEnabled}}
+        <Page::Header @title={{this.model.replicationModeForDisplay}}>
+          <:breadcrumbs>
+            <Page::Breadcrumbs
+              @breadcrumbs={{array
+                (hash label="Vault" route="vault" icon="vault" linkExternal=true)
+                (hash label="Replication" route="index")
+                (hash label=this.model.replicationModeForDisplay)
+              }}
+            />
+          </:breadcrumbs>
+          <:badges>
+            <Hds::Badge
+              @text={{this.model.replicationAttrs.modeForHeader}}
+              data-test-badge={{this.model.replicationAttrs.modeForHeader}}
+            />
+          </:badges>
+        </Page::Header>
+
+        <div class="tabs-container box is-bottomless is-fullwidth is-paddingless is-marginless">
+          <nav class="tabs sub-nav" aria-label="tab navigation">
+            <ul>
+              <LinkTo @route="mode.index" @model={{this.replicationMode}} data-test-replication-link="details">
+                Details
+              </LinkTo>
+              <LinkTo @route="mode.manage" @model={{this.replicationMode}} data-test-replication-link="manage">
+                Manage
+              </LinkTo>
+              {{#if this.model.replicationAttrs.isPrimary}}
+                <LinkTo @route="mode.secondaries" @model={{this.replicationMode}} data-test-replication-link="secondaries">
+                  Secondaries
+                </LinkTo>
+              {{/if}}
+            </ul>
+          </nav>
+        </div>
+      {{/if}}
+      {{outlet}}
+    {{/if}}
+  </div>
+</section>

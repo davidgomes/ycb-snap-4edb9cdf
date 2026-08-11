@@ -1,0 +1,52 @@
+@use '../utils/size_variables';
+
+/**
+ * Copyright IBM Corp. 2016, 2025
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+// This file defines the styles for the larger container elements like page-container, section and container.
+
+.ember-application > .ember-view {
+  display: flex;
+  flex-direction: column;
+}
+
+.page-container {
+  min-height: calc(100vh - 60px);
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  padding: 0 size_variables.$spacing-64;
+}
+
+.section {
+  display: flex;
+  flex-grow: 1;
+  flex-direction: column;
+
+  > .container {
+    display: flex;
+    flex-grow: 1;
+    flex-direction: column;
+    width: 100%;
+
+    > .columns {
+      flex-grow: 1;
+    }
+  }
+}
+
+.container {
+  flex-grow: 1;
+  margin: size_variables.$spacing-24 0;
+  max-width: 1032px;
+  position: relative;
+  width: auto;
+}
+
+.centered-container {
+  margin: 0 auto;
+  max-width: 1032px;
+  padding: size_variables.$spacing-24;
+}

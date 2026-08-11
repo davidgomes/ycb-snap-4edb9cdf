@@ -1,0 +1,16 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<PkiPageHeader @backend={{this.model.parentModel}} />
+
+<Page::PkiKeyList
+  @keys={{this.model.keys}}
+  @mountPoint={{this.mountPoint}}
+  @backend={{this.model.parentModel.id}}
+  @canImportKeys={{this.model.canImportKeys}}
+  @canGenerateKeys={{this.model.canGenerateKeys}}
+  @keyPermsById={{this.model.keyPermsById}}
+  @hasConfig={{this.model.hasConfig}}
+/>

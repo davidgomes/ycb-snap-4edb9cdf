@@ -1,0 +1,50 @@
+/**
+ * Copyright IBM Corp. 2016, 2025
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+import Component from '@glimmer/component';
+import { service } from '@ember/service';
+
+import NamespaceService from 'vault/services/namespace';
+
+export type Args = {
+  isRootNamespace: boolean;
+  replication: unknown;
+  secretsEngines: unknown;
+  vaultConfiguration: unknown;
+  version: { isEnterprise: boolean; hasPKIOnly: boolean; hasConsumptionBilling: boolean };
+};
+
+export default class OverviewComponent extends Component<Args> {
+  @service declare readonly namespace: NamespaceService;
+
+  /**
+   * the client count card should show in the following conditions
+   * Self Managed clusters that are running enterprise and showing the `root` namespace
+   * Managed clusters that are running enterprise and show the `admin` namespace
+   */
+  // for self managed clusters, this is the `root` namespace
+  // for HVD clusters, this is the `admin` namespace
+  get shouldShowClientCount() {
+    const { version, isRootNamespace } = this.args;
+    const { namespace } = this;
+
+    // don't show client count if this isn't an enterprise cluster
+    if (!version.isEnterprise) return false;
+
+    // don't show client count if this is a PKI-only Secrets cluster
+    if (version.hasPKIOnly) return false;
+
+    // don't show client count if this is a Consumption Billing cluster
+    if (version.hasConsumptionBilling) return false;
+
+    // HVD clusters
+    if (namespace.inHvdAdminNamespace) return true;
+
+    // SM clusters
+    if (isRootNamespace) return true;
+
+    return false;
+  }
+}

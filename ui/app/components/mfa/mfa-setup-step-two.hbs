@@ -1,0 +1,29 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Mfa::SplashCard @header={{@header}} @description={{@description}} data-test-step-two>
+
+  <:alerts>
+    <MessageError @errorMessage={{this.error}} />
+    {{#if @warning}}
+      <Hds::Alert @type="inline" @color="highlight" class="has-bottom-margin-s" data-test-mfa-enabled-warning as |A|>
+        <A.Title>MFA enabled</A.Title>
+        <A.Description>{{@warning}}</A.Description>
+      </Hds::Alert>
+    {{/if}}
+  </:alerts>
+
+  <:qrCode>
+    {{#if @qrCode}}
+      <Mfa::QrCodeCard @qrCode={{@qrCode}} />
+    {{/if}}
+  </:qrCode>
+
+  <:actions>
+    <Hds::Button @text="Restart setup" @color="critical" id="restart" {{on "click" this.restartSetup}} data-test-restart />
+    <Hds::Button @text="Done" id="cancel" {{on "click" this.redirectPreviousPage}} data-test-done />
+  </:actions>
+
+</Mfa::SplashCard>

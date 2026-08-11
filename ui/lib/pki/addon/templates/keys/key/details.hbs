@@ -1,0 +1,12 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Page::Header @icon="certificate" @title="View Key">
+  <:breadcrumbs>
+    <Page::Breadcrumbs @breadcrumbs={{this.breadcrumbs}} />
+  </:breadcrumbs>
+</Page::Header>
+
+<Page::PkiKeyDetails @key={{this.model.key}} @canDelete={{this.model.canDelete}} @canEdit={{this.model.canUpdate}} />

@@ -1,0 +1,173 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<div class="box is-sideless is-fullwidth is-marginless">
+  {{#if this.errors}}
+    <Hds::Alert data-test-config-edit-error @type="inline" @color="critical" as |A|>
+      <A.Title>Error</A.Title>
+      <A.Description>
+        <ul class={{if (gt this.errors.length 1) "bullet"}}>
+          {{#each this.errors as |error|}}
+            <li>
+              <code>POST config/{{error.type}}</code>:
+              {{error.message}}
+            </li>
+          {{/each}}
+        </ul>
+      </A.Description>
+    </Hds::Alert>
+  {{/if}}
+  <form {{on "submit" (perform this.save)}}>
+    <fieldset class="is-shadowless is-marginless is-borderless is-fullwidth" data-test-cluster-config-edit-section>
+      <h2 class="title is-size-5 has-border-bottom-light page-header">
+        Cluster Config
+      </h2>
+      {{#if @capabilities.canSetCluster}}
+        {{#each @clusterForm.formFields as |field|}}
+          <FormField @attr={{field}} @model={{@clusterForm}} @showHelpText={{false}} />
+        {{/each}}
+      {{else}}
+        <Hds::ApplicationState class="top-padding-32 bottom-padding-32 is-marginless" as |A|>
+          <A.Header
+            @title="You do not have permission to set this mount's the cluster config"
+            @titleTag="h2"
+            data-test-empty-state-title
+          />
+          <A.Body @text="Ask your administrator if you think you should have access to:" data-test-empty-state-message />
+          <A.Footer data-test-empty-state-actions>
+            <code>POST /{{@backend}}/config/cluster</code>
+          </A.Footer>
+        </Hds::ApplicationState>
+      {{/if}}
+    </fieldset>
+
+    <fieldset class="box is-shadowless is-marginless is-borderless is-fullwidth" data-test-acme-edit-section>
+      <h2 class="title is-size-5 has-border-bottom-light page-header">
+        ACME Config
+      </h2>
+      {{#if @capabilities.canSetAcme}}
+        {{#each @acmeForm.formFields as |field|}}
+          <FormField @attr={{field}} @model={{@acmeForm}} @showHelpText={{false}} />
+        {{/each}}
+      {{else}}
+        <Hds::ApplicationState class="top-padding-32 bottom-padding-32 is-marginless" as |A|>
+          <A.Header
+            @title="You do not have permission to set this mount's ACME config"
+            @titleTag="h2"
+            data-test-empty-state-title
+          />
+          <A.Body @text="Ask your administrator if you think you should have access to:" data-test-empty-state-message />
+          <A.Footer data-test-empty-state-actions>
+            <code>POST /{{@backend}}/config/acme</code>
+          </A.Footer>
+        </Hds::ApplicationState>
+      {{/if}}
+    </fieldset>
+
+    <fieldset class="box is-shadowless is-marginless is-borderless is-fullwidth" data-test-urls-edit-section>
+      <h2 class="title is-size-5 has-border-bottom-light page-header">
+        Global URLs
+      </h2>
+      {{#if @capabilities.canSetUrls}}
+        {{#each @urlsForm.formFields as |field|}}
+          <FormField @attr={{field}} @model={{@urlsForm}} @showHelpText={{false}} />
+        {{/each}}
+      {{else}}
+        <Hds::ApplicationState class="top-padding-32 bottom-padding-32 is-marginless" as |A|>
+          <A.Header
+            @title="You do not have permission to set this mount's URLs"
+            @titleTag="h2"
+            data-test-empty-state-title
+          />
+          <A.Body @text="Ask your administrator if you think you should have access to:" data-test-empty-state-message />
+          <A.Footer data-test-empty-state-actions>
+            <code>POST /{{@backend}}/config/urls</code>
+          </A.Footer>
+        </Hds::ApplicationState>
+      {{/if}}
+    </fieldset>
+
+    <fieldset class="box is-shadowless is-marginless is-borderless is-fullwidth" data-test-crl-edit-section>
+      {{#if @capabilities.canSetCrl}}
+        {{#each @crlForm.formFieldGroups as |fieldGroup|}}
+          {{#each-in fieldGroup as |group fields|}}
+            {{#if (or (not-eq group "Unified Revocation") this.isEnterprise)}}
+              <h2 class="title is-size-5 has-border-bottom-light page-header" data-test-crl-header={{group}}>
+                {{group}}
+              </h2>
+            {{/if}}
+            {{#each fields as |field|}}
+              {{#if (eq field.options.editType "ttl")}}
+                {{#if (or (includes field.name (array "expiry" "ocsp_expiry")) (not @crlForm.disable))}}
+                  {{#let (get @crlForm field.options.mapToBoolean) as |enabled|}}
+                    {{! 'enabled' is the pki/crl model's boolean attr that corresponds to the duration set by the ttl }}
+                    <div class="field">
+                      <TtlPicker
+                        data-test-input={{field.name}}
+                        @onChange={{fn this.handleTtl field}}
+                        @label={{field.options.label}}
+                        @labelDisabled={{field.options.labelDisabled}}
+                        @helperTextDisabled={{field.options.helperTextDisabled}}
+                        @helperTextEnabled={{field.options.helperTextEnabled}}
+                        @initialEnabled={{if field.options.isOppositeValue (not enabled) enabled}}
+                        @initialValue={{get @crlForm field.name}}
+                      />
+                    </div>
+                  {{/let}}
+                {{/if}}
+              {{else}}
+                {{#if this.isEnterprise}}
+                  <FormField @attr={{field}} @model={{@crlForm}} />
+                {{/if}}
+              {{/if}}
+            {{/each}}
+          {{/each-in}}
+        {{/each}}
+      {{else}}
+        <Hds::ApplicationState class="top-padding-32 bottom-padding-32 is-marginless" as |A|>
+          <A.Header
+            @title="You do not have permission to set this mount's revocation configuration"
+            @titleTag="h2"
+            data-test-empty-state-title
+          />
+          <A.Body @text="Ask your administrator if you think you should have access to:" data-test-empty-state-message />
+          <A.Footer data-test-empty-state-actions>
+            <code>POST /{{@backend}}/config/crl</code>
+          </A.Footer>
+        </Hds::ApplicationState>
+      {{/if}}
+    </fieldset>
+
+    <hr class="has-background-gray-100" />
+    <Hds::ButtonSet>
+      {{#if (or @capabilities.canSetUrls @capabilities.canSetCrl)}}
+        <Hds::Button
+          @text="Save"
+          @icon={{if this.save.isRunning "loading"}}
+          type="submit"
+          disabled={{this.save.isRunning}}
+          data-test-configuration-edit-save
+        />
+      {{/if}}
+      <Hds::Button
+        @text="Cancel"
+        @color="secondary"
+        {{on "click" this.cancel}}
+        disabled={{this.save.isRunning}}
+        data-test-configuration-edit-cancel
+      />
+    </Hds::ButtonSet>
+    {{#if this.invalidFormAlert}}
+      <div class="control">
+        <AlertInline
+          @type="danger"
+          class="has-top-padding-s"
+          @message={{this.invalidFormAlert}}
+          data-test-configuration-edit-validation-alert
+        />
+      </div>
+    {{/if}}
+  </form>
+</div>

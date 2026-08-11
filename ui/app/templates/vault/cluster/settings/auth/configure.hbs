@@ -1,0 +1,29 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Page::Header @title="Configure {{get (engines-display-data this.model.method.methodType) 'displayName'}}">
+  <:breadcrumbs>
+    <Page::Breadcrumbs
+      @breadcrumbs={{array
+        (hash label="Vault" route="vault.cluster.dashboard" icon="vault")
+        (hash label="Auth Methods" route="vault.cluster.access.methods")
+        (hash label=this.model.method.id route="vault.cluster.access.method" model=this.model.method.id)
+        (hash label="Configure")
+      }}
+    />
+  </:breadcrumbs>
+</Page::Header>
+
+<SectionTabs @model={{this.model.method}} />
+
+<Toolbar>
+  <ToolbarActions>
+    <ToolbarLink @route="vault.cluster.access.method" @model={{this.model.method.id}} data-test-backend-view-link>
+      View method
+    </ToolbarLink>
+  </ToolbarActions>
+</Toolbar>
+
+{{outlet}}

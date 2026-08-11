@@ -1,0 +1,113 @@
+/**
+ * Copyright IBM Corp. 2016, 2025
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+/* This helper includes styles referencing background color, border color, and text color. */
+
+// background colors
+.background-neutral-50 {
+  background: var(--token-color-palette-neutral-50);
+}
+
+.has-background-white-bis {
+  background: var(--token-color-surface-faint);
+}
+
+.has-background-gray-100 {
+  background-color: var(--token-color-palette-neutral-100);
+}
+
+.has-background-gray-200 {
+  background-color: var(--token-color-palette-neutral-200);
+}
+
+.has-background-gray-300 {
+  background-color: var(--token-color-palette-neutral-300);
+}
+
+.has-background-gray-900 {
+  background-color: var(--token-color-palette-neutral-600);
+}
+
+.background-color-black {
+  background-color: black;
+}
+
+// borders
+.has-border-top-light {
+  border-radius: 0;
+  border-top: 1px solid var(--token-color-palette-neutral-300);
+}
+
+.has-border-bottom-light {
+  border-radius: 0;
+  border-bottom: 1px solid var(--token-color-palette-neutral-300);
+}
+
+.has-error-border,
+select.has-error-border,
+.ttl-picker-form-field-error input,
+.string-list-form-field-error .field:first-of-type textarea,
+.hds-form-checkbox.has-error-border {
+  border: 1px solid var(--token-color-palette-red-200);
+}
+
+.error-border-child-inputs input,
+.error-border-child-inputs textarea {
+  border: 1px solid var(--token-color-palette-red-200);
+}
+
+// specifically for the SearchSelect dropdown.
+.dropdown-has-error-border > div.ember-basic-dropdown-trigger {
+  border: 1px solid var(--token-color-palette-red-200);
+}
+
+// text color
+.text-grey-lightest {
+  color: var(--token-color-palette-neutral-50);
+}
+
+.has-text-neutral-300 {
+  color: var(--token-color-foreground-faint) !important;
+}
+
+.has-text-grey {
+  color: var(--token-color-foreground-faint) !important;
+}
+
+.has-text-neutral-500 {
+  color: var(--token-color-foreground-faint) !important;
+}
+
+.has-text-white {
+  color: hsl(0, 0%, 100%) !important;
+}
+
+.has-text-black {
+  color: hsl(0, 0%, 4%) !important;
+}
+
+.has-text-info {
+  color: var(--token-color-foreground-action) !important;
+}
+// same without the !important
+.has-text-primary {
+  color: var(--token-color-foreground-action);
+}
+
+.has-text-success {
+  color: var(--token-color-foreground-success) !important;
+}
+
+.has-text-highlight {
+  color: var(--token-color-foreground-warning);
+}
+
+.has-text-danger {
+  color: var(--token-color-foreground-critical) !important;
+}
+
+.has-text-primary {
+  color: var(--token-color-foreground-action);
+}

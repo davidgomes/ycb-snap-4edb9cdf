@@ -1,0 +1,80 @@
+/**
+ * Copyright IBM Corp. 2016, 2025
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+import Component from '@glimmer/component';
+import { tracked } from '@glimmer/tracking';
+import { task, timeout } from 'ember-concurrency';
+import { service } from '@ember/service';
+import { action } from '@ember/object';
+
+const SHOW_ROUTE = 'vault.cluster.secrets.backend.show';
+
+export default class GenerateCredentialsTotp extends Component {
+  @tracked elapsedTime = 0;
+  @tracked totpCode = null;
+  @service api;
+  @service router;
+
+  title = 'Generate TOTP code';
+
+  constructor() {
+    super(...arguments);
+    this.startTimer.perform();
+  }
+
+  get breadcrumbs() {
+    return [
+      {
+        label: this.args.backendPath,
+        route: 'vault.cluster.secrets.backend',
+        model: this.args.backendPath,
+      },
+      { label: this.args.keyName, route: 'vault.cluster.secrets.backend.show', model: this.args.keyName },
+      { label: this.title },
+    ];
+  }
+
+  get remainingTime() {
+    const { totpCodePeriod } = this.args;
+
+    return totpCodePeriod - this.elapsedTime;
+  }
+
+  @task({ restartable: true })
+  *startTimer() {
+    const { backendPath, keyName, totpCodePeriod } = this.args;
+    this.generateTotpCode(backendPath, keyName);
+    while (this.elapsedTime <= totpCodePeriod) {
+      yield timeout(1000);
+      this.elapsedTime += 1;
+    }
+
+    if (this.elapsedTime > totpCodePeriod) {
+      this.elapsedTime = 0;
+      this.generateTotpCode(backendPath, keyName);
+      this.startTimer.perform();
+    }
+  }
+
+  async generateTotpCode(backend, keyName) {
+    // refreshing will generate a new code if the period has expired.
+    try {
+      const resp = await this.api.secrets.totpGenerateCode(keyName, backend);
+      this.totpCode = resp?.data?.code ?? null;
+    } catch (e) {
+      // swallow error, non-essential data
+      return;
+    }
+  }
+
+  @action redirectPreviousPage() {
+    const { backRoute, keyName } = this.args;
+    if (backRoute === SHOW_ROUTE) {
+      this.router.transitionTo(this.args.backRoute, keyName);
+    } else {
+      this.router.transitionTo(this.args.backRoute);
+    }
+  }
+}

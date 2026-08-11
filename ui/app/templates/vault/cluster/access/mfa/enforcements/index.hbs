@@ -1,0 +1,37 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Page::Header @title="Multi-factor authentication">
+  <:breadcrumbs>
+    <Page::Breadcrumbs @breadcrumbs={{this.breadcrumbs}} />
+  </:breadcrumbs>
+  <:description>
+    Enforce a secondary layer of identity verification (such as TOTP, Okta, or Duo) during the login process.
+    <Hds::Link::Inline @isHrefExternal={{true}} @href={{doc-link "/vault/gui/login-mfa"}}>
+      Learn more
+    </Hds::Link::Inline>
+  </:description>
+</Page::Header>
+
+<Mfa::Nav />
+
+<Toolbar>
+  <ToolbarActions>
+    <ToolbarLink @route="vault.cluster.access.mfa.enforcements.create" @type="add" data-test-enforcement-create>
+      New enforcement
+    </ToolbarLink>
+  </ToolbarActions>
+</Toolbar>
+
+{{#if (gt this.model.enforcements.length 0)}}
+  {{#each this.model.enforcements as |item|}}
+    <Mfa::LoginEnforcementListItem @model={{item}} />
+  {{/each}}
+{{else}}
+  <Hds::ApplicationState class="top-padding-32 is-marginless" as |A|>
+    <A.Header @title="No enforcements found." @titleTag="h2" data-test-empty-state-title />
+    <A.Body @text="Add a new one to get started." data-test-empty-state-message />
+  </Hds::ApplicationState>
+{{/if}}

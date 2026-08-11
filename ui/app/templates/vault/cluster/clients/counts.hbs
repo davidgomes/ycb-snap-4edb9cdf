@@ -1,0 +1,17 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Clients::Page::Counts
+  @activity={{this.model.activity}}
+  @config={{this.model.config}}
+  @canUpdateConfig={{this.model.canUpdateConfig}}
+  @endTimestamp={{this.model.endTimestamp}}
+  @onFilterChange={{this.updateQueryParams}}
+  @startTimestamp={{this.model.startTimestamp}}
+  @versionHistory={{this.model.versionHistory}}
+  @responseTimestamp={{this.model.responseTimestamp}}
+>
+  {{outlet}}
+</Clients::Page::Counts>

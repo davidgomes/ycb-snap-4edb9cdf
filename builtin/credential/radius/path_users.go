@@ -1,0 +1,222 @@
+// Copyright IBM Corp. 2016, 2025
+// SPDX-License-Identifier: BUSL-1.1
+
+package radius
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/helper/policyutil"
+	"github.com/hashicorp/vault/sdk/logical"
+)
+
+func pathUsersList(b *backend) *framework.Path {
+	return &framework.Path{
+		Pattern: "users/?$",
+
+		DisplayAttrs: &framework.DisplayAttributes{
+			OperationPrefix: operationPrefixRadius,
+			OperationSuffix: "users",
+			Navigation:      true,
+			ItemType:        "User",
+		},
+
+		Callbacks: map[logical.Operation]framework.OperationFunc{
+			logical.ListOperation: b.pathUserList,
+		},
+
+		HelpSynopsis:    pathUserHelpSyn,
+		HelpDescription: pathUserHelpDesc,
+	}
+}
+
+func pathUsers(b *backend) *framework.Path {
+	return &framework.Path{
+		Pattern: `users/(?P<name>.+)`,
+
+		DisplayAttrs: &framework.DisplayAttributes{
+			OperationPrefix: operationPrefixRadius,
+			OperationSuffix: "user",
+			Action:          "Create",
+			ItemType:        "User",
+		},
+
+		Fields: map[string]*framework.FieldSchema{
+			"name": {
+				Type:        framework.TypeString,
+				Description: "Name of the RADIUS user.",
+			},
+
+			"policies": {
+				Type:        framework.TypeCommaStringSlice,
+				Description: "Comma-separated list of policies associated to the user.",
+				DisplayAttrs: &framework.DisplayAttributes{
+					Description: "A list of policies associated to the user.",
+				},
+			},
+		},
+
+		Callbacks: map[logical.Operation]framework.OperationFunc{
+			logical.DeleteOperation: b.pathUserDelete,
+			logical.ReadOperation:   b.pathUserRead,
+			logical.UpdateOperation: b.pathUserWrite,
+			logical.CreateOperation: b.pathUserWrite,
+		},
+
+		ExistenceCheck: b.userExistenceCheck,
+
+		HelpSynopsis:    pathUserHelpSyn,
+		HelpDescription: pathUserHelpDesc,
+	}
+}
+
+func (b *backend) userExistenceCheck(ctx context.Context, req *logical.Request, data *framework.FieldData) (bool, error) {
+	name, err := b.normalizeName(ctx, req, data.Get("name").(string))
+	if err != nil {
+		return false, err
+	}
+	userEntry, err := b.user(ctx, req.Storage, name)
+	if err != nil {
+		return false, err
+	}
+
+	return userEntry != nil, nil
+}
+
+func (b *backend) user(ctx context.Context, s logical.Storage, username string) (*UserEntry, error) {
+	if username == "" {
+		return nil, fmt.Errorf("missing username")
+	}
+
+	entry, err := s.Get(ctx, "user/"+username)
+	if err != nil {
+		return nil, err
+	}
+	if entry == nil {
+		return nil, nil
+	}
+
+	var result UserEntry
+	if err := entry.DecodeJSON(&result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
+func (b *backend) normalizeName(ctx context.Context, req *logical.Request, name string) (string, error) {
+	cfg, err := b.Config(ctx, req)
+	if err != nil {
+		return "", err
+	}
+	if cfg != nil && cfg.CaseInsensitiveNames {
+		return strings.ToLower(name), nil
+	}
+	return name, nil
+}
+
+func (b *backend) pathUserDelete(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	name, err := b.normalizeName(ctx, req, d.Get("name").(string))
+	if err != nil {
+		return nil, err
+	}
+	err = req.Storage.Delete(ctx, "user/"+name)
+	if err != nil {
+		return nil, err
+	}
+
+	return nil, nil
+}
+
+func (b *backend) pathUserRead(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	name, err := b.normalizeName(ctx, req, d.Get("name").(string))
+	if err != nil {
+		return nil, err
+	}
+	user, err := b.user(ctx, req.Storage, name)
+	if err != nil {
+		return nil, err
+	}
+	if user == nil {
+		return nil, nil
+	}
+
+	return &logical.Response{
+		Data: map[string]interface{}{
+			"policies": user.Policies,
+		},
+	}, nil
+}
+
+func (b *backend) pathUserWrite(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	policies := policyutil.ParsePolicies(d.Get("policies"))
+	for _, policy := range policies {
+		if policy == "root" {
+			return logical.ErrorResponse("root policy cannot be granted by an auth method"), nil
+		}
+	}
+
+	rawName := d.Get("name").(string)
+	name, err := b.normalizeName(ctx, req, rawName)
+	if err != nil {
+		return nil, err
+	}
+
+	cfg, err := b.Config(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if cfg != nil && cfg.CaseInsensitiveNames {
+		users, err := req.Storage.List(ctx, "user/")
+		if err != nil {
+			return nil, err
+		}
+		for _, existingUser := range users {
+			if strings.EqualFold(existingUser, rawName) && (existingUser != rawName || existingUser != name) {
+				return logical.ErrorResponse("username %q collides with existing username %q when case_insensitive_names=true", rawName, existingUser), nil
+			}
+		}
+	}
+
+	// Store it
+	entry, err := logical.StorageEntryJSON("user/"+name, &UserEntry{
+		Policies: policies,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := req.Storage.Put(ctx, entry); err != nil {
+		return nil, err
+	}
+
+	return nil, nil
+}
+
+func (b *backend) pathUserList(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	users, err := req.Storage.List(ctx, "user/")
+	if err != nil {
+		return nil, err
+	}
+	return logical.ListResponse(users), nil
+}
+
+type UserEntry struct {
+	Policies []string
+}
+
+const pathUserHelpSyn = `
+Manage users allowed to authenticate.
+`
+
+const pathUserHelpDesc = `
+This endpoint allows you to create, read, update, and delete configuration
+for RADIUS users that are allowed to authenticate, and associate policies to
+them.
+
+Deleting a user will not revoke auth for prior authenticated users.
+To do this, do a revoke token by path on "auth/radius/login/<username>"
+for the usernames you want revoked.
+`

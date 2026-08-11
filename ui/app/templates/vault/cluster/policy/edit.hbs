@@ -1,0 +1,53 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+<Page::Header @title={{this.model.name}}>
+  <:breadcrumbs>
+    <Page::Breadcrumbs
+      @breadcrumbs={{array
+        (hash label="Vault" route="vault.cluster.dashboard" icon="vault")
+        (hash
+          label=(concat (uppercase this.model.policyType) " policies")
+          route="vault.cluster.policies"
+          model=this.model.policyType
+        )
+        (hash label=this.model.name route="vault.cluster.policy.show" model=this.model.name)
+        (hash label="Edit")
+      }}
+    />
+  </:breadcrumbs>
+  <:badges>
+    {{#if this.model.enforcementLevel}}
+      <Hds::Badge @text={{this.model.enforcementLevel}} aria-label="Enforcement level: {{this.model.enforcementLevel}}" />
+    {{/if}}
+  </:badges>
+</Page::Header>
+
+{{#if (and (not-eq this.model.name "root") (or this.model.capabilities.canUpdate this.model.capabilities.canDelete))}}
+  <Toolbar>
+    <ToolbarActions>
+      {{#if
+        (and (not-eq this.model.name "default") (not-eq this.model.name "default-ceiling") this.model.capabilities.canDelete)
+      }}
+        <ConfirmAction
+          @buttonText="Delete policy"
+          class="toolbar-button"
+          @buttonColor="secondary"
+          @confirmMessage="Deleting this policy may affect access to Vault data."
+          @onConfirmAction={{this.deletePolicy}}
+        />
+        <div class="toolbar-separator"></div>
+      {{/if}}
+      <ToolbarLink @route="vault.cluster.policy.show" @model={{this.model.name}} data-test-button="Back to policy">
+        Back to policy
+      </ToolbarLink>
+    </ToolbarActions>
+  </Toolbar>
+{{/if}}
+
+<PolicyForm
+  @form={{this.model}}
+  @onSave={{transition-to "vault.cluster.policy.show" this.model.policyType this.model.name}}
+  @onCancel={{transition-to "vault.cluster.policy.show" this.model.policyType this.model.name}}
+/>

@@ -1,0 +1,94 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+{{#let (engines-display-data @model.secretsEngine.type) as |engineDisplayData|}}
+  <Page::Header
+    @title="{{@model.secretsEngine.id}} configuration"
+    @description={{engineDisplayData.displayName}}
+    @icon={{engineDisplayData.glyph}}
+  >
+    <:breadcrumbs>
+      <Page::Breadcrumbs @breadcrumbs={{@breadcrumbs}} />
+    </:breadcrumbs>
+    <:actions>
+      <Hds::Button
+        @color="secondary"
+        @route={{exit-configuration-route @model.secretsEngine.type @model.secretsEngine.version}}
+        @text="Exit configuration"
+        data-test-button="Exit configuration"
+      />
+    </:actions>
+  </Page::Header>
+  <Mount::ConfigureTabs
+    @configRoute={{this.configRoute}}
+    @displayName={{engineDisplayData.displayName}}
+    @path={{@model.secretsEngine.id}}
+  />
+
+  {{#if @model.config}}
+    <Toolbar>
+      <ToolbarActions>
+        <ToolbarLink
+          @route="vault.cluster.secrets.backend.configuration.edit"
+          @model={{this.model.secretsEngine.id}}
+          data-test-secret-backend-configure
+        >
+          Edit configuration
+        </ToolbarLink>
+      </ToolbarActions>
+    </Toolbar>
+
+    {{#each this.displayFields as |field|}}
+      {{! public key while not sensitive when editing/creating, should be hidden by default on viewing }}
+      {{#if (eq field "public_key")}}
+        <InfoTableRow @label="Public key" @value={{@model.config.public_key}}>
+          <MaskedInput @value={{@model.config.public_key}} @name={{field}} @displayOnly={{true}} @allowCopy={{true}} />
+        </InfoTableRow>
+      {{else}}
+        <InfoTableRow
+          @alwaysRender={{not (is-empty-value (get @model.config field))}}
+          @label={{this.label field}}
+          @value={{get @model.config field}}
+          @formatTtl={{this.isDuration field}}
+        />
+      {{/if}}
+    {{/each}}
+  {{else if engineDisplayData.isConfigurable}}
+    {{! Prompt user to configure the secret engine }}
+    <Hds::ApplicationState class="top-padding-32 is-marginless" as |A|>
+      <A.Header @title="{{engineDisplayData.displayName}} not configured" @titleTag="h2" data-test-empty-state-title />
+      <A.Body
+        @text="Get started by configuring your {{engineDisplayData.displayName}} secrets engine."
+        data-test-empty-state-message
+      />
+      <A.Footer data-test-empty-state-actions as |F|>
+        <F.LinkStandalone
+          @icon="chevron-right"
+          @iconPosition="trailing"
+          @text="Configure {{engineDisplayData.displayName}}"
+          @route="vault.cluster.secrets.backend.configuration.edit"
+          @model={{@model.secretsEngine.id}}
+        />
+      </A.Footer>
+    </Hds::ApplicationState>
+  {{else}}
+    <Hds::ApplicationState class="top-padding-32 is-marginless" data-test-no-config as |A|>
+      <A.Header @title="No configuration details available" @titleTag="h2" data-test-empty-state-title />
+      <A.Body
+        @text="{{engineDisplayData.displayName}} does not have any plugin specific configuration. All configurable parameters for this engine are under 'General Settings'."
+        data-test-empty-state-message
+      />
+      <A.Footer data-test-empty-state-actions as |F|>
+        <F.LinkStandalone
+          @icon="chevron-right"
+          @iconPosition="trailing"
+          @text="Back to general settings"
+          @route="vault.cluster.secrets.backend.configuration.general-settings"
+          @model={{@model.secretsEngine.id}}
+        />
+      </A.Footer>
+    </Hds::ApplicationState>
+  {{/if}}
+{{/let}}

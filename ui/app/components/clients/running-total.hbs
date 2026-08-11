@@ -1,0 +1,87 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+{{#if @byMonthClients.length}}
+  <Clients::CountsCard @title="Client usage trends" @description={{this.chartContainerText}}>
+    <:dataLeft>
+      <Clients::Charts::CarbonChart
+        @chartData={{this.donutChartData}}
+        @chartOptions={{this.donutChartOptions}}
+        @chartType={{this.chartTypes.DONUT}}
+        data-test-chart="Client count and type distribution"
+      />
+    </:dataLeft>
+
+    <:dataRight>
+      <div class="chart-container">
+        <div class="chart-container-toggle">
+          <Hds::Form::Toggle::Field
+            data-test-input="toggle view"
+            {{on "change" (fn (mut this.showStacked) (not this.showStacked))}}
+            as |F|
+          >
+            <F.Label>Split by client type</F.Label>
+          </Hds::Form::Toggle::Field>
+        </div>
+        {{#if this.showStacked}}
+          <Clients::Charts::CarbonChart
+            @chartData={{this.stackedChartData}}
+            @chartOptions={{this.stackedChartOptions}}
+            @chartType={{this.chartTypes.STACKED_BAR}}
+            data-test-chart="Client usage by month (stacked)"
+          />
+        {{else}}
+          <Clients::Charts::CarbonChart
+            @chartData={{this.simpleChartData}}
+            @chartOptions={{this.simpleChartOptions}}
+            @chartType={{this.chartTypes.SIMPLE_BAR}}
+            data-test-chart="Client usage by month (simple)"
+          />
+        {{/if}}
+      </div>
+    </:dataRight>
+  </Clients::CountsCard>
+{{else}}
+  {{! Renders when viewing activity log data that predates the monthly breakdown added in 1.11 }}
+  <Clients::UsageStats @title="Client usage" @description="Total client usage for the selected date range.">
+    <StatText
+      class="column"
+      @label="Total clients"
+      @value={{@runningTotals.clients}}
+      @size="l"
+      @subText="The number of clients which interacted with Vault during this month. This is Vault’s primary billing metric."
+    />
+    <StatText
+      class="column"
+      @label="Entity"
+      @value={{@runningTotals.entity_clients}}
+      @size="l"
+      @subText="Representations of a particular user, client, or application that created a token via login."
+    />
+    <StatText
+      class="column"
+      @label="Non-entity"
+      @value={{@runningTotals.non_entity_clients}}
+      @size="l"
+      @subText="Clients created with a shared set of permissions, but not associated with an entity."
+    />
+    <StatText
+      class="column"
+      @label="ACME"
+      @value={{@runningTotals.acme_clients}}
+      @size="l"
+      @subText="Each ACME request counts as one client."
+    />
+    {{#if this.flags.secretsSyncIsActivated}}
+      <StatText
+        class="column"
+        @label="Secret sync"
+        @value={{@runningTotals.secret_syncs}}
+        @size="l"
+        @subText="A secret with a configured sync destination qualifies as a unique and active client."
+      />
+    {{/if}}
+  </Clients::UsageStats>
+{{/if}}

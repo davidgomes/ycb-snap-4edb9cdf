@@ -1,0 +1,33 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<PkiPageHeader @backend={{this.model.engine}} />
+
+<Toolbar />
+
+{{#if this.model.hasConfig}}
+  <Page::PkiOverview
+    @issuers={{this.model.issuers}}
+    @roles={{this.model.roles}}
+    @certificates={{this.model.certificates}}
+    @engine={{this.model.engine}}
+    @canListCertificates={{this.model.canListCertificates}}
+    @canListRoles={{this.model.canListRoles}}
+  />
+{{else}}
+  <Hds::ApplicationState class="top-padding-32 is-marginless" as |A|>
+    <A.Header @title="PKI not configured" @titleTag="h2" data-test-empty-state-title />
+    <A.Body @text={{this.notConfiguredMessage}} data-test-empty-state-message />
+    <A.Footer data-test-empty-state-actions as |F|>
+      <F.LinkStandalone
+        @icon="chevron-right"
+        @iconPosition="trailing"
+        @text="Configure PKI"
+        @route="configuration.create"
+        @model={{this.model.engine.id}}
+      />
+    </A.Footer>
+  </Hds::ApplicationState>
+{{/if}}

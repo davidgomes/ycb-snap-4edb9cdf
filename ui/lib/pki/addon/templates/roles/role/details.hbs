@@ -1,0 +1,11 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Page::Header @icon="file-text" @title="PKI Role" @subtitle={{this.model.role.name}}>
+  <:breadcrumbs>
+    <Page::Breadcrumbs @breadcrumbs={{this.breadcrumbs}} />
+  </:breadcrumbs>
+</Page::Header>
+<Page::PkiRoleDetails @role={{this.model.role}} @capabilities={{this.model.capabilities}} />

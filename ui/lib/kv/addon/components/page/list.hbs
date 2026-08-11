@@ -1,0 +1,200 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Page::Header @description="KV" @icon={{@backendModel.icon}} @title={{@backendModel.id}}>
+  <:breadcrumbs>
+    <Page::Breadcrumbs @breadcrumbs={{@breadcrumbs}} />
+  </:breadcrumbs>
+  <:badges>
+    <Hds::Badge @text="version 2" data-test-badge />
+  </:badges>
+  <:actions>
+    <ManageDropdown @model={{@backendModel}} @configRoute="configuration" as |D|>
+      {{#unless this.version.isCommunity}}
+        <D.Interactive
+          @icon="shield-check"
+          {{on "click" (fn (mut this.showPolicyFlyout) true)}}
+          data-test-popup-menu="Generate policy"
+        >
+          Generate policy
+        </D.Interactive>
+      {{/unless}}
+    </ManageDropdown>
+    <Hds::Button
+      @text="Create secret"
+      @icon="plus"
+      @route="create"
+      @model={{@backendModel}}
+      @query={{hash initialKey=@filterValue}}
+      data-test-button="create secret"
+    />
+  </:actions>
+</Page::Header>
+
+<CodeGenerator::Policy::Flyout @onClose={{(fn (mut this.showPolicyFlyout) false)}}>
+  <:customTrigger as |openFlyout|>
+    {{#if this.showPolicyFlyout}}
+      <div {{did-insert openFlyout}} />
+    {{/if}}
+  </:customTrigger>
+</CodeGenerator::Policy::Flyout>
+
+<KvTabsToolbar>
+  <:tabs>
+    <li><LinkTo @route="list" data-test-tab="Secrets" @model={{@backend}}>Secrets</LinkTo></li>
+  </:tabs>
+
+  <:toolbarFilters>
+    {{#if (and (not-eq @secrets 403) (or @secrets @filterValue))}}
+      <KvListFilter @mountPoint={{this.mountPoint}} @filterValue={{@filterValue}} />
+    {{/if}}
+  </:toolbarFilters>
+</KvTabsToolbar>
+
+{{#if (eq @secrets 403)}}
+  <div class="box is-fullwidth is-shadowless has-tall-padding">
+    <div class="selectable-card-container one-card">
+      <OverviewCard
+        @cardTitle="View secret"
+        @subText="Type the path of the secret you want to view. Include a trailing slash to navigate to the list view."
+      >
+        <:content>
+          <form {{on "submit" this.transitionToSecretDetail}} class="has-top-margin-m">
+            <InputSearch
+              @id="search-input-kv-secret"
+              @initialValue={{@pathToSecret}}
+              @onChange={{this.handleSecretPathInput}}
+              @placeholder="secret/"
+              data-test-view-secret
+            />
+            <Hds::Button
+              @text={{this.buttonText}}
+              @color="secondary"
+              type="submit"
+              disabled={{not this.secretPath}}
+              data-test-submit
+            />
+          </form>
+          {{#if @failedDirectoryQuery}}
+            <AlertInline
+              @type="danger"
+              @message="You do not have the required permissions or the directory does not exist."
+            />
+          {{/if}}
+        </:content>
+      </OverviewCard>
+    </div>
+  </div>
+{{else}}
+  {{#if @secrets}}
+    {{#each @secrets as |secretPath|}}
+      {{#let (this.isDirectory secretPath) (this.fullSecretPath secretPath) as |isDir fullPath|}}
+        <LinkedBlock
+          data-test-list-item={{secretPath}}
+          class="list-item-row"
+          @params={{array (if isDir "list-directory" "secret.index") @backend fullPath}}
+          @linkPrefix={{this.mountPoint}}
+        >
+          <div class="level is-mobile">
+            <div class="level-left">
+              <div>
+                <Icon @name={{if isDir "folder" "file"}} class="has-text-grey-light" />
+                <span class="has-text-weight-semibold is-underline" data-test-path>
+                  {{secretPath}}
+                </span>
+              </div>
+            </div>
+            <div class="level-right is-flex is-paddingless is-marginless">
+              <div class="level-item">
+                <Hds::Dropdown @isInline={{true}} @listPosition="bottom-right" as |dd|>
+                  <dd.ToggleIcon
+                    @icon="more-horizontal"
+                    @text="Manage secret"
+                    @hasChevron={{false}}
+                    data-test-popup-menu-trigger
+                  />
+                  {{#if isDir}}
+                    <dd.Interactive
+                      @route="list-directory"
+                      @models={{array @backend fullPath}}
+                      data-test-list-menu-item="Content"
+                    >
+                      Content
+                    </dd.Interactive>
+                  {{else}}
+                    <dd.Interactive
+                      @route="secret.index"
+                      @models={{array @backend fullPath}}
+                      data-test-list-menu-item="Overview"
+                    >
+                      Overview
+                    </dd.Interactive>
+                    <dd.Interactive
+                      @route="secret.details"
+                      @models={{array @backend fullPath}}
+                      data-test-list-menu-item="Secret data"
+                    >
+                      Secret data
+                    </dd.Interactive>
+                    {{#if @capabilities.canRead}}
+                      <dd.Interactive
+                        @route="secret.metadata.versions"
+                        @models={{array @backend fullPath}}
+                        data-test-list-menu-item="View version history"
+                      >
+                        View version history
+                      </dd.Interactive>
+                    {{/if}}
+                    {{#if @capabilities.canDelete}}
+                      <dd.Interactive
+                        @color="critical"
+                        {{on "click" (fn (mut this.metadataToDelete) secretPath)}}
+                        data-test-list-menu-item="Permanently delete"
+                      >
+                        Permanently delete
+                      </dd.Interactive>
+                    {{/if}}
+                  {{/if}}
+                </Hds::Dropdown>
+              </div>
+            </div>
+          </div>
+        </LinkedBlock>
+      {{/let}}
+    {{/each}}
+    {{#if this.metadataToDelete}}
+      <ConfirmModal
+        @color="critical"
+        @onClose={{fn (mut this.metadataToDelete) null}}
+        @onConfirm={{fn this.onDelete this.metadataToDelete}}
+        @confirmMessage="This will permanently delete this secret and all its versions."
+      />
+    {{/if}}
+    <Hds::Pagination::Numbered
+      @currentPage={{@secrets.meta.currentPage}}
+      @currentPageSize={{@secrets.meta.pageSize}}
+      @route={{this.router.currentRoute.localName}}
+      @showSizeSelector={{false}}
+      @models={{@currentRouteParams}}
+      @totalItems={{@secrets.meta.total}}
+      @queryFunction={{this.paginationQueryParams}}
+      data-test-pagination
+    />
+  {{else}}
+    {{#if @filterValue}}
+      <Hds::ApplicationState class="top-padding-32 is-marginless" as |A|>
+        <A.Header @title='There are no secrets matching "{{@filterValue}}".' @titleTag="h2" data-test-empty-state-title />
+      </Hds::ApplicationState>
+    {{else}}
+      <Hds::ApplicationState class="top-padding-32 is-marginless" data-test-secret-list-empty-state as |A|>
+        <A.Header @title="No secrets yet" @titleTag="h2" data-test-empty-state-title />
+        <A.Body
+          @text="When created, secrets will be listed here. Create a secret to get started."
+          data-test-empty-state-message
+        />
+      </Hds::ApplicationState>
+    {{/if}}
+  {{/if}}
+{{/if}}

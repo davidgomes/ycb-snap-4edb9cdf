@@ -1,0 +1,157 @@
+/**
+ * Copyright IBM Corp. 2016, 2025
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+import { service } from '@ember/service';
+import Route from '@ember/routing/route';
+import config from 'vault/config/environment';
+import { supportedTypes } from 'vault/utils/auth-form-helpers';
+import { sanitizePath } from 'core/utils/sanitize-path';
+import AuthMethodResource from 'vault/resources/auth/method';
+import { REDIRECT } from 'vault/lib/route-paths';
+
+export default class AuthRoute extends Route {
+  queryParams = {
+    authMount: { replace: true, refreshModel: true },
+    wrapped_token: { refreshModel: true },
+  };
+
+  @service api;
+  @service auth;
+  @service flashMessages;
+  @service namespace;
+  @service router;
+  @service store;
+  @service version;
+
+  beforeModel() {
+    if (this.auth.currentToken) {
+      return this.router.replaceWith(REDIRECT);
+    }
+    return this.version.fetchFeatures();
+  }
+
+  async model(params) {
+    const clusterModel = this.modelFor('vault.cluster');
+    const wrapped_token = params?.wrapped_token;
+    if (wrapped_token) {
+      // log user in directly (i.e. no form interaction) via URL query param
+      const authResponse = await this.unwrapToken(wrapped_token, clusterModel.id);
+      return { clusterModel, unwrapResponse: authResponse };
+    }
+
+    const loginSettings = this.version.isEnterprise ? await this.fetchLoginSettings() : null;
+    const visibleAuthMounts = await this.fetchMounts();
+    const authMount = params?.authMount;
+
+    return {
+      clusterModel,
+      visibleAuthMounts,
+      directLinkData: this.getDirectLinkData(authMount, visibleAuthMounts),
+      loginSettings,
+    };
+  }
+
+  afterModel() {
+    if (config.welcomeMessage) {
+      this.flashMessages.info(config.welcomeMessage, {
+        sticky: true,
+        priority: 300,
+      });
+    }
+  }
+
+  redirect(model, transition) {
+    if (model?.unwrapResponse) {
+      // handles the transition
+      /* eslint-disable-next-line ember/no-controller-access-in-routes */
+      return this.controllerFor('vault.cluster.auth').loginAndTransition.perform(model.unwrapResponse);
+    }
+    const hasQueryParam = transition.to?.queryParams?.with;
+    const isInvalid = !model.directLinkData;
+    if (hasQueryParam && isInvalid) {
+      // redirect user and clear out the query param if it's invalid
+      return this.router.replaceWith(this.routeName, { queryParams: { authMount: '' } });
+    }
+  }
+
+  // authenticates the user if the wrapped_token query param exists
+  async unwrapToken(token, clusterId) {
+    try {
+      const { auth } = await this.api.sys.unwrap({}, this.api.buildHeaders({ token }));
+      const authData = this.auth.normalizeAuthData(auth, { authMethodType: 'token', authMountPath: '' });
+      return await this.auth.authSuccess(clusterId, authData);
+    } catch (e) {
+      const { message } = await this.api.parseError(e);
+      /* eslint-disable-next-line ember/no-controller-access-in-routes */
+      this.controllerFor('vault.cluster.auth').unwrapTokenError = message;
+    }
+  }
+
+  async fetchLoginSettings() {
+    try {
+      const adapter = this.store.adapterFor('application');
+      const response = await adapter.ajax(
+        '/v1/sys/internal/ui/default-auth-methods',
+        'GET',
+        this.api.buildHeaders({ token: '' })
+      );
+
+      if (response?.data) {
+        const { default_auth_type, backup_auth_types } = response.data;
+        return {
+          defaultType: default_auth_type,
+          backupTypes: backup_auth_types?.length ? backup_auth_types : null,
+        };
+      }
+    } catch {
+      // swallow if there's an error and fallback to default login form configuration
+      return null;
+    }
+  }
+
+  async fetchMounts() {
+    try {
+      const resp = await this.api.sys.internalUiListEnabledVisibleMounts(
+        this.api.buildHeaders({ token: '' })
+      );
+      const authMounts = this.api.responseObjectToArray(resp.auth, 'path').flatMap((method) => {
+        const resource = new AuthMethodResource(method, this);
+        return this.isSupported(resource.methodType) ? [resource] : [];
+      });
+      return authMounts.length ? authMounts : null;
+    } catch {
+      // catch error if there's a problem fetching mount data (i.e. invalid namespace)
+      return null;
+    }
+  }
+
+  /*
+    In older versions of Vault, the "with" query param could refer to either the auth mount path or the type
+    (which may be the same, since the default mount path *is* the type).
+    For backward compatibility, we handle both scenarios.
+    → If `authMount` matches a visible auth mount the method will assume that mount path to login and render as the default in the login form.
+    → If `authMount` matches a supported auth type (and the mount does not have `listing_visibility="unauth"`), that type is preselected in the login form.
+  */
+  getDirectLinkData(authMount, visibleAuthMounts) {
+    if (!authMount) return null;
+
+    const sanitizedParam = sanitizePath(authMount); // strip leading/trailing slashes
+    // mount paths in visibleAuthMounts always end in a slash, so format for consistency
+    const formattedPath = `${sanitizedParam}/`;
+    const mountData = visibleAuthMounts?.find((a) => a.path === formattedPath);
+    if (mountData) {
+      return { path: formattedPath, type: mountData.type };
+    }
+
+    if (this.isSupported(sanitizedParam)) {
+      return { type: sanitizedParam };
+    }
+    // `type` is necessary because it determines which login fields to render.
+    // If we can't safely glean it from the query param, ignore it and return null.
+    return null;
+  }
+
+  isSupported = (type = '') => supportedTypes(this.version.isEnterprise).includes(type);
+}

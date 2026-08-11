@@ -1,0 +1,371 @@
+// Copyright IBM Corp. 2016, 2025
+// SPDX-License-Identifier: BUSL-1.1
+
+package database
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/hashicorp/vault/helper/versions"
+	v5 "github.com/hashicorp/vault/sdk/database/dbplugin/v5"
+	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/logical"
+	"github.com/hashicorp/vault/sdk/queue"
+)
+
+func pathRotateRootCredentials(b *databaseBackend) []*framework.Path {
+	return []*framework.Path{
+		{
+			Pattern: "rotate-root/" + framework.GenericNameRegex("name"),
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: operationPrefixDatabase,
+				OperationVerb:   "rotate",
+				OperationSuffix: "root-credentials",
+			},
+
+			Fields: map[string]*framework.FieldSchema{
+				"name": {
+					Type:        framework.TypeString,
+					Description: "Name of this database connection",
+				},
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback:                    b.pathRotateRootCredentialsUpdate(),
+					ForwardPerformanceSecondary: true,
+					ForwardPerformanceStandby:   true,
+				},
+			},
+
+			HelpSynopsis:    pathRotateCredentialsUpdateHelpSyn,
+			HelpDescription: pathRotateCredentialsUpdateHelpDesc,
+		},
+		{
+			Pattern: "rotate-role/" + framework.GenericNameRegex("name"),
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationPrefix: operationPrefixDatabase,
+				OperationVerb:   "rotate",
+				OperationSuffix: "static-role-credentials",
+			},
+
+			Fields: map[string]*framework.FieldSchema{
+				"name": {
+					Type:        framework.TypeString,
+					Description: "Name of the static role",
+				},
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback:                    b.pathRotateRoleCredentialsUpdate(),
+					ForwardPerformanceStandby:   true,
+					ForwardPerformanceSecondary: true,
+				},
+			},
+
+			HelpSynopsis:    pathRotateRoleCredentialsUpdateHelpSyn,
+			HelpDescription: pathRotateRoleCredentialsUpdateHelpDesc,
+		},
+	}
+}
+
+func (b *databaseBackend) rotateRootCredential(ctx context.Context, req *logical.Request) error {
+	name, err := b.getDatabaseConfigNameFromRotationID(req.RotationInfo.RotationID)
+	if err != nil {
+		return err
+	}
+
+	_, err = b.performRootRotation(ctx, req, name)
+
+	return err
+}
+
+func (b *databaseBackend) pathRotateRootCredentialsUpdate() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, data *framework.FieldData) (resp *logical.Response, err error) {
+		name := data.Get("name").(string)
+		resp, err = b.performRootRotation(ctx, req, name)
+		if err != nil {
+			b.Logger().Error("failed to rotate root credential on user request", "path", req.Path, "error", err.Error())
+		} else {
+			b.Logger().Info("successfully rotated root credential on user request", "path", req.Path)
+		}
+		return resp, err
+	}
+}
+
+func (b *databaseBackend) performRootRotation(ctx context.Context, req *logical.Request, name string) (resp *logical.Response, err error) {
+	if name == "" {
+		return logical.ErrorResponse(respErrEmptyName), nil
+	}
+
+	modified := false
+	defer func() {
+		if err == nil {
+			b.dbEvent(ctx, "rotate-root", req.Path, name, modified)
+		} else {
+			b.dbEvent(ctx, "rotate-root-fail", req.Path, name, modified)
+		}
+	}()
+
+	config, err := b.DatabaseConfig(ctx, req.Storage, name)
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() {
+		if err == nil {
+			recordDatabaseObservation(ctx, b, req, name, ObservationTypeDatabaseRotateRootSuccess,
+				AdditionalDatabaseMetadata{key: "rotation_period", value: config.RotationPeriod.String()},
+				AdditionalDatabaseMetadata{key: "rotation_schedule", value: config.RotationSchedule})
+		} else {
+			recordDatabaseObservation(ctx, b, req, name, ObservationTypeDatabaseRotateRootFailure,
+				AdditionalDatabaseMetadata{key: "rotation_period", value: config.RotationPeriod.String()},
+				AdditionalDatabaseMetadata{key: "rotation_schedule", value: config.RotationSchedule})
+		}
+	}()
+
+	rootUsername, userOk := config.ConnectionDetails["username"].(string)
+	if !userOk || rootUsername == "" {
+		return nil, fmt.Errorf("unable to rotate root credentials: no username in configuration")
+	}
+
+	dbi, err := b.GetConnection(ctx, req.Storage, name)
+	if err != nil {
+		return nil, err
+	}
+
+	dbType, err := dbi.database.Type()
+	if err != nil {
+		return nil, fmt.Errorf("unable to determine database type: %w", err)
+	}
+
+	rootPassword, passOk := config.ConnectionDetails["password"].(string)
+	isPasswordSet := passOk && rootPassword != ""
+
+	rootPrivateKey, pkeyOk := config.ConnectionDetails["private_key"].(string)
+	isPrivateKeySet := pkeyOk && rootPrivateKey != ""
+
+	// If both are unset, return an error. If we get past this, we know at least one is set.
+	if !isPasswordSet && !isPrivateKeySet {
+		return nil, fmt.Errorf("unable to rotate root credentials: both private_key and password fields are missing from the configuration")
+	}
+
+	// If both are set, return an error.
+	if isPasswordSet && isPrivateKeySet {
+		return nil, fmt.Errorf("unable to rotate root credentials: both private_key and password fields are set in the configuration")
+	}
+
+	// Take the write lock on the instance
+	dbi.Lock()
+	defer func() {
+		dbi.Unlock()
+		// Even on error, still remove the connection
+		b.ClearConnectionId(name, dbi.id)
+	}()
+	defer func() {
+		// Close the plugin
+		dbi.closed = true
+		if err := dbi.database.Close(); err != nil {
+			b.Logger().Error("error closing the database plugin connection", "err", err)
+		}
+	}()
+
+	var walEntry *rotateRootCredentialsWAL
+	var updateReq v5.UpdateUserRequest
+	// If private key is set, use it. This takes precedence over password.
+	if isPrivateKeySet {
+		// For now snowflake is the only database type to support private key rotation.
+		if dbType == "snowflake" {
+			newKeypairCredentialConfig := map[string]interface{}{
+				"format":   "pkcs8",
+				"key_bits": 4096,
+			}
+			newPublicKey, newPrivateKey, err := b.generateNewKeypair(newKeypairCredentialConfig)
+			if err != nil {
+				return nil, err
+			}
+			oldPrivateKey := config.ConnectionDetails["private_key"].(string)
+			config.ConnectionDetails["private_key"] = string(newPrivateKey)
+			walEntry = NewRotateRootCredentialsWALPrivateKeyEntry(name, rootUsername, string(newPublicKey), string(newPrivateKey), oldPrivateKey)
+			updateReq = v5.UpdateUserRequest{
+				Username:       rootUsername,
+				CredentialType: v5.CredentialTypeRSAPrivateKey,
+				PublicKey: &v5.ChangePublicKey{
+					NewPublicKey: newPublicKey,
+					Statements: v5.Statements{
+						Commands: config.RootCredentialsRotateStatements,
+					},
+				},
+			}
+		}
+	} else {
+		// Private key isn't set so we're using the password field.
+		newPassword, err := b.generateNewPassword(ctx, nil, config.PasswordPolicy, dbi)
+		if err != nil {
+			return nil, err
+		}
+		oldPassword := config.ConnectionDetails["password"].(string)
+		config.ConnectionDetails["password"] = newPassword
+		walEntry = NewRotateRootCredentialsWALPasswordEntry(name, rootUsername, newPassword, oldPassword)
+		updateReq = v5.UpdateUserRequest{
+			Username:       rootUsername,
+			CredentialType: v5.CredentialTypePassword,
+			Password: &v5.ChangePassword{
+				NewPassword: newPassword,
+				Statements: v5.Statements{
+					Commands: config.RootCredentialsRotateStatements,
+				},
+			},
+		}
+	}
+
+	if walEntry == nil {
+		return nil, fmt.Errorf("unable to rotate root credentials: no valid credential type found")
+	}
+
+	// Write a WAL entry
+	walID, err := framework.PutWAL(ctx, req.Storage, rotateRootWALKey, walEntry)
+	if err != nil {
+		return nil, err
+	}
+
+	newConfigDetails, err := dbi.database.UpdateUser(ctx, updateReq, true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update user: %w", err)
+	}
+	if newConfigDetails != nil {
+		config.ConnectionDetails = newConfigDetails
+	}
+	modified = true
+
+	// 1.12.0 and 1.12.1 stored builtin plugins in storage, but 1.12.2 reverted
+	// that, so clean up any pre-existing stored builtin versions on write.
+	if versions.IsBuiltinVersion(config.PluginVersion) {
+		config.PluginVersion = ""
+	}
+	err = storeConfig(ctx, req.Storage, name, config)
+	if err != nil {
+		return nil, err
+	}
+
+	err = framework.DeleteWAL(ctx, req.Storage, walID)
+	if err != nil {
+		b.Logger().Warn("unable to delete WAL", "error", err, "WAL ID", walID)
+	}
+	return nil, nil
+}
+
+func (b *databaseBackend) pathRotateRoleCredentialsUpdate() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, data *framework.FieldData) (_ *logical.Response, err error) {
+		name := data.Get("name").(string)
+		modified := false
+		defer func() {
+			if err == nil {
+				b.dbEvent(ctx, "rotate", req.Path, name, modified)
+			} else {
+				b.dbEvent(ctx, "rotate-fail", req.Path, name, modified)
+			}
+		}()
+		if name == "" {
+			return logical.ErrorResponse("empty role name attribute given"), nil
+		}
+
+		role, err := b.StaticRole(ctx, req.Storage, name)
+		if err != nil {
+			return nil, err
+		}
+		if role == nil {
+			return logical.ErrorResponse("no static role found for role name"), nil
+		}
+
+		// We defer after we've found that the static role exists, otherwise it's not really fair to say
+		// that the rotation failed.
+		defer func(s *staticAccount, credType *v5.CredentialType) {
+			if err == nil {
+				recordDatabaseObservation(ctx, b, req, role.DBName, ObservationTypeDatabaseRotateStaticRoleSuccess,
+					AdditionalDatabaseMetadata{key: "role_name", value: name},
+					AdditionalDatabaseMetadata{key: "credential_type", value: credType.String()},
+					AdditionalDatabaseMetadata{key: "credential_ttl", value: s.CredentialTTL().String()},
+					AdditionalDatabaseMetadata{key: "rotation_period", value: s.RotationPeriod.String()},
+					AdditionalDatabaseMetadata{key: "rotation_schedule", value: s.RotationSchedule},
+					AdditionalDatabaseMetadata{key: "next_vault_rotation", value: s.NextVaultRotation.Format(time.RFC3339)})
+			} else {
+				recordDatabaseObservation(ctx, b, req, role.DBName, ObservationTypeDatabaseRotateStaticRoleFailure,
+					AdditionalDatabaseMetadata{key: "role_name", value: name},
+					AdditionalDatabaseMetadata{key: "credential_type", value: credType.String()})
+			}
+		}(role.StaticAccount, &role.CredentialType) // argument is evaluated now, but since it's a pointer should refer correctly to updated values
+
+		// In create/update of static accounts, we only care if the operation
+		// err'd , and this call does not return credentials
+		item, err := b.popFromRotationQueueByKey(name)
+		if err != nil {
+			item = &queue.Item{
+				Key: name,
+			}
+		}
+
+		input := &setStaticAccountInput{
+			RoleName: name,
+			Role:     role,
+		}
+		if walID, ok := item.Value.(string); ok {
+			input.WALID = walID
+		}
+		resp, err := b.setStaticAccount(ctx, req.Storage, input)
+		// if err is not nil, we need to attempt to update the priority and place
+		// this item back on the queue. The err should still be returned at the end
+		// of this method.
+		if err != nil {
+			b.logger.Error("unable to rotate credentials in rotate-role on user request", "path", req.Path, "error", err.Error())
+			// Update the priority to re-try this rotation and re-add the item to
+			// the queue
+			item.Priority = time.Now().Add(10 * time.Second).Unix()
+
+			// Preserve the WALID if it was returned
+			if resp != nil && resp.WALID != "" {
+				item.Value = resp.WALID
+			}
+		} else {
+			item.Priority = role.StaticAccount.NextRotationTimeFromInput(resp.RotationTime).Unix()
+			ttl := role.StaticAccount.CredentialTTL().Seconds()
+			b.Logger().Info("rotated credential in rotate-role on user request", "path", req.Path, "TTL", ttl)
+			// Clear any stored WAL ID as we must have successfully deleted our WAL to get here.
+			item.Value = ""
+			modified = true
+		}
+
+		// Add their rotation to the queue
+		if err := b.pushItem(item); err != nil {
+			return nil, err
+		}
+
+		if err != nil {
+			return nil, fmt.Errorf("unable to finish rotating credentials; retries will "+
+				"continue in the background but it is also safe to retry manually: %w", err)
+		}
+
+		return nil, nil
+	}
+}
+
+const pathRotateCredentialsUpdateHelpSyn = `
+Request to rotate the root credentials for a certain database connection.
+`
+
+const pathRotateCredentialsUpdateHelpDesc = `
+This path attempts to rotate the root credentials for the given database. 
+`
+
+const pathRotateRoleCredentialsUpdateHelpSyn = `
+Request to rotate the credentials for a static user account.
+`
+
+const pathRotateRoleCredentialsUpdateHelpDesc = `
+This path attempts to rotate the credentials for the given static user account.
+`

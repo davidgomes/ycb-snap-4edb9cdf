@@ -1,0 +1,56 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+{{#if (has-feature "Control Groups")}}
+  <Page::Header
+    @title="Approval workflow"
+    @description="Implement manual or automated checkpoints to require authorization before sensitive operations or accessing secrets."
+  >
+    <:breadcrumbs>
+      <Page::Breadcrumbs
+        @breadcrumbs={{array
+          (hash label="Vault" route="vault.cluster.dashboard" icon="vault")
+          (hash label="Approval workflow" route="vault.cluster.access.control-groups")
+        }}
+      />
+    </:breadcrumbs>
+
+  </Page::Header>
+  {{#if this.model.canConfigure}}
+    <Toolbar>
+      <ToolbarActions>
+        <ToolbarLink @route="vault.cluster.access.control-groups-configure">
+          Configure
+        </ToolbarLink>
+      </ToolbarActions>
+    </Toolbar>
+  {{/if}}
+  <form {{action (nav-to-route "vault.cluster.access.control-group-accessor" this.model.id) on="submit"}}>
+    <div class="box is-sideless is-fullwidth is-marginless">
+      <p class="has-text-grey is-size-8">
+        Approval workflows add additional authorization factors to be required before satisfying a request. If you have a
+        Control Group accessor, provide it here to view the lookup the authorization progress.
+      </p>
+      <label for="accessor" class="is-label">
+        Accessor
+      </label>
+      <div class="control">
+        <Input
+          aria-label="Accessor"
+          class="input"
+          autocomplete="off"
+          spellcheck="false"
+          name="accessor"
+          @value={{this.model.id}}
+        />
+      </div>
+    </div>
+    <div class="field is-grouped box is-fullwidth is-bottomless">
+      <Hds::Button @text="Lookup" type="submit" disabled={{not this.model.id}} />
+    </div>
+  </form>
+{{else}}
+  <UpgradePage @title="Approval workflow" @minimumEdition="Vault Enterprise Premium" />
+{{/if}}

@@ -1,0 +1,334 @@
+/**
+ * Copyright IBM Corp. 2016, 2025
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+import { module, test } from 'qunit';
+import { setupRenderingTest } from 'vault/tests/helpers';
+import { render } from '@ember/test-helpers';
+import { hbs } from 'ember-cli-htmlbars';
+import { setupMirage } from 'ember-cli-mirage/test-support';
+import { SECRET_ENGINE_SELECTORS as SES } from 'vault/tests/helpers/secret-engine/secret-engine-selectors';
+import { GENERAL } from 'vault/tests/helpers/general-selectors';
+
+module('Integration | Component | dashboard/overview', function (hooks) {
+  setupRenderingTest(hooks);
+  setupMirage(hooks);
+
+  hooks.beforeEach(function () {
+    this.flags = this.owner.lookup('service:flags');
+    this.namespace = this.owner.lookup('service:namespace');
+    this.permissions = this.owner.lookup('service:permissions');
+    this.store = this.owner.lookup('service:store');
+    this.version = this.owner.lookup('service:version');
+    this.isRootNamespace = true;
+    this.replication = {
+      dr: { clusterId: '123', state: 'running' },
+      performance: { clusterId: 'abc-1', state: 'running', isPrimary: true },
+    };
+    this.store.pushPayload('secret-engine', {
+      modelName: 'secret-engine',
+      data: {
+        accessor: 'kv_f3400dee',
+        path: 'kv-test/',
+        type: 'kv',
+      },
+    });
+    this.store.pushPayload('secret-engine', {
+      modelName: 'secret-engine',
+      data: {
+        accessor: 'kv_f3300dee',
+        path: 'kv-1/',
+        type: 'kv',
+      },
+    });
+    this.secretsEngines = this.store.peekAll('secret-engine', {});
+    this.vaultConfiguration = {
+      api_addr: 'http://127.0.0.1:8200',
+      default_lease_ttl: 0,
+      max_lease_ttl: 0,
+      listeners: [
+        {
+          config: {
+            address: '127.0.0.1:8200',
+            tls_disable: 1,
+          },
+          type: 'tcp',
+        },
+      ],
+    };
+    this.refreshModel = () => {};
+    this.renderComponent = async () => {
+      return render(
+        hbs`
+        <Dashboard::Overview
+          @secretsEngines={{this.secretsEngines}}
+          @vaultConfiguration={{this.vaultConfiguration}}
+          @replication={{this.replication}}
+          @version={{this.version}}
+          @isRootNamespace={{this.isRootNamespace}}
+          @refreshModel={{this.refreshModel}} 
+          @replicationUpdatedAt={{this.replicationUpdatedAt}}
+          />
+      `
+      );
+    };
+  });
+
+  test('it should show dashboard empty states in root namespace', async function (assert) {
+    this.version.version = '1.13.1';
+    this.secretsEngines = null;
+    this.replication = null;
+    this.vaultConfiguration = null;
+    await this.renderComponent();
+    assert.dom(GENERAL.hdsPageHeaderTitle).exists();
+    assert.dom(GENERAL.textDisplay('Secrets engines')).exists();
+    assert.dom(GENERAL.emptyState('secrets-engines')).exists();
+    assert.dom(GENERAL.textDisplay('Learn more')).exists();
+    assert.dom(GENERAL.textDisplay('Quick actions')).exists();
+    assert.dom(GENERAL.textDisplay('Cluster information')).doesNotExist();
+    assert.dom(GENERAL.textDisplay('Cluster replication')).doesNotExist();
+    assert.dom(GENERAL.textDisplay('Client count')).doesNotExist();
+  });
+
+  test('it renders the secrets engine card', async function (assert) {
+    assert.expect(3);
+    await this.renderComponent();
+    assert.dom(GENERAL.textDisplay('Secrets engines')).hasText('Secrets engines');
+    assert.dom(SES.secretPath('kv-1/')).exists();
+    assert.dom(SES.secretPath('kv-test/')).exists();
+  });
+
+  module('client count and replication card', function (hooks) {
+    hooks.beforeEach(function () {
+      this.version.version = '1.13.1+ent';
+      this.version.type = 'enterprise';
+    });
+
+    test('it should hide cards on community in root namespace', async function (assert) {
+      this.version.version = '1.13.1';
+      this.version.type = 'community';
+      this.server.get(
+        'sys/internal/counters/activity',
+        () => new Error('uh oh! a request was made to sys/internal/counters/activity')
+      );
+      await this.renderComponent();
+
+      assert.dom(GENERAL.hdsPageHeaderTitle).exists();
+      assert.dom(GENERAL.textDisplay('Secrets engines')).exists();
+      assert.dom(GENERAL.textDisplay('Learn more')).exists();
+      assert.dom(GENERAL.textDisplay('Quick actions')).exists();
+      assert.dom(GENERAL.textDisplay('Cluster information')).exists();
+      assert.dom(GENERAL.textDisplay('Replication')).doesNotExist();
+      assert.dom(GENERAL.textDisplay('Client count')).doesNotExist();
+    });
+
+    test('it should hide cards on enterprise if permission but not in root namespace', async function (assert) {
+      this.permissions.exactPaths = {
+        'sys/internal/counters/activity': {
+          capabilities: ['read'],
+        },
+        'sys/replication/status': {
+          capabilities: ['read'],
+        },
+      };
+      this.isRootNamespace = false;
+      await this.renderComponent();
+      assert.dom(GENERAL.textDisplay('Client count')).doesNotExist();
+      assert.dom(GENERAL.textDisplay('Replication')).doesNotExist();
+    });
+
+    test('it should show cards on enterprise if has permission and in root namespace', async function (assert) {
+      this.permissions.exactPaths = {
+        'sys/internal/counters/activity': {
+          capabilities: ['read'],
+        },
+        'sys/replication/status': {
+          capabilities: ['read'],
+        },
+      };
+      await this.renderComponent();
+      assert.dom(GENERAL.hdsPageHeaderTitle).exists();
+      assert.dom(GENERAL.textDisplay('Secrets engines')).exists();
+      assert.dom(GENERAL.textDisplay('Learn more')).exists();
+      assert.dom(GENERAL.textDisplay('Quick actions')).exists();
+      assert.dom(GENERAL.textDisplay('Cluster information')).exists();
+      assert.dom(GENERAL.textDisplay('Replication')).doesNotExist();
+      assert.dom(GENERAL.textDisplay('Client count')).exists();
+    });
+
+    test('it should show client count on enterprise in admin namespace when running a managed mode', async function (assert) {
+      this.permissions.exactPaths = {
+        'admin/sys/internal/counters/activity': {
+          capabilities: ['read'],
+        },
+        'admin/sys/replication/status': {
+          capabilities: ['read'],
+        },
+      };
+
+      this.version.type = 'enterprise';
+      this.flags.featureFlags = ['VAULT_CLOUD_ADMIN_NAMESPACE'];
+      this.namespace.path = 'admin';
+      this.isRootNamespace = false;
+
+      await this.renderComponent();
+
+      assert.dom(GENERAL.textDisplay('Client count')).exists();
+    });
+
+    test('it should hide client count on enterprise in child namespaces called "admin" when running a managed mode', async function (assert) {
+      this.permissions.exactPaths = {
+        'admin/sys/internal/counters/activity': {
+          capabilities: ['read'],
+        },
+        'admin/sys/replication/status': {
+          capabilities: ['read'],
+        },
+      };
+
+      this.version.type = 'enterprise';
+      this.flags.featureFlags = ['VAULT_CLOUD_ADMIN_NAMESPACE'];
+      this.namespace.path = 'ns1/admin';
+      this.isRootNamespace = false;
+
+      await this.renderComponent();
+
+      assert.dom(GENERAL.textDisplay('Client count')).doesNotExist();
+    });
+
+    test('it should hide client count on enterprise in any other namespace when running a managed mode', async function (assert) {
+      this.permissions.exactPaths = {
+        'sys/internal/counters/activity': {
+          capabilities: ['read'],
+        },
+        'sys/replication/status': {
+          capabilities: ['read'],
+        },
+      };
+
+      this.version.type = 'enterprise';
+      this.flags.featureFlags = ['VAULT_CLOUD_ADMIN_NAMESPACE'];
+      this.namespace.path = 'groceries';
+      this.isRootNamespace = false;
+
+      await this.renderComponent();
+
+      assert.dom(GENERAL.textDisplay('Client count')).doesNotExist();
+    });
+
+    test('it should hide client count on PKI-only Secrets clusters', async function (assert) {
+      this.permissions.exactPaths = {
+        'sys/internal/counters/activity': {
+          capabilities: ['read'],
+        },
+      };
+      this.version.features = ['PKI-only Secrets'];
+      await this.renderComponent();
+      assert.dom(GENERAL.textDisplay('Client count')).doesNotExist();
+    });
+
+    test('it should hide client count on enterprise when Consumption Billing is enabled', async function (assert) {
+      this.permissions.exactPaths = {
+        'sys/internal/counters/activity': {
+          capabilities: ['read'],
+        },
+      };
+      this.version.features = ['Consumption Billing'];
+
+      await this.renderComponent();
+      assert.dom(GENERAL.widget('client count')).doesNotExist();
+    });
+
+    test('it should hide cards on enterprise in root namespace but no permission', async function (assert) {
+      await this.renderComponent();
+      assert.dom(GENERAL.textDisplay('Client count')).doesNotExist();
+      assert.dom(GENERAL.textDisplay('Replication')).doesNotExist();
+    });
+
+    test('it should hide cards on enterprise if no permission and not in root namespace', async function (assert) {
+      this.isRootNamespace = false;
+      await this.renderComponent();
+      assert.dom(GENERAL.textDisplay('Client count')).doesNotExist();
+      assert.dom(GENERAL.textDisplay('Replication')).doesNotExist();
+    });
+
+    test('it should hide client count on enterprise in root namespace if no activity permission', async function (assert) {
+      this.permissions.exactPaths = {
+        'sys/internal/counters/activity': {
+          capabilities: ['deny'],
+        },
+        'sys/replication/status': {
+          capabilities: ['read'],
+        },
+      };
+
+      await this.renderComponent();
+
+      assert.dom(GENERAL.textDisplay('Client count')).doesNotExist();
+      assert.dom(GENERAL.textDisplay('Cluster replication')).exists();
+    });
+
+    test('it should hide replication on enterprise in root namespace if no replication status permission', async function (assert) {
+      this.permissions.exactPaths = {
+        'sys/internal/counters/activity': {
+          capabilities: ['read'],
+        },
+        'sys/replication/status': {
+          capabilities: ['deny'],
+        },
+      };
+
+      await this.renderComponent();
+      assert.dom(GENERAL.textDisplay('Client count')).exists();
+      assert.dom(GENERAL.textDisplay('Replication')).doesNotExist();
+    });
+
+    test('it should hide replication on enterprise if has permission and in root namespace but is empty', async function (assert) {
+      this.permissions.exactPaths = {
+        'sys/internal/counters/activity': {
+          capabilities: ['read'],
+        },
+        'sys/replication/status': {
+          capabilities: ['read'],
+        },
+      };
+      this.replication = {};
+      await this.renderComponent();
+      assert.dom(GENERAL.textDisplay('Client count')).exists();
+      assert.dom(GENERAL.textDisplay('Replication')).doesNotExist();
+    });
+  });
+
+  test('it shows the learn more card on community', async function (assert) {
+    this.version.version = '1.13.1';
+    this.version.type = 'community';
+    await this.renderComponent();
+
+    assert.dom(GENERAL.textDisplay('Learn more')).hasText('Learn more');
+    assert
+      .dom(GENERAL.textBody('Learn more description'))
+      .hasText(
+        'Explore the features of Vault and learn advance practices with the following tutorials and documentation.'
+      );
+    assert.dom('[data-test-learn-more-links] a').exists({ count: 3 });
+  });
+
+  test('it shows the learn more card on enterprise', async function (assert) {
+    this.version.type = 'enterprise';
+    this.version.features = [
+      'Performance Replication',
+      'DR Replication',
+      'Namespaces',
+      'Transform Secrets Engine',
+    ];
+    await this.renderComponent();
+    assert.dom(GENERAL.textDisplay('Learn more')).hasText('Learn more');
+    assert
+      .dom(GENERAL.textBody('Learn more description'))
+      .hasText(
+        'Explore the features of Vault and learn advance practices with the following tutorials and documentation.'
+      );
+    assert.dom('[data-test-learn-more-links] a').exists({ count: 4 });
+  });
+});

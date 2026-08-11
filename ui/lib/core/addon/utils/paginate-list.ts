@@ -1,0 +1,73 @@
+/**
+ * Copyright IBM Corp. 2016, 2025
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+import config from 'vault/config/environment';
+
+const { DEFAULT_PAGE_SIZE } = config.APP;
+
+export type PaginateOptions = {
+  page?: number;
+  pageSize?: number;
+  filter?: string;
+  filterKey?: string;
+};
+export type PaginatedMetadata = {
+  meta: {
+    currentPage: number;
+    lastPage: number;
+    nextPage: number;
+    prevPage: number;
+    total: number;
+    filteredTotal: number;
+    pageSize: number;
+  };
+};
+
+/**
+ * Util to paginate data set based on page number and size
+ * If filter is provided, it will filter the data prior to paginating
+ */
+
+export function paginate<T>(data: T[], options: PaginateOptions = {}) {
+  const { page = 1, pageSize = DEFAULT_PAGE_SIZE, filter, filterKey } = options;
+
+  if (Array.isArray(data)) {
+    let filteredData = filter
+      ? data.filter((item) => {
+          const filterValue = filterKey ? (item as Record<string, unknown>)[filterKey] : item;
+          if (typeof filterValue === 'string') {
+            return filterValue.toLowerCase().includes(filter.toLowerCase());
+          }
+          return false;
+        })
+      : [...data];
+
+    const filteredTotal = filteredData.length;
+    const lastPage = Math.ceil(filteredTotal / pageSize);
+    // Verify that the page number does not go out of bounds, if so adjust to show
+    // the first page of results
+    const currentPage = page > lastPage ? 1 : page;
+    const start = (currentPage - 1) * pageSize;
+    const end = start + pageSize;
+    filteredData = filteredData.slice(start, end);
+    // add meta data previously from lazyPaginatedQuery since components expect it
+    Object.defineProperty(filteredData, 'meta', {
+      value: {
+        currentPage,
+        lastPage,
+        nextPage: page + 1,
+        prevPage: page - 1,
+        total: data.length,
+        filteredTotal,
+        pageSize,
+      },
+      writable: false,
+    });
+
+    return filteredData as T[] & PaginatedMetadata;
+  }
+
+  return data;
+}

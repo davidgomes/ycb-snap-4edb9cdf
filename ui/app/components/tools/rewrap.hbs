@@ -1,0 +1,57 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Page::Header
+  @title="Rewrap token"
+  @description="Migrate a wrapped secret to a new token to extend its lifetime without exposing the underlying secret data."
+>
+  <:breadcrumbs>
+    <Page::Breadcrumbs @breadcrumbs={{this.breadcrumbs}} />
+  </:breadcrumbs>
+</Page::Header>
+
+{{#if this.rewrappedToken}}
+  <div class="box is-fullwidth is-marginless">
+    <div class="field">
+      <label class="is-label">Rewrapped token</label>
+      <Hds::Copy::Snippet
+        @textToCopy={{this.rewrappedToken}}
+        @color="secondary"
+        data-test-tools-input="rewrapped-token"
+        @onError={{fn (set-flash-message "Clipboard copy failed. The Clipboard API requires a secure context." "danger")}}
+      />
+    </div>
+  </div>
+  <div class="field is-grouped box is-fullwidth is-bottomless">
+    <Hds::Button @text="Done" @color="secondary" {{on "click" this.reset}} data-test-button="Done" />
+  </div>
+{{else}}
+  <form {{on "submit" this.handleSubmit}}>
+    <div class="box is-fullwidth is-marginless">
+      <NamespaceReminder @mode="perform" @noun="rewrap" />
+      <MessageError @errorMessage={{this.errorMessage}} />
+      <div class="field">
+        <label for="token" class="is-label">Wrapped token</label>
+        <div class="has-text-grey is-size-8 has-bottom-margin-xs">
+          Enter your wrapped token here to rewrap it and refresh its TTL.
+        </div>
+        <div class="control">
+          <Input
+            @value={{this.originalToken}}
+            class="input"
+            id="token"
+            name="token"
+            data-test-tools-input="original-token"
+          />
+        </div>
+      </div>
+    </div>
+    <div class="field is-grouped box is-fullwidth is-bottomless">
+      <div class="control">
+        <Hds::Button @text="Rewrap token" type="submit" data-test-submit />
+      </div>
+    </div>
+  </form>
+{{/if}}

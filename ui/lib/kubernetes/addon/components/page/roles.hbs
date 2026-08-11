@@ -1,0 +1,86 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<KubernetesHeader
+  @model={{@secretsEngine}}
+  @filterRoles={{not @promptConfig}}
+  @query={{this.query}}
+  @breadcrumbs={{@breadcrumbs}}
+  @handleSearch={{this.handleSearch}}
+  @handleInput={{this.handleInput}}
+  @handleKeyDown={{this.handleKeyDown}}
+>
+  {{#unless @promptConfig}}
+    <ToolbarLink @route="roles.create" @type="add" data-test-toolbar-roles-action>
+      Create role
+    </ToolbarLink>
+  {{/unless}}
+</KubernetesHeader>
+
+{{#if @promptConfig}}
+  <ConfigCta />
+{{else if (not @roles)}}
+  {{#if @filterValue}}
+    <Hds::ApplicationState class="top-padding-32 is-marginless" as |A|>
+      <A.Header
+        @title="There are no roles matching &quot;{{@filterValue}}&quot;"
+        @titleTag="h2"
+        data-test-empty-state-title
+      />
+    </Hds::ApplicationState>
+  {{else}}
+    <Hds::ApplicationState class="top-padding-32 is-marginless" as |A|>
+      <A.Header @title="No roles yet" @titleTag="h2" data-test-empty-state-title />
+      <A.Body
+        @text="When created, roles will be listed here. Create a role to start generating service account tokens."
+        data-test-empty-state-message
+      />
+    </Hds::ApplicationState>
+  {{/if}}
+{{else}}
+  <div class="has-bottom-margin-s">
+    {{#each @roles as |role|}}
+      <ListItem @linkPrefix={{this.mountPoint}} @linkParams={{array "roles.role.details" role}} as |Item|>
+        <Item.content>
+          <Icon @name="user" />
+          <span data-test-role={{role}}>{{role}}</span>
+        </Item.content>
+        <Item.menu>
+          {{#let (hash backend=this.secretMountPath.currentPath name=role) as |params|}}
+            {{#if (has-capability @capabilities "read" "update" "delete" pathKey="kubernetesRole" params=params)}}
+              <Hds::Dropdown @isInline={{true}} @listPosition="bottom-right" as |dd|>
+                <dd.ToggleIcon
+                  @icon="more-horizontal"
+                  @text="More options"
+                  @hasChevron={{false}}
+                  data-test-popup-menu-trigger
+                />
+                {{#if (has-capability @capabilities "read" pathKey="kubernetesRole" params=params)}}
+                  <dd.Interactive @route="roles.role.details" @model={{role}} data-test-details>Details</dd.Interactive>
+                {{/if}}
+                {{#if (has-capability @capabilities "update" pathKey="kubernetesRole" params=params)}}
+                  <dd.Interactive data-test-edit @route="roles.role.edit" @model={{role}}>Edit</dd.Interactive>
+                {{/if}}
+                {{#if (has-capability @capabilities "delete" pathKey="kubernetesRole" params=params)}}
+                  <dd.Interactive data-test-delete @color="critical" {{on "click" (fn (mut this.roleToDelete) role)}}>
+                    Delete
+                  </dd.Interactive>
+                {{/if}}
+              </Hds::Dropdown>
+            {{/if}}
+          {{/let}}
+        </Item.menu>
+      </ListItem>
+    {{/each}}
+    {{#if this.roleToDelete}}
+      <ConfirmModal
+        @color="critical"
+        @confirmMessage="Deleting this role means that you’ll need to recreate it in order to generate credentials again."
+        @onConfirm={{fn this.onDelete this.roleToDelete}}
+        @onClose={{fn (mut this.roleToDelete) null}}
+      />
+    {{/if}}
+  </div>
+{{/if}}

@@ -1,0 +1,24 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<form {{on "submit" (perform @onSubmit)}}>
+  <div class="box is-sideless is-fullwidth is-marginless">
+    <NamespaceReminder @mode={{"create"}} @noun="TOTP key" />
+    <FormFieldGroups @model={{@form}} @groupName="formFieldGroups" @modelValidations={{@modelValidations}} />
+  </div>
+  <Hds::ButtonSet class="has-top-bottom-margin-12">
+    <Hds::Button @text="Create key" type="submit" data-test-submit />
+    <Hds::Button
+      @text="Cancel"
+      @color="secondary"
+      @route="vault.cluster.secrets.backend.list-root"
+      @model={{@form.data.backend}}
+      @query={{hash tab="key"}}
+    />
+  </Hds::ButtonSet>
+  {{#if @invalidFormAlert}}
+    <AlertInline @type="danger" class="has-top-padding-s" @message={{@invalidFormAlert}} />
+  {{/if}}
+</form>

@@ -1,0 +1,16 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Page::Header @icon="file-text" @title="Sign Intermediate">
+  <:breadcrumbs>
+    <Page::Breadcrumbs @breadcrumbs={{this.breadcrumbs}} />
+  </:breadcrumbs>
+</Page::Header>
+
+<PkiSignIntermediateForm
+  @form={{this.model.form}}
+  @issuerRef={{this.model.issuerRef}}
+  @onCancel={{transition-to "vault.cluster.secrets.backend.pki.issuers.issuer.details" model=this.model.issuerRef}}
+/>

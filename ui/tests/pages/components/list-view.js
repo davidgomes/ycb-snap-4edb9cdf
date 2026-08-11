@@ -1,0 +1,23 @@
+/**
+ * Copyright IBM Corp. 2016, 2025
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+import { text, isPresent, collection, clickable } from 'ember-cli-page-object';
+import { GENERAL } from 'vault/tests/helpers/general-selectors';
+
+export default {
+  isEmpty: isPresent(GENERAL.emptyStateTitle),
+  listItemLinks: collection('[data-test-list-item-link]', {
+    text: text(),
+    click: clickable(),
+    menuToggle: clickable('[data-test-popup-menu-trigger]'),
+  }),
+  listItems: collection('[data-test-list-item]', {
+    text: text(),
+    menuToggle: clickable('[data-test-popup-menu-trigger]'),
+  }),
+  menuItems: collection('.ember-basic-dropdown-content li', {
+    testContainer: '#ember-testing',
+  }),
+};

@@ -1,0 +1,37 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Page::Header @title="Multi-factor authentication">
+  <:breadcrumbs>
+    <Page::Breadcrumbs @breadcrumbs={{this.breadcrumbs}} />
+  </:breadcrumbs>
+  <:description>
+    Enforce a secondary layer of identity verification (such as TOTP, Okta, or Duo) during the login process.
+    <Hds::Link::Inline @isHrefExternal={{true}} @href={{doc-link "/vault/gui/login-mfa"}}>
+      Learn more
+    </Hds::Link::Inline>
+  </:description>
+</Page::Header>
+
+<Mfa::Nav />
+
+<Toolbar>
+  <ToolbarActions>
+    <ToolbarLink @route="vault.cluster.access.mfa.methods.create" @type="add" data-test-mfa-method-create>
+      New MFA method
+    </ToolbarLink>
+  </ToolbarActions>
+</Toolbar>
+
+{{#if (gt this.model.methods.length 0)}}
+  {{#each this.model.methods as |item|}}
+    <Mfa::MethodListItem @model={{item}} />
+  {{/each}}
+{{else}}
+  <Hds::ApplicationState class="top-padding-32 is-marginless" as |A|>
+    <A.Header @title="No methods found." @titleTag="h2" data-test-empty-state-title />
+    <A.Body @text="Add a new one to get started." data-test-empty-state-message />
+  </Hds::ApplicationState>
+{{/if}}

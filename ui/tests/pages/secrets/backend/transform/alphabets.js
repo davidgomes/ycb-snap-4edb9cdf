@@ -1,0 +1,17 @@
+/**
+ * Copyright IBM Corp. 2016, 2025
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+import { create, clickable, fillable, visitable } from 'ember-cli-page-object';
+import ListView from 'vault/tests/pages/components/list-view';
+
+export default create({
+  ...ListView,
+  visit: visitable('/vault/secrets-engines/:backend/list?tab=alphabet'),
+  visitCreate: visitable('/vault/secrets-engines/:backend/create?itemType=alphabet'),
+  editLink: clickable('[data-test-edit-link]'),
+  name: fillable('[data-test-input="name"]'),
+  alphabet: fillable('[data-test-input="alphabet"'),
+  submit: clickable('[data-test-alphabet-transform-create]'),
+});

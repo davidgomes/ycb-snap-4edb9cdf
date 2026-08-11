@@ -1,0 +1,25 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+{{#each-in @model.metadata as |key value|}}
+  <div class="info-table-row is-mobile">
+    <div class="is-flex is-fullwidth">
+      <div class="column is-one-quarter">
+        <span class="is-label has-text-grey-dark">
+          {{key}}
+        </span>
+      </div>
+      <div class="column is-flex">
+        {{value}}
+      </div>
+      <div class="column has-text-right">
+      </div>
+    </div>
+  </div>
+{{else}}
+  <Hds::ApplicationState class="top-padding-32 is-marginless" as |A|>
+    <A.Header data-test-empty-state-title @title="No metadata associated with {{@model.name}} yet" @titleTag="h2" />
+  </Hds::ApplicationState>
+{{/each-in}}

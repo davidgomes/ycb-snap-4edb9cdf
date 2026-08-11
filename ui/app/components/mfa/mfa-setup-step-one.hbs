@@ -1,0 +1,44 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Mfa::SplashCard @header={{@header}} @description={{@description}} data-test-step-one>
+
+  <:alerts>
+    <MessageError @errorMessage={{this.error}} />
+  </:alerts>
+
+  <:additionalContent>
+    <form id="mfa-setup-step-one" {{on "submit" this.verifyUUID}}>
+      <label class="is-label">
+        Method ID
+      </label>
+
+      <p class="sub-text">Enter the UUID for your multi-factor authentication method. This can be provided to you by your
+        administrator.</p>
+      <Input
+        id="uuid"
+        name="uuid"
+        class="input"
+        autocomplete="off"
+        spellcheck="false"
+        @value={{this.UUID}}
+        data-test-input="uuid"
+      />
+    </form>
+  </:additionalContent>
+
+  <:actions>
+    <Hds::Button
+      @text="Verify"
+      id="continue"
+      type="submit"
+      form="mfa-setup-step-one"
+      disabled={{is-empty-value this.UUID}}
+      data-test-verify
+    />
+    <Hds::Button @text="Cancel" @color="secondary" id="cancel" {{on "click" this.redirectPreviousPage}} />
+  </:actions>
+
+</Mfa::SplashCard>

@@ -1,0 +1,31 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+{{#if (has-feature "Control Groups")}}
+  <Page::Header @title="Approval workflow">
+    <:breadcrumbs>
+      <Page::Breadcrumbs
+        @breadcrumbs={{array
+          (hash label="Vault" route="vault.cluster.dashboard" icon="vault")
+          (hash label="Approval workflow" route="vault.cluster.access.control-groups")
+          (hash label="Accessor")
+        }}
+      />
+    </:breadcrumbs>
+  </Page::Header>
+
+  {{#if this.model.canConfigure}}
+    <Toolbar>
+      <ToolbarActions>
+        <ToolbarLink @route="vault.cluster.access.control-groups-configure">
+          Configure
+        </ToolbarLink>
+      </ToolbarActions>
+    </Toolbar>
+  {{/if}}
+  <ControlGroup @model={{this.model}} />
+{{else}}
+  <UpgradePage @title="Control Groups" @minimumEdition="Vault Enterprise Premium" />
+{{/if}}

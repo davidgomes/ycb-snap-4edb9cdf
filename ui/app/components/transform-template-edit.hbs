@@ -1,0 +1,124 @@
+{{!
+  Copyright IBM Corp. 2016, 2026
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Page::Header @title={{this.title}} @subtitle={{this.subtitle}}>
+  <:breadcrumbs>
+    <Page::Breadcrumbs @breadcrumbs={{this.breadcrumbs}} />
+  </:breadcrumbs>
+</Page::Header>
+
+{{#if (eq @mode "show")}}
+  <Toolbar>
+    <ToolbarActions>
+      {{#if @capabilities.canDelete}}
+        <Hds::Button
+          @text="Delete template"
+          @color="secondary"
+          class="toolbar-button"
+          data-test-delete
+          {{on "click" this.onDelete}}
+        />
+        <div class="toolbar-separator"></div>
+      {{/if}}
+      {{#if @capabilities.canUpdate}}
+        <ToolbarSecretLink
+          @secret={{concat "template/" @form.data.name}}
+          @backend={{@form.data.backend}}
+          @mode="edit"
+          @replace={{true}}
+          data-test-edit-link
+        >
+          Edit template
+        </ToolbarSecretLink>
+      {{/if}}
+    </ToolbarActions>
+  </Toolbar>
+{{/if}}
+
+{{#if (or (eq @mode "edit") (eq @mode "create"))}}
+  <form onsubmit={{this.createOrUpdate}}>
+    <div class="box is-sideless is-fullwidth is-marginless">
+      <NamespaceReminder @mode={{@mode}} @noun="transform template" />
+      <MessageError @errorMessage={{this.errorMessage}} />
+      {{#each @form.formFields as |field|}}
+        {{#if (and (not-eq field.name "encode_format") (not-eq field.name "decode_formats"))}}
+          {{#if (eq field.name "alphabet")}}
+            <TransformAdvancedTemplating @model={{@form}} />
+            <div class="form-section">
+              <SearchSelect
+                @id="alphabet"
+                @label={{field.options.label}}
+                @labelClass="title is-4"
+                @subText={{field.options.subText}}
+                @options={{this.alphabets}}
+                @inputValue={{@form.data.alphabet}}
+                @onChange={{fn (mut @form.alphabet)}}
+                @fallbackComponent="string-list"
+                @selectLimit={{1}}
+                data-test-field
+              />
+            </div>
+          {{else}}
+            <FormField
+              data-test-field
+              @attr={{field}}
+              @model={{@form}}
+              @mode={{@mode}}
+              @modelValidations={{this.modelValidations}}
+            />
+          {{/if}}
+        {{/if}}
+      {{/each}}
+    </div>
+    <div class="field is-grouped-split box is-fullwidth is-bottomless">
+      <Hds::ButtonSet>
+        <Hds::Button @text={{if (eq @mode "create") "Create template" "Save"}} type="submit" data-test-submit />
+        {{#if (eq @mode "create")}}
+          <Hds::Button
+            @text="Cancel"
+            @color="secondary"
+            @route="vault.cluster.secrets.backend.list-root"
+            @model={{@form.data.backend}}
+            @query={{hash tab="template"}}
+          />
+        {{else}}
+          <Hds::Button
+            @text="Cancel"
+            @color="secondary"
+            @route="vault.cluster.secrets.backend.show"
+            @models={{array @form.data.backend (concat "template/" @form.data.name)}}
+          />
+        {{/if}}
+      </Hds::ButtonSet>
+    </div>
+  </form>
+{{else}}
+  <div class="box is-fullwidth is-sideless is-paddingless is-marginless">
+    {{#each @form.formFields as |field|}}
+      {{#let (capitalize (or field.options.label (humanize (dasherize field.name)))) as |label|}}
+        {{#if (eq field.name "decode_formats")}}
+          {{#if (not (is-empty-value (get @form.data field.name)))}}
+            <InfoTableRow @label={{label}}>
+              <div>
+                {{#each-in (get @form.data field.name) as |key value|}}
+                  <div class="transform-decode-formats">
+                    <p class="is-label has-text-grey-light">{{key}}</p>
+                    <p>{{value}}</p>
+                  </div>
+                {{/each-in}}
+              </div>
+            </InfoTableRow>
+          {{/if}}
+        {{else}}
+          <InfoTableRow
+            @label={{label}}
+            @value={{get @form.data field.name}}
+            class={{if (eq field.name "pattern") "transform-pattern-text"}}
+          />
+        {{/if}}
+      {{/let}}
+    {{/each}}
+  </div>
+{{/if}}

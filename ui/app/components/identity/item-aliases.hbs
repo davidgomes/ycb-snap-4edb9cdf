@@ -1,0 +1,39 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+{{#each (if @model.alias.id (array @model.alias) @model.aliases) as |item|}}
+  <LinkedBlock @params={{array "vault.cluster.access.identity.aliases.show" item.id "details"}} class="list-item-row">
+    <div class="columns is-mobile">
+      <div class="column is-10">
+        <LinkTo
+          @route="vault.cluster.access.identity.aliases.show"
+          @models={{array item.id "details"}}
+          class="has-text-black has-text-weight-semibold"
+        >
+          <Icon @name="user" class="has-text-grey-light" />
+          <span class="has-text-weight-semibold">{{item.name}}</span>
+        </LinkTo>
+        <div class="has-text-grey">
+          {{item.id}}
+        </div>
+        <Hds::Badge @text={{item.mount_type}} />
+        <span class="has-text-grey is-size-8">
+          {{item.mount_accessor}}
+        </span>
+      </div>
+      <div class="column has-text-right">
+        <Identity::PopupAlias @item={{item}} />
+      </div>
+    </div>
+  </LinkedBlock>
+{{else}}
+  <Hds::ApplicationState class="top-padding-32 is-marginless" as |A|>
+    <A.Header
+      data-test-empty-state-title
+      @title="No {{@model.identityType}} aliases for {{@model.name}} yet"
+      @titleTag="h2"
+    />
+  </Hds::ApplicationState>
+{{/each}}

@@ -1,0 +1,79 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+{{#if (and this.licenseExpired (not this.expiredDismissed))}}
+  <Hds::Alert
+    @type="inline"
+    @color="critical"
+    @onDismiss={{fn this.dismissBanner this.banners.EXPIRED}}
+    data-test-license-banner={{this.banners.EXPIRED}}
+    as |A|
+  >
+    <A.Title>License expired</A.Title>
+    <A.Description>
+      Your Vault license expired on
+      {{date-format @expiry "MMM d, yyyy"}}. Add a new license to your configuration and restart Vault.
+    </A.Description>
+    <A.Description class="has-top-margin-xs">
+      <Hds::Link::Standalone
+        @icon="learn-link"
+        @iconPosition="trailing"
+        @href={{doc-link "/vault/tutorials/enterprise/hashicorp-enterprise-license"}}
+        @text="Read documentation"
+      />
+    </A.Description>
+  </Hds::Alert>
+{{else if (and (lte this.licenseExpiringInDays 30) (not this.warningDismissed))}}
+  <Hds::Alert
+    @type="inline"
+    @color="warning"
+    @onDismiss={{fn this.dismissBanner this.banners.WARNING}}
+    data-test-license-banner={{this.banners.WARNING}}
+    as |A|
+  >
+    <A.Title>Vault license expiring</A.Title>
+    <A.Description>
+      Your Vault license will expire in
+      {{this.licenseExpiringInDays}}
+      days at
+      {{date-format @expiry "hh:mm:ss a"}}
+      on
+      {{date-format @expiry "MMM d, yyyy"}}.
+      {{if
+        @autoloaded
+        "Add a new license to your configuration."
+        "Keep in mind that your next license will need to be autoloaded."
+      }}
+    </A.Description>
+    <A.Description class="has-top-margin-xs">
+      <Hds::Link::Standalone
+        @icon="learn-link"
+        @iconPosition="trailing"
+        @href={{doc-link "/vault/tutorials/enterprise/hashicorp-enterprise-license"}}
+        @text="Read documentation"
+      />
+    </A.Description>
+  </Hds::Alert>
+{{/if}}
+
+{{#if (and this.isPKIOnly (not this.infoDismissed))}}
+  <Hds::Alert
+    @type="inline"
+    @color="highlight"
+    @onDismiss={{fn this.dismissBanner this.banners.PKI}}
+    data-test-license-banner={{this.banners.PKI}}
+    as |A|
+  >
+    <A.Title>Cluster operating in PKI-only mode</A.Title>
+    <A.Description>
+      This cluster is operating under PKI-only mode. Other than the built-in Vault PKI engine, all secrets engines are
+      disabled. The
+      <Hds::Link::Inline @isHrefExternal={{true}} @href={{doc-link "/vault/api-docs/system/billing/certificates"}}>
+        number of certificates
+      </Hds::Link::Inline>
+      issued is the relevant license utilization metric.
+    </A.Description>
+  </Hds::Alert>
+{{/if}}

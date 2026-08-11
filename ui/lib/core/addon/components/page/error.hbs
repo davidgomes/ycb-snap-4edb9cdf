@@ -1,0 +1,58 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<div class="flex is-flex-grow-1" data-test-page-error {{did-update this.unpackError @error}}>
+  {{! Full page errors should be vertically and horizontally centered on the page with text @align="center" }}
+  {{! Otherwise text alignment should be "left" and top-padding: 32px }}
+  <Hds::ApplicationState
+    class={{if @isFullPage "align-self-center" "top-padding-32 is-marginless"}}
+    @align={{if @isFullPage "center" "left"}}
+    as |AppState|
+  >
+    {{#if (has-block "media")}}
+      <AppState.Media>{{yield to="media"}}</AppState.Media>
+    {{/if}}
+
+    <AppState.Header
+      @errorCode={{this.errorCode}}
+      {{! When there is no error code the icon renders below the title and looks awkward }}
+      @icon={{if this.errorCode this.statusDefaults.icon}}
+      @title={{this.statusDefaults.title}}
+      @titleTag={{or @titleTag (if @isFullPage "h1" "div")}}
+      data-test-page-error-title={{this.errorCode}}
+    />
+
+    {{#if this.shouldRenderUrl}}
+      <AppState.Body data-test-page-error-message>
+        {{this.message}}
+        <Hds::Text::Code class="code-in-text">{{this.displayUrl}}</Hds::Text::Code>.
+      </AppState.Body>
+    {{else}}
+      {{#if this.message}}
+        <AppState.Body data-test-page-error-message @text={{this.message}} />
+      {{/if}}
+
+      {{#each this.error.errors as |error index|}}
+        <AppState.Body data-test-page-error-details={{index}} @text={{error}} />
+      {{/each}}
+    {{/if}}
+
+    {{#if (has-block "customFooter")}}
+      {{yield AppState to="customFooter"}}
+    {{else if @isFullPage}}
+      <AppState.Body @text="Double check the URL or return to the dashboard." />
+      <AppState.Footer as |F|>
+        <F.LinkStandalone
+          @icon="arrow-right"
+          @iconPosition="trailing"
+          @text="Go to dashboard"
+          {{! Navigate to the root URL so the app refreshes }}
+          @href="/"
+          @isHrefExternal={{false}}
+        />
+      </AppState.Footer>
+    {{/if}}
+  </Hds::ApplicationState>
+</div>

@@ -1,0 +1,43 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<section class="section">
+  <div class="centered-container is-widescreen">
+    <ReplicationPage @model={{this.model}} as |Page|>
+      <Page.header @showTabs={{true}} />
+      {{#if Page.isDisabled}}
+        <Hds::ApplicationState class="top-padding-32 is-marginless" as |A|>
+          <A.Header
+            @title="Disaster Recovery secondary not set up"
+            @titleTag="h2"
+            @icon="alert-circle"
+            data-test-empty-state-title
+          />
+          <A.Body @text={{Page.message}} data-test-empty-state-message />
+          <A.Footer data-test-empty-state-actions as |F|>
+            <F.LinkStandalone @icon="chevron-left" @text="Go back" @route="vault.cluster.secrets.backends" />
+            <F.LinkStandalone
+              @icon="learn-link"
+              @iconPosition="trailing"
+              @color="secondary"
+              @text="Disaster recovery tutorial"
+              @href={{doc-link "/vault/tutorials/enterprise/disaster-recovery"}}
+            />
+          </A.Footer>
+        </Hds::ApplicationState>
+      {{else}}
+        <Page.dashboard
+          {{! passing in component to render so that the yielded components are flexible based on the dashboard }}
+          @componentToRender="replication-secondary-card"
+          as |Dashboard|
+        >
+          <Dashboard.card @title="Status" />
+          <Dashboard.card @title="Primary cluster" />
+          <Dashboard.rows />
+        </Page.dashboard>
+      {{/if}}
+    </ReplicationPage>
+  </div>
+</section>

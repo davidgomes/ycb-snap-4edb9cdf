@@ -1,0 +1,10 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Oidc::ScopeForm
+  @form={{this.model}}
+  @onCancel={{transition-to "vault.cluster.access.oidc.scopes"}}
+  @onSave={{transition-to "vault.cluster.access.oidc.scopes.scope.details" this.model.data.name}}
+/>

@@ -1,0 +1,42 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<form {{on "submit" (perform this.onSubmit)}}>
+  <div class="box is-sideless is-fullwidth is-marginless">
+    <MessageError @model={{@form}} @errorMessage={{this.errorMessage}} />
+    <NamespaceReminder @mode="save" @noun="Auth Method" />
+
+    {{#each @form.tuneFields as |field|}}
+      <FormField data-test-field @attr={{field}} @model={{@form}} />
+      {{#if (and (eq field.name "config.listing_visibility") this.directLoginLink)}}
+        <div class="has-top-margin-negative-s has-bottom-margin-l is-flex-center">
+          <Hds::Text::Body @tag="p" @color="faint">UI login link:</Hds::Text::Body>
+          <Hds::Copy::Snippet @textToCopy={{this.directLoginLink}} />
+        </div>
+      {{/if}}
+    {{/each}}
+
+    {{#if this.supportsUserLockoutConfig}}
+      <hr class="has-top-margin-xl has-bottom-margin-l has-background-gray-200" />
+      <Hds::Text::Display @tag="h2" @size="400" @weight="bold" data-test-user-lockout-section>User lockout configuration</Hds::Text::Display>
+      <Hds::Text::Body @tag="p" @size="100" @color="faint" class="has-bottom-margin-m">
+        Specifies the user lockout settings for this auth mount.
+      </Hds::Text::Body>
+      {{#each @form.userLockoutConfigFields as |field|}}
+        <FormField @attr={{field}} @model={{@form}} />
+      {{/each}}
+    {{/if}}
+  </div>
+
+  <div class="field is-grouped box is-fullwidth is-bottomless">
+    <Hds::Button
+      @text="Update options"
+      @icon={{if this.onSubmit.isRunning "loading"}}
+      type="submit"
+      disabled={{this.onSubmit.isRunning}}
+      data-test-submit
+    />
+  </div>
+</form>

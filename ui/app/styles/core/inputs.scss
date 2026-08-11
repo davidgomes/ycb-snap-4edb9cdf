@@ -1,0 +1,89 @@
+@use '../utils/box-shadow_variables';
+@use '../utils/mixins';
+@use '../utils/size_variables';
+
+/**
+ * Copyright IBM Corp. 2016, 2025
+ * SPDX-License-Identifier: BUSL-1.1
+ */
+
+// This file defines the styles for .input, .textarea and .input-hint.
+
+.input,
+.textarea {
+  align-items: center;
+  border-radius: var(--token-border-radius-x-small);
+  border: box-shadow_variables.$base-border;
+  box-shadow: 0 4px 1px rgba(hsl(0, 0%, 4%), 0.06) inset;
+  color: var(--token-color-foreground-faint);
+  display: inline-flex;
+  font-size: var(--token-typography-body-300-font-size);
+  height: size_variables.$size-2;
+  line-height: var(--token-typography-body-300-line-height);
+  max-width: 100%;
+  padding-bottom: calc(0.375em - 1px);
+  padding-left: size_variables.$spacing-12;
+  padding-right: size_variables.$spacing-12;
+  padding-top: calc(0.375em - 1px);
+  width: 100%;
+
+  &:focus,
+  &:active,
+  &.is-active,
+  &:focus-visible {
+    outline: none;
+    background-color: hsl(0, 0%, 100%);
+    border-color: var(--token-color-palette-blue-200) !important;
+    box-shadow: 0 0 0 0.125em rgba(21, 99, 255, 0.25);
+  }
+
+  &:hover {
+    border-color: var(--token-color-palette-neutral-300);
+  }
+
+  @include mixins.until(size_variables.$desktop) {
+    font-size: var(--token-typography-body-300-font-size);
+  }
+
+  &::placeholder {
+    opacity: 0.5;
+  }
+}
+
+.input[disabled],
+.textarea[disabled] {
+  border-color: var(--token-color-palette-neutral-300);
+  background-color: var(--token-color-palette-neutral-100);
+  color: var(--token-color-foreground-disabled);
+  cursor: not-allowed;
+
+  &:hover {
+    border-color: var(--token-color-palette-neutral-300);
+  }
+}
+
+.input[readonly],
+.textarea[readonly] {
+  border: none;
+  box-shadow: none;
+  cursor: not-allowed;
+}
+
+// textarea specific css
+.textarea {
+  min-width: 100%;
+  padding-bottom: 0.625em;
+  padding-top: 0.625em;
+}
+
+.textarea:not([rows]) {
+  max-height: 600px;
+  min-height: 120px;
+}
+
+// custom input
+.input-hint {
+  padding: 0 size_variables.$spacing-10;
+  font-size: var(--token-typography-body-200-font-size);
+  color: var(--token-color-foreground-faint);
+}

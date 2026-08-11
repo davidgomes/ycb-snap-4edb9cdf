@@ -1,0 +1,58 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Toolbar>
+  <ToolbarActions>
+    {{#if @canDelete}}
+      <ConfirmAction
+        class="toolbar-button"
+        @buttonColor="secondary"
+        @onConfirmAction={{this.deleteKey}}
+        @confirmTitle="Delete key?"
+        @buttonText="Delete"
+        data-test-pki-key-delete
+      />
+      <div class="toolbar-separator"></div>
+    {{/if}}
+    {{#if @key.private_key}}
+      <DownloadButton
+        class="toolbar-button"
+        @color="secondary"
+        @filename="{{this.backend}}-{{or @key.key_name 'private-key'}}"
+        @data={{@key.private_key}}
+        @extension="pem"
+        @text="Download private key"
+      />
+    {{/if}}
+    {{#if @canEdit}}
+      <ToolbarLink @route="keys.key.edit" @models={{array this.backend @key.key_id}} data-test-pki-key-edit>
+        Edit key
+      </ToolbarLink>
+    {{/if}}
+  </ToolbarActions>
+</Toolbar>
+
+<div class="box is-fullwidth is-sideless is-paddingless is-marginless">
+  {{#if @key.private_key}}
+    <div class="has-top-margin-m">
+      <Hds::Alert data-test-pki-key-next-steps @type="inline" @color="highlight" class="has-bottom-margin-s" as |A|>
+        <A.Title>Next steps</A.Title>
+        <A.Description>This private key material will only be available once. Copy or download it now.</A.Description>
+      </Hds::Alert>
+    </div>
+  {{/if}}
+  {{#each this.displayFields as |field|}}
+    <InfoTableRow
+      @label={{if (eq field "key_id") "Key ID" (capitalize (humanize field))}}
+      @value={{get @key field}}
+      @addCopyButton={{eq field "key_id"}}
+    />
+  {{/each}}
+  {{#if @key.private_key}}
+    <InfoTableRow @label="Private key">
+      <EncodedDataCard @data={{@key.private_key}} />
+    </InfoTableRow>
+  {{/if}}
+</div>

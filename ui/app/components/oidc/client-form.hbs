@@ -1,0 +1,112 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Page::Header @title="{{if @form.isNew 'Create' 'Edit'}} Application">
+  <:breadcrumbs>
+    <Page::Breadcrumbs @breadcrumbs={{this.breadcrumbs}} />
+  </:breadcrumbs>
+</Page::Header>
+
+<form {{on "submit" (perform this.save)}}>
+  <div class="box is-sideless is-fullwidth is-bottomless">
+    <MessageError @errorMessage={{this.errorBanner}} />
+    <FormFieldGroups @model={{@form}} @groupName="formFieldGroups" @modelValidations={{this.modelValidations}}>
+      {{! keys are fetched in route and passed into select component }}
+      <SearchSelect
+        @id="oidc-client-form-key-select"
+        @options={{@keys}}
+        @selectLimit="1"
+        @disallowNewItems={{true}}
+        @fallbackComponent="input-search"
+        @onChange={{this.onKeyChange}}
+        @inputValue={{if @form.data.key (array @form.data.key)}}
+        @disabled={{not @form.isNew}}
+        class="is-marginless"
+        data-test-search-select="keys"
+      />
+    </FormFieldGroups>
+  </div>
+  {{! RADIO CARD + SEARCH SELECT }}
+  <div class="box is-sideless is-fullwidth is-marginless has-top-padding-xxl">
+    <Hds::Text::Display @tag="h2" @size="400">Assign access</Hds::Text::Display>
+    <div class="is-flex-row">
+      <RadioCard
+        data-test-oidc-radio="allow-all"
+        @title="Allow everyone to access existing"
+        @description="All Vault entities can authenticate through this application."
+        @icon="org"
+        @value="allow_all"
+        @groupValue={{this.radioCardGroupValue}}
+        @onChange={{this.handleAssignmentSelection}}
+      />
+      <RadioCard
+        data-test-oidc-radio="limited"
+        @title="Limit access to selected users"
+        @description="Choose or create an assignment to give access to selected entities."
+        @icon="users"
+        @value="limited"
+        @groupValue={{this.radioCardGroupValue}}
+        @onChange={{this.handleAssignmentSelection}}
+      />
+    </div>
+    {{#if (eq this.radioCardGroupValue "limited")}}
+      <SearchSelect
+        @id="oidc-client-form-assignments-select"
+        @label="Assignment name"
+        @subText="Search for an existing assignment, or type a new name to create it."
+        @options={{@assignments}}
+        @parentManageSelected={{this.modelAssignments}}
+        @onChange={{this.handleAssignmentSelection}}
+        @onCreate={{this.onAssignmentCreate}}
+        @fallbackComponent="string-list"
+        data-test-search-select="assignments"
+      />
+    {{/if}}
+  </div>
+  <div class="field box is-fullwidth is-bottomless">
+    <div class="control">
+      <Hds::Button
+        @text={{if @form.isNew "Create" "Update"}}
+        @icon={{if this.save.isRunning "loading"}}
+        type="submit"
+        disabled={{this.save.isRunning}}
+        data-test-oidc-client-save
+      />
+      <Hds::Button
+        @text="Cancel"
+        @color="secondary"
+        class="has-left-margin-s"
+        disabled={{this.save.isRunning}}
+        {{on "click" @onCancel}}
+        data-test-oidc-client-cancel
+      />
+    </div>
+    {{#if this.invalidFormAlert}}
+      <div class="control">
+        <AlertInline @type="danger" class="has-top-padding-s" @message={{this.invalidFormAlert}} />
+      </div>
+    {{/if}}
+  </div>
+</form>
+
+{{#if this.oidcAssignmentForm}}
+  <Hds::Modal id="search-select-modal" @onClose={{fn (mut this.oidcAssignmentForm) null}} as |M|>
+    <M.Header data-test-modal-title>
+      Create new assignment
+    </M.Header>
+    <M.Body>
+      <p class="has-bottom-margin-s" data-test-modal-subtext>
+        Use assignment to specify which Vault entities and groups are allowed to authenticate.
+      </p>
+      <Oidc::AssignmentForm
+        @form={{this.oidcAssignmentForm}}
+        @entities={{this.entities}}
+        @groups={{this.groups}}
+        @onCancel={{fn (mut this.oidcAssignmentForm) null}}
+        @onSave={{fn (mut this.oidcAssignmentForm) null}}
+      />
+    </M.Body>
+  </Hds::Modal>
+{{/if}}

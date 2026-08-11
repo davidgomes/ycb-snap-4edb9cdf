@@ -1,0 +1,16 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Page::Header @title="Create a PKI Role">
+  <:breadcrumbs>
+    <Page::Breadcrumbs @breadcrumbs={{this.breadcrumbs}} />
+  </:breadcrumbs>
+</Page::Header>
+<PkiRoleForm
+  @form={{this.model.form}}
+  @issuers={{this.model.issuers}}
+  @onCancel={{transition-to "vault.cluster.secrets.backend.pki.roles.index"}}
+  @onSave={{transition-to "vault.cluster.secrets.backend.pki.roles.role.details" this.model.form.data.name}}
+/>

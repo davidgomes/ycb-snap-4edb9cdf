@@ -1,0 +1,73 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<div
+  class="field string-list"
+  data-test-component="string-list"
+  {{did-insert this.autoSize}}
+  {{did-update this.autoSizeUpdate}}
+  data-test-input
+  ...attributes
+>
+  {{#if @label}}
+    <div class="label-row">
+      <label data-test-string-list-label="true">
+        {{@label}}
+      </label>
+      {{#if @helpText}}
+        <Hds::TooltipButton @text={{@helpText}} aria-label="More information" data-test-tooltip="string-list">
+          <Hds::Icon @name="info" />
+        </Hds::TooltipButton>
+      {{/if}}
+    </div>
+    {{#if @subText}}
+      <p class="sub-text" id={{concat (dasherize @label) "-helper-text"}}>
+        {{@subText}}
+      </p>
+    {{/if}}
+  {{/if}}
+  {{#each this.inputList as |data index|}}
+    <div class="field is-grouped" data-test-string-list-row={{index}}>
+      <div class="control is-expanded">
+        <Textarea
+          data-test-string-list-input={{index}}
+          class="input {{if (includes index this.indicesWithComma) 'has-warning-border'}}"
+          @value={{data.value}}
+          name={{concat this.elementId "-" index}}
+          aria-label="{{@label}} list item {{index}}"
+          aria-describedby={{concat (dasherize @label) "-helper-text"}}
+          {{on "keyup" (action "inputChanged" index)}}
+          {{on "change" (action "inputChanged" index)}}
+        />
+      </div>
+      <div class="control is-narrow">
+        {{#if (eq (inc index) this.inputList.length)}}
+          <Hds::Button @text="Add" data-test-string-list-button="add" {{on "click" this.addInput}} @isFullWidth={{true}} />
+        {{else}}
+          <Hds::Button
+            @text="delete row"
+            @icon="trash"
+            @isIconOnly={{true}}
+            @color="secondary"
+            @isFullWidth={{true}}
+            data-test-string-list-button="delete"
+            {{on "click" (fn this.removeInput index)}}
+          />
+        {{/if}}
+      </div>
+      {{#if (includes index this.indicesWithComma)}}
+        <Hds::Icon @name="alert-triangle" @color="warning" @size="24" @isInline={{true}} />
+      {{/if}}
+    </div>
+  {{/each}}
+  {{#if this.indicesWithComma}}
+    <Hds::Alert @type="inline" @color="warning" data-test-validation-warning={{@attrName}} as |A|>
+      <A.Description>
+        Input contains a comma. To enter multiple values, use separate rows. If commas are part of your value, disregard this
+        message.
+      </A.Description>
+    </Hds::Alert>
+  {{/if}}
+</div>

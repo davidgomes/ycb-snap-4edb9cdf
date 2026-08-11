@@ -1,0 +1,41 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Page::Header @title={{this.title}} @subtitle={{this.subtitle}}>
+  <:breadcrumbs>
+    <KeyValueHeader
+      @baseKey={{@form}}
+      @path="vault.cluster.secrets.backend.list"
+      @mode={{@mode}}
+      @root={{this.breadcrumbs}}
+      @showCurrent={{true}}
+    />
+  </:breadcrumbs>
+</Page::Header>
+
+{{#if (eq @mode "show")}}
+  <Totp::KeyDetails
+    @key={{this.key}}
+    @capabilities={{@capabilities}}
+    @onDelete={{this.deleteKey}}
+    @displayFields={{this.displayFields}}
+  />
+{{else if (eq @mode "create")}}
+  {{#if this.hasGenerated}}
+    <Totp::KeyQrCode
+      @qrSize={{@form.data.qr_size}}
+      @key={{this.key}}
+      @onReset={{this.reset}}
+      @generatedFields={{this.generatedFields}}
+    />
+  {{else}}
+    <Totp::KeyCreate
+      @onSubmit={{this.createKey}}
+      @form={{@form}}
+      @modelValidations={{this.modelValidations}}
+      @invalidFormAlert={{this.invalidFormAlert}}
+    />
+  {{/if}}
+{{/if}}

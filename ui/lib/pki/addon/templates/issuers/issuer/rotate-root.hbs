@@ -1,0 +1,13 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Page::PkiIssuerRotateRoot
+  @oldRoot={{this.model.oldRoot}}
+  @certData={{this.model.certData}}
+  @parsingErrors={{this.model.parsingErrors}}
+  @breadcrumbs={{this.breadcrumbs}}
+  @onCancel={{transition-to "vault.cluster.secrets.backend.pki.issuers.issuer.details"}}
+  @onComplete={{transition-to "vault.cluster.secrets.backend.pki.issuers"}}
+/>

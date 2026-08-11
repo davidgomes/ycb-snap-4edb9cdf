@@ -1,0 +1,28 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+{{#if @label}}
+  <div class="label-row">
+    <label data-test-form-field-label ...attributes>
+      {{@label}}
+    </label>
+    {{#if @helpText}}
+      <Hds::TooltipButton @text={{@helpText}} aria-label="More information" data-test-tooltip="form field label">
+        <Hds::Icon @name="info" />
+      </Hds::TooltipButton>
+    {{/if}}
+  </div>
+{{/if}}
+{{#if @subText}}
+  <p class="sub-text" data-test-label-subtext>
+    {{@subText}}
+    {{#if @docLink}}
+      <DocLink @path={{@docLink}}>
+        See our documentation
+      </DocLink>
+      for help.
+    {{/if}}
+  </p>
+{{/if}}

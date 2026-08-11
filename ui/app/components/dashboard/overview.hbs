@@ -1,0 +1,61 @@
+{{!
+  Copyright IBM Corp. 2016, 2025
+  SPDX-License-Identifier: BUSL-1.1
+}}
+
+<Page::Header
+  @title="Vault {{@version.versionDisplay}}"
+  @icon="dashboard"
+  @description="Review the status of your Vault cluster, including: currently enabled secrets engines and authentication methods, and system configurations."
+  class="dashboard-header-with-gradient has-bottom-margin-xl"
+>
+  <:badges>
+    {{#if @version.isEnterprise}}
+      <Hds::Badge @text={{this.namespace.currentNamespace}} @icon="org" data-test-badge-namespace />
+    {{/if}}
+  </:badges>
+</Page::Header>
+
+<div class="has-bottom-margin-xl">
+  <Hds::Layout::Flex @wrap={{true}} @gap="32" as |LF|>
+    {{#if @version.isEnterprise}}
+      <LF.Item @basis="58%" @grow={{true}} @shrink={{true}}>
+        <Dashboard::Widgets::SecretsEngines @secretsEngines={{@secretsEngines}} />
+        {{#if
+          (and (has-permission "status" routeParams="replication") (not (is-empty-value @replication)) @isRootNamespace)
+        }}
+          <Dashboard::Widgets::Replication
+            @replication={{@replication}}
+            @version={{@version}}
+            @refresh={{@refreshModel}}
+            @updatedAt={{@replicationUpdatedAt}}
+            class="has-top-margin-xl"
+          />
+        {{/if}}
+        {{#if @vaultConfiguration}}
+          <Dashboard::Widgets::ClusterConfiguration @vaultConfiguration={{@vaultConfiguration}} />
+        {{/if}}
+      </LF.Item>
+
+      <LF.Item @basis="38%" @grow={{true}} @shrink={{true}}>
+        <Dashboard::Widgets::QuickActions @secretsEngines={{@secretsEngines}} />
+        {{#if (and (has-permission "clients" routeParams="activity") this.shouldShowClientCount)}}
+          <Dashboard::Widgets::ClientCount class="has-top-margin-xl" />
+        {{/if}}
+
+        <Dashboard::Widgets::LearnMore @isEnterprise={{@version.isEnterprise}} class="has-top-margin-xl" />
+      </LF.Item>
+    {{else}}
+      <LF.Item @basis="58%" @grow={{true}} @shrink={{true}}>
+        <Dashboard::Widgets::SecretsEngines @secretsEngines={{@secretsEngines}} />
+        {{#if @vaultConfiguration}}
+          <Dashboard::Widgets::ClusterConfiguration @vaultConfiguration={{@vaultConfiguration}} />
+        {{/if}}
+      </LF.Item>
+      <LF.Item @basis="38%" @grow={{true}} @shrink={{true}}>
+        <Dashboard::Widgets::QuickActions @secretsEngines={{@secretsEngines}} />
+        <Dashboard::Widgets::LearnMore @isEnterprise={{@version.isEnterprise}} class="has-top-margin-xl" />
+      </LF.Item>
+    {{/if}}
+  </Hds::Layout::Flex>
+</div>
