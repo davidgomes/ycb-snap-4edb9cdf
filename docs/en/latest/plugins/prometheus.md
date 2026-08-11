@@ -176,6 +176,8 @@ The `type` label distinguishes the kind of latency, similar to `apisix_http_late
 - `total`: the full response latency, recorded for both `ai_chat` and `ai_stream` requests.
 - `ttft`: the time to first token, recorded for `ai_stream` requests only (non-streaming responses do not expose a first-token moment).
 
+`apisix_llm_latency` has no status label and is meant for successfully served LLM responses. Requests with HTTP status `>= 400` are not observed.
+
 | Name | Description                                                                                                                   |
 | ---------- | ----------------------------------------------------------------------------------------------------------------------------- |                                                                                             |
 | type          | Kind of latency: `total` or `ttft`.                                                                                             |

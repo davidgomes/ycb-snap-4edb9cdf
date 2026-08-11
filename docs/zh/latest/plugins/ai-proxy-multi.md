@@ -2710,7 +2710,7 @@ curl "http://127.0.0.1:9080/anything" -X POST \
 以下示例演示了如何在网关的访问日志中记录 LLM 请求相关信息，以改进分析和审计。以下变量可用：
 
 * `request_llm_model`：请求中指定的 LLM 模型名称。
-* `apisix_upstream_response_time`：APISIX 向上游服务发送请求并接收完整响应所花费的时间
+* `apisix_upstream_response_time`：APISIX 向上游服务发送请求并接收完整响应所花费的时间（毫秒）。
 * `request_type`：请求类型，值可能是 `traditional_http`、`ai_chat` 或 `ai_stream`。
 * `llm_time_to_first_token`：从发送请求到从 LLM 服务接收第一个令牌的持续时间（毫秒）。
 * `llm_model`：LLM 模型。
