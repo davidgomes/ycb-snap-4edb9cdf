@@ -221,6 +221,7 @@ impl EnforceSecret for IcebergCommon {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, WithOptions)]
 #[serde(deny_unknown_fields)]
 pub struct IcebergTableIdentifier {
+    /// Iceberg namespace. Dots are multi-level separators (e.g. `a.b.c`); empty segments are rejected.
     #[serde(rename = "database.name")]
     pub database_name: Option<String>,
     /// Full name of table, must include schema name when database is provided.
@@ -237,9 +238,26 @@ impl IcebergTableIdentifier {
         &self.table_name
     }
 
+    /// Split `database.name` into Iceberg namespace levels.
+    ///
+    /// Dots are namespace separators. Empty segments from leading, trailing, or
+    /// consecutive dots are rejected.
+    fn namespace_levels(database_name: &str) -> ConnectorResult<Vec<&str>> {
+        let levels: Vec<&str> = database_name.split('.').collect();
+        if levels.iter().any(|level| level.is_empty()) {
+            bail!(
+                "Invalid database.name '{}': empty namespace segments are not allowed (leading, trailing, or consecutive dots)",
+                database_name
+            );
+        }
+        Ok(levels)
+    }
+
     pub fn to_table_ident(&self) -> ConnectorResult<TableIdent> {
         let ret = if let Some(database_name) = &self.database_name {
-            TableIdent::from_strs(vec![database_name, &self.table_name])
+            let mut names = Self::namespace_levels(database_name)?;
+            names.push(&self.table_name);
+            TableIdent::from_strs(names)
         } else {
             TableIdent::from_strs(vec![&self.table_name])
         };
@@ -248,13 +266,8 @@ impl IcebergTableIdentifier {
     }
 
     pub fn validate(&self) -> ConnectorResult<()> {
-        if let Some(database_name) = &self.database_name
-            && database_name.contains('.')
-        {
-            bail!(
-                "Invalid database.name '{}': dots are not allowed in database names",
-                database_name
-            );
+        if let Some(database_name) = &self.database_name {
+            Self::namespace_levels(database_name)?;
         }
         Ok(())
     }
@@ -937,7 +950,7 @@ mod tests {
 
     #[test]
     fn test_iceberg_table_identifier_validation() {
-        // Test valid database names
+        // Test valid database names, including multi-level namespaces.
         let valid_identifier = IcebergTableIdentifier {
             database_name: Some("valid_db".to_owned()),
             table_name: "test_table".to_owned(),
@@ -956,31 +969,66 @@ mod tests {
         };
         assert!(no_database.validate().is_ok());
 
-        // Test invalid database names with dots
-        let single_dot = IcebergTableIdentifier {
+        let nested = IcebergTableIdentifier {
             database_name: Some("a.b".to_owned()),
             table_name: "test_table".to_owned(),
         };
-        let result = single_dot.validate();
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("dots are not allowed")
-        );
+        assert!(nested.validate().is_ok());
 
-        let multiple_dots = IcebergTableIdentifier {
+        let deeply_nested = IcebergTableIdentifier {
             database_name: Some("a.b.c".to_owned()),
             table_name: "test_table".to_owned(),
         };
-        let result = multiple_dots.validate();
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("dots are not allowed")
+        assert!(deeply_nested.validate().is_ok());
+
+        // Malformed identifiers with empty segments.
+        for database_name in [".a", "a.", "a..b", ".", ".."] {
+            let invalid = IcebergTableIdentifier {
+                database_name: Some(database_name.to_owned()),
+                table_name: "test_table".to_owned(),
+            };
+            let result = invalid.validate();
+            assert!(
+                result.is_err(),
+                "expected error for database.name `{database_name}`"
+            );
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("empty namespace segments are not allowed"),
+                "unexpected error for database.name `{database_name}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_iceberg_table_identifier_to_table_ident() {
+        let single = IcebergTableIdentifier {
+            database_name: Some("demo_db".to_owned()),
+            table_name: "demo_table".to_owned(),
+        };
+        let ident = single.to_table_ident().unwrap();
+        assert_eq!(ident.to_string(), "demo_db.demo_table");
+        assert_eq!(ident.namespace().as_ref(), &vec!["demo_db".to_owned()]);
+        assert_eq!(ident.name(), "demo_table");
+
+        let nested = IcebergTableIdentifier {
+            database_name: Some("a.b.c".to_owned()),
+            table_name: "t".to_owned(),
+        };
+        let ident = nested.to_table_ident().unwrap();
+        assert_eq!(ident.to_string(), "a.b.c.t");
+        assert_eq!(
+            ident.namespace().as_ref(),
+            &vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
         );
+        assert_eq!(ident.name(), "t");
+
+        let invalid = IcebergTableIdentifier {
+            database_name: Some("a..b".to_owned()),
+            table_name: "t".to_owned(),
+        };
+        assert!(invalid.to_table_ident().is_err());
     }
 }

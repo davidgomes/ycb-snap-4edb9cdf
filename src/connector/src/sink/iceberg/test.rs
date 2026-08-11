@@ -349,6 +349,58 @@ fn test_parse_iceberg_config() {
 }
 
 #[test]
+fn test_iceberg_config_nested_namespace() {
+    let values: BTreeMap<String, String> = [
+        ("connector", "iceberg"),
+        ("type", "append-only"),
+        ("force_append_only", "true"),
+        ("catalog.name", "test-catalog"),
+        ("catalog.type", "storage"),
+        ("warehouse.path", "s3://my-bucket/warehouse"),
+        ("database.name", "a.b.c"),
+        ("table.name", "nested_table"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect();
+
+    let config = IcebergConfig::from_btreemap(values).unwrap();
+    let ident = config.full_table_name().unwrap();
+    assert_eq!(ident.to_string(), "a.b.c.nested_table");
+    assert_eq!(
+        ident.namespace().as_ref(),
+        &vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
+    );
+    assert_eq!(ident.name(), "nested_table");
+}
+
+#[test]
+fn test_iceberg_config_rejects_empty_namespace_segments() {
+    for database_name in [".a", "a.", "a..b", "."] {
+        let values: BTreeMap<String, String> = [
+            ("connector", "iceberg"),
+            ("type", "append-only"),
+            ("force_append_only", "true"),
+            ("catalog.name", "test-catalog"),
+            ("catalog.type", "storage"),
+            ("warehouse.path", "s3://my-bucket/warehouse"),
+            ("database.name", database_name),
+            ("table.name", "test_table"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+
+        let err = IcebergConfig::from_btreemap(values).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("empty namespace segments are not allowed"),
+            "unexpected error for database.name `{database_name}`: {err}"
+        );
+    }
+}
+
+#[test]
 fn test_parse_commit_checkpoint_size_threshold() {
     let values: BTreeMap<String, String> = [
         ("connector", "iceberg"),

@@ -1,5 +1,5 @@
 # Test cases for iceberg database.name validation
-# This file tests that dots are not allowed in database.name field
+# Dots are namespace separators; empty segments are rejected.
 
 statement ok
 DROP TABLE IF EXISTS t_db_validation;
@@ -10,12 +10,12 @@ CREATE TABLE t_db_validation (
     data varchar
 );
 
-# Test case 1: Error - database.name with single dot
-statement error Invalid database.name 'a.b': dots are not allowed in database names
-CREATE SINK s_single_dot AS SELECT * FROM t_db_validation WITH (
+# Test case 1: Error - leading dot creates an empty namespace segment
+statement error empty namespace segments are not allowed
+CREATE SINK s_leading_dot AS SELECT * FROM t_db_validation WITH (
     connector = 'iceberg',
     type = 'append-only',
-    database.name = 'a.b',
+    database.name = '.a',
     table.name = 'test_table',
     catalog.name = 'demo',
     catalog.type = 'storage',
@@ -27,13 +27,30 @@ CREATE SINK s_single_dot AS SELECT * FROM t_db_validation WITH (
     create_table_if_not_exists = 'true'
 );
 
-# Test case 2: Error - database.name with multiple dots
-statement error Invalid database.name 'a.b.c': dots are not allowed in database names
-CREATE SINK s_multiple_dots AS SELECT * FROM t_db_validation WITH (
+# Test case 2: Error - trailing dot creates an empty namespace segment
+statement error empty namespace segments are not allowed
+CREATE SINK s_trailing_dot AS SELECT * FROM t_db_validation WITH (
     connector = 'iceberg',
     type = 'upsert',
     primary_key = 'id',
-    database.name = 'a.b.c',
+    database.name = 'a.',
+    table.name = 'test_table',
+    catalog.name = 'demo',
+    catalog.type = 'storage',
+    warehouse.path = 's3a://icebergdata/demo',
+    s3.endpoint = 'http://127.0.0.1:9301',
+    s3.region = 'us-east-1',
+    s3.access.key = 'hummockadmin',
+    s3.secret.key = 'hummockadmin',
+    create_table_if_not_exists = 'true'
+);
+
+# Test case 3: Error - consecutive dots create an empty namespace segment
+statement error empty namespace segments are not allowed
+CREATE SINK s_consecutive_dots AS SELECT * FROM t_db_validation WITH (
+    connector = 'iceberg',
+    type = 'append-only',
+    database.name = 'a..b',
     table.name = 'test_table',
     catalog.name = 'demo',
     catalog.type = 'storage',

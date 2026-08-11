@@ -348,6 +348,7 @@ IcebergProperties:
     required: false
   - name: database.name
     field_type: String
+    comments: Iceberg namespace. Dots are multi-level separators (e.g. `a.b.c`); empty segments are rejected.
     required: false
   - name: table.name
     field_type: String

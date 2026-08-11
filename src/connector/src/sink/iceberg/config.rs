@@ -601,7 +601,7 @@ impl IcebergConfig {
             )));
         }
 
-        // Validate table identifier (e.g., database.name should not contain dots)
+        // Validate table identifier (e.g., reject empty Iceberg namespace segments).
         config
             .table
             .validate()

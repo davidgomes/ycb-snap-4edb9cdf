@@ -85,27 +85,32 @@ pub(super) async fn create_table_if_not_exists_impl(
     param: &SinkParam,
 ) -> Result<()> {
     let catalog = config.create_catalog().await?;
-    let namespace = if let Some(database_name) = config.table.database_name() {
-        let namespace = NamespaceIdent::new(database_name.to_owned());
+    if config.table.database_name().is_none() {
+        bail!("database name must be set if you want to create table")
+    }
+    let table_id = config
+        .full_table_name()
+        .context("Unable to parse table name")?;
+    let namespace = table_id.namespace().clone();
+
+    // Create any missing intermediate namespaces, parent first.
+    // Iceberg identifiers like `a.b.c` require `a` and `a.b` to exist before `a.b.c`.
+    let levels = namespace.clone().inner();
+    for depth in 1..=levels.len() {
+        let ns = NamespaceIdent::from_vec(levels[..depth].to_vec())
+            .map_err(|e| SinkError::Iceberg(anyhow!(e)))?;
         if !catalog
-            .namespace_exists(&namespace)
+            .namespace_exists(&ns)
             .await
             .map_err(|e| SinkError::Iceberg(anyhow!(e)))?
         {
             catalog
-                .create_namespace(&namespace, HashMap::default())
+                .create_namespace(&ns, HashMap::default())
                 .await
                 .map_err(|e| SinkError::Iceberg(anyhow!(e)))
                 .context("failed to create iceberg namespace")?;
         }
-        namespace
-    } else {
-        bail!("database name must be set if you want to create table")
-    };
-
-    let table_id = config
-        .full_table_name()
-        .context("Unable to parse table name")?;
+    }
     if !catalog
         .table_exists(&table_id)
         .await

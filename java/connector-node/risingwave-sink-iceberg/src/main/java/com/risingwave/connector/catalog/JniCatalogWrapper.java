@@ -77,12 +77,7 @@ public class JniCatalogWrapper {
      * @throws Exception
      */
     public String createTable(String namespaceStr, String createTableRequest) throws Exception {
-        Namespace namespace;
-        if (namespaceStr == null) {
-            namespace = Namespace.empty();
-        } else {
-            namespace = Namespace.of(namespaceStr);
-        }
+        Namespace namespace = parseNamespace(namespaceStr);
         CreateTableRequest req =
                 RESTObjectMapper.mapper().readValue(createTableRequest, CreateTableRequest.class);
         LoadTableResponse resp = CatalogHandlers.createTable(catalog, namespace, req);
@@ -107,12 +102,7 @@ public class JniCatalogWrapper {
      * @return true if the namespace exists, false otherwise.
      */
     public boolean namespaceExists(String namespaceStr) {
-        Namespace namespace;
-        if (namespaceStr == null) {
-            namespace = Namespace.empty();
-        } else {
-            namespace = Namespace.of(namespaceStr);
-        }
+        Namespace namespace = parseNamespace(namespaceStr);
         if (catalog instanceof SupportsNamespaces) {
             return ((SupportsNamespaces) catalog).namespaceExists(namespace);
         } else {
@@ -126,12 +116,7 @@ public class JniCatalogWrapper {
      * @param namespaceStr The namespace to create.
      */
     public void createNamespace(String namespaceStr) {
-        Namespace namespace;
-        if (namespaceStr == null) {
-            namespace = Namespace.empty();
-        } else {
-            namespace = Namespace.of(namespaceStr);
-        }
+        Namespace namespace = parseNamespace(namespaceStr);
         if (catalog instanceof SupportsNamespaces) {
             ((SupportsNamespaces) catalog).createNamespace(namespace);
         }
@@ -173,12 +158,7 @@ public class JniCatalogWrapper {
      * @throws Exception
      */
     public String listTables(String namespaceStr) throws Exception {
-        Namespace namespace;
-        if (namespaceStr == null) {
-            namespace = Namespace.empty();
-        } else {
-            namespace = Namespace.of(namespaceStr);
-        }
+        Namespace namespace = parseNamespace(namespaceStr);
         ListTablesResponse resp = CatalogHandlers.listTables(catalog, namespace);
         return RESTObjectMapper.mapper().writer().writeValueAsString(resp);
     }
@@ -192,6 +172,19 @@ public class JniCatalogWrapper {
         if (catalog instanceof Closeable) {
             ((Closeable) catalog).close();
         }
+    }
+
+    /**
+     * Parse a possibly multi-level Iceberg namespace.
+     *
+     * <p>Dots are treated as namespace separators (for example {@code a.b.c}). A null or empty
+     * string is the empty namespace.
+     */
+    private static Namespace parseNamespace(String namespaceStr) {
+        if (namespaceStr == null || namespaceStr.isEmpty()) {
+            return Namespace.empty();
+        }
+        return Namespace.fromString(namespaceStr);
     }
 
     /**

@@ -34,7 +34,6 @@ use iceberg::{
 };
 use itertools::Itertools;
 use jni::objects::{GlobalRef, JObject};
-use risingwave_common::bail;
 use risingwave_common::global_jvm::Jvm;
 use risingwave_jni_core::call_method;
 use risingwave_jni_core::jvm_runtime::{execute_with_jni_env, jobj_to_str};
@@ -150,14 +149,7 @@ impl Catalog for JniCatalog {
         _properties: HashMap<String, String>,
     ) -> iceberg::Result<iceberg::Namespace> {
         execute_with_jni_env(self.jvm, |env| {
-            let namespace_jstr = if namespace.is_empty() {
-                env.new_string("").unwrap()
-            } else {
-                if namespace.len() > 1 {
-                    bail!("Namespace with more than one level is not supported!")
-                }
-                env.new_string(&namespace[0]).unwrap()
-            };
+            let namespace_jstr = env.new_string(&namespace.to_string()).unwrap();
 
             call_method!(env, self.java_catalog.as_obj(), {void createNamespace(String)},
                 &namespace_jstr)
@@ -182,14 +174,7 @@ impl Catalog for JniCatalog {
     /// Check if namespace exists in catalog.
     async fn namespace_exists(&self, namespace: &NamespaceIdent) -> iceberg::Result<bool> {
         execute_with_jni_env(self.jvm, |env| {
-            let namespace_jstr = if namespace.is_empty() {
-                env.new_string("").unwrap()
-            } else {
-                if namespace.len() > 1 {
-                    bail!("Namespace with more than one level is not supported!")
-                }
-                env.new_string(&namespace[0]).unwrap()
-            };
+            let namespace_jstr = env.new_string(&namespace.to_string()).unwrap();
 
             let exists =
                 call_method!(env, self.java_catalog.as_obj(), {boolean namespaceExists(String)},
@@ -215,14 +200,7 @@ impl Catalog for JniCatalog {
     /// List tables from namespace.
     async fn list_tables(&self, namespace: &NamespaceIdent) -> iceberg::Result<Vec<TableIdent>> {
         execute_with_jni_env(self.jvm, |env| {
-            let namespace_jstr = if namespace.is_empty() {
-                env.new_string("").unwrap()
-            } else {
-                if namespace.len() > 1 {
-                    bail!("Namespace with more than one level is not supported!")
-                }
-                env.new_string(&namespace[0]).unwrap()
-            };
+            let namespace_jstr = env.new_string(&namespace.to_string()).unwrap();
 
             let result_json =
                 call_method!(env, self.java_catalog.as_obj(), {String listTables(String)},
@@ -261,14 +239,7 @@ impl Catalog for JniCatalog {
         creation: TableCreation,
     ) -> iceberg::Result<Table> {
         execute_with_jni_env(self.jvm, |env| {
-            let namespace_jstr = if namespace.is_empty() {
-                env.new_string("").unwrap()
-            } else {
-                if namespace.len() > 1 {
-                    bail!("Namespace with more than one level is not supported!")
-                }
-                env.new_string(&namespace[0]).unwrap()
-            };
+            let namespace_jstr = env.new_string(&namespace.to_string()).unwrap();
 
             let creation_str = serde_json::to_string(&CreateTableRequest::from(&creation))?;
 
