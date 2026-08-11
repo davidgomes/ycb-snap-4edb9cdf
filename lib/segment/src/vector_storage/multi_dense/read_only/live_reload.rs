@@ -13,8 +13,8 @@ impl<T: PrimitiveVectorElement, S: UniversalRead> LiveReload
 {
     type Fs = S::Fs;
 
-    /// Reload the vectors and offsets and apply `deleted_points`; appended points
-    /// are served from the refreshed chunks, so `new_points` is unused.
+    /// Reload the vectors and offsets, apply `deleted_points`, and fold persisted
+    /// per-vector deletion bits for `new_points`.
     fn live_reload(
         &mut self,
         fs: &S::Fs,
@@ -26,7 +26,7 @@ impl<T: PrimitiveVectorElement, S: UniversalRead> LiveReload
             .live_reload(fs, deleted_points, new_points, hw_counter)?;
         self.offsets
             .live_reload(fs, deleted_points, new_points, hw_counter)?;
-        self.deleted.insert_all(deleted_points);
+        self.deleted.live_reload(fs, deleted_points, new_points)?;
 
         Ok(())
     }

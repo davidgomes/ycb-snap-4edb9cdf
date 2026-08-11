@@ -235,4 +235,53 @@ mod tests {
         }
         assert!(!reader.is_deleted_vector(0));
     }
+
+    /// Per-vector deletion on an appended point lives only in the flags file,
+    /// not in `deleted_points`. live_reload must fold that bit in.
+    #[test]
+    fn live_reload_folds_persisted_deletion_on_appended_point() {
+        let dir = Builder::new()
+            .prefix("ro_sparse_reload_vec_del")
+            .tempdir()
+            .unwrap();
+        let hw = HardwareCounterCell::disposable();
+        let vector = SparseVector {
+            indices: vec![1, 5],
+            values: vec![0.1, 0.2],
+        };
+
+        let mut writer = MmapSparseVectorStorage::open_or_create(dir.path()).unwrap();
+        writer
+            .insert_vector(0, VectorRef::from(&vector), &hw)
+            .unwrap();
+        writer.flusher()().unwrap();
+
+        let mut reader =
+            ReadOnlySparseVectorStorage::<MmapFile>::open(&MmapFs, dir.path(), Populate::No)
+                .unwrap();
+
+        writer
+            .insert_vector(1, VectorRef::from(&vector), &hw)
+            .unwrap();
+        writer
+            .insert_vector(2, VectorRef::from(&vector), &hw)
+            .unwrap();
+        writer.delete_vector(2).unwrap();
+        writer.flusher()().unwrap();
+
+        reader
+            .live_reload(
+                &MmapFs,
+                &SortedSlice::new(&[]).unwrap(),
+                &SortedSlice::new(&[1, 2]).unwrap(),
+                &hw,
+            )
+            .unwrap();
+
+        assert_eq!(reader.total_vector_count(), 3);
+        assert!(!reader.is_deleted_vector(0));
+        assert!(!reader.is_deleted_vector(1));
+        assert!(reader.is_deleted_vector(2));
+        assert_eq!(reader.deleted_vector_count(), 1);
+    }
 }

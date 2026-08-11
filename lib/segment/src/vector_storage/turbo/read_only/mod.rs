@@ -162,3 +162,136 @@ impl<S: UniversalRead> std::fmt::Debug for ReadOnlyTurboMultiVectorStorage<S> {
             .finish_non_exhaustive()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use common::counter::hardware_counter::HardwareCounterCell;
+    use common::mmap::AdviceSetting;
+    use common::sorted_slice::SortedSlice;
+    use common::universal_io::{MmapFile, MmapFs, Populate};
+    use tempfile::Builder;
+
+    use super::*;
+    use crate::common::live_reload::LiveReload;
+    use crate::data_types::vectors::{
+        MultiDenseVectorInternal, TypedMultiDenseVectorRef, VectorRef,
+    };
+    use crate::types::{Distance, MultiVectorConfig};
+    use crate::vector_storage::turbo::multi::open_appendable_turbo_multi_vector_storage;
+    use crate::vector_storage::turbo::open_appendable_turbo_vector_storage;
+    use crate::vector_storage::{VectorStorage, VectorStorageRead};
+
+    /// Per-vector deletion on an appended point lives only in the flags file,
+    /// not in `deleted_points`. live_reload must fold that bit in.
+    #[test]
+    fn live_reload_folds_persisted_deletion_on_appended_dense_point() {
+        const DIM: usize = 16;
+        let dir = Builder::new()
+            .prefix("ro_turbo_reload_vec_del")
+            .tempdir()
+            .unwrap();
+        let hw = HardwareCounterCell::disposable();
+        let vector = vec![1.0; DIM];
+
+        let mut writer =
+            open_appendable_turbo_vector_storage(dir.path(), DIM, Distance::Dot, false).unwrap();
+        writer
+            .insert_vector(0, VectorRef::from(&vector), &hw)
+            .unwrap();
+        writer.flusher()().unwrap();
+
+        let mut reader = ReadOnlyTurboVectorStorage::<MmapFile>::open(
+            &MmapFs,
+            dir.path(),
+            DIM,
+            Distance::Dot,
+            true,
+            Populate::No,
+        )
+        .unwrap();
+
+        writer
+            .insert_vector(1, VectorRef::from(&vector), &hw)
+            .unwrap();
+        writer
+            .insert_vector(2, VectorRef::from(&vector), &hw)
+            .unwrap();
+        writer.delete_vector(2).unwrap();
+        writer.flusher()().unwrap();
+
+        reader
+            .live_reload(
+                &MmapFs,
+                &SortedSlice::new(&[]).unwrap(),
+                &SortedSlice::new(&[1, 2]).unwrap(),
+                &hw,
+            )
+            .unwrap();
+
+        assert_eq!(reader.total_vector_count(), 3);
+        assert!(!reader.is_deleted_vector(0));
+        assert!(!reader.is_deleted_vector(1));
+        assert!(reader.is_deleted_vector(2));
+        assert_eq!(reader.deleted_vector_count(), 1);
+    }
+
+    /// Same gap on the turbo multivector read-only storage.
+    #[test]
+    fn live_reload_folds_persisted_deletion_on_appended_multi_point() {
+        const DIM: usize = 16;
+        let dir = Builder::new()
+            .prefix("ro_turbo_multi_reload_vec_del")
+            .tempdir()
+            .unwrap();
+        let hw = HardwareCounterCell::disposable();
+        let multi = MultiDenseVectorInternal::try_from(vec![vec![1.0; DIM]]).unwrap();
+
+        let mut writer = open_appendable_turbo_multi_vector_storage(
+            dir.path(),
+            DIM,
+            Distance::Dot,
+            MultiVectorConfig::default(),
+            false,
+        )
+        .unwrap();
+        writer
+            .insert_vector(0, TypedMultiDenseVectorRef::from(&multi).into(), &hw)
+            .unwrap();
+        writer.flusher()().unwrap();
+
+        let mut reader = ReadOnlyTurboMultiVectorStorage::<MmapFile>::open(
+            &MmapFs,
+            dir.path(),
+            DIM,
+            Distance::Dot,
+            MultiVectorConfig::default(),
+            AdviceSetting::Global,
+            Populate::No,
+        )
+        .unwrap();
+
+        writer
+            .insert_vector(1, TypedMultiDenseVectorRef::from(&multi).into(), &hw)
+            .unwrap();
+        writer
+            .insert_vector(2, TypedMultiDenseVectorRef::from(&multi).into(), &hw)
+            .unwrap();
+        writer.delete_vector(2).unwrap();
+        writer.flusher()().unwrap();
+
+        reader
+            .live_reload(
+                &MmapFs,
+                &SortedSlice::new(&[]).unwrap(),
+                &SortedSlice::new(&[1, 2]).unwrap(),
+                &hw,
+            )
+            .unwrap();
+
+        assert_eq!(reader.total_vector_count(), 3);
+        assert!(!reader.is_deleted_vector(0));
+        assert!(!reader.is_deleted_vector(1));
+        assert!(reader.is_deleted_vector(2));
+        assert_eq!(reader.deleted_vector_count(), 1);
+    }
+}

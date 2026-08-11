@@ -257,4 +257,67 @@ mod tests {
         }
         assert!(!reader.is_deleted_vector(0));
     }
+
+    /// Per-vector deletion on an appended point lives only in the flags file,
+    /// not in `deleted_points`. live_reload must fold that bit in.
+    #[test]
+    fn live_reload_folds_persisted_deletion_on_appended_point() {
+        const DIM: usize = 16;
+        let dir = Builder::new()
+            .prefix("ro_multi_reload_vec_del")
+            .tempdir()
+            .unwrap();
+        let hw = HardwareCounterCell::disposable();
+        let multi = MultiDenseVectorInternal::try_from(vec![vec![1.0; DIM]]).unwrap();
+
+        let mut writer = open_appendable_memmap_multi_vector_storage_impl::<VectorElementType>(
+            dir.path(),
+            DIM,
+            Distance::Dot,
+            MultiVectorConfig::default(),
+            AdviceSetting::Global,
+            false,
+        )
+        .unwrap();
+        writer
+            .insert_vector(0, VectorRef::from(&multi), &hw)
+            .unwrap();
+        writer.flusher()().unwrap();
+
+        let mut reader =
+            ReadOnlyChunkedMultiDenseVectorStorage::<VectorElementType, MmapFile>::open(
+                &MmapFs,
+                dir.path(),
+                DIM,
+                Distance::Dot,
+                MultiVectorConfig::default(),
+                AdviceSetting::Global,
+                Populate::No,
+            )
+            .unwrap();
+
+        writer
+            .insert_vector(1, VectorRef::from(&multi), &hw)
+            .unwrap();
+        writer
+            .insert_vector(2, VectorRef::from(&multi), &hw)
+            .unwrap();
+        writer.delete_vector(2).unwrap();
+        writer.flusher()().unwrap();
+
+        reader
+            .live_reload(
+                &MmapFs,
+                &SortedSlice::new(&[]).unwrap(),
+                &SortedSlice::new(&[1, 2]).unwrap(),
+                &hw,
+            )
+            .unwrap();
+
+        assert_eq!(reader.total_vector_count(), 3);
+        assert!(!reader.is_deleted_vector(0));
+        assert!(!reader.is_deleted_vector(1));
+        assert!(reader.is_deleted_vector(2));
+        assert_eq!(reader.deleted_vector_count(), 1);
+    }
 }

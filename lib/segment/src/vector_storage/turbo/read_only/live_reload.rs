@@ -11,7 +11,8 @@ impl<S: UniversalRead> LiveReload for ReadOnlyTurboVectorStorage<S> {
     type Fs = S::Fs;
 
     /// Pick up vectors a writer appended (chunked backend only; the single-file
-    /// layout is immutable) and patch the in-memory deletion flags.
+    /// layout is immutable) and patch the in-memory deletion flags, including
+    /// persisted per-vector deletions on `new_points`.
     fn live_reload(
         &mut self,
         fs: &S::Fs,
@@ -22,7 +23,7 @@ impl<S: UniversalRead> LiveReload for ReadOnlyTurboVectorStorage<S> {
         if let ReadOnlyTurboEncoded::Chunked(storage) = &mut self.storage {
             storage.live_reload(fs, deleted_points, new_points, hw_counter)?;
         }
-        self.deleted.insert_all(deleted_points);
+        self.deleted.live_reload(fs, deleted_points, new_points)?;
         Ok(())
     }
 }
@@ -31,7 +32,8 @@ impl<S: UniversalRead> LiveReload for ReadOnlyTurboMultiVectorStorage<S> {
     type Fs = S::Fs;
 
     /// Pick up multivectors a writer appended (records + offsets) and patch the
-    /// in-memory deletion flags.
+    /// in-memory deletion flags, including persisted per-vector deletions on
+    /// `new_points`.
     fn live_reload(
         &mut self,
         fs: &S::Fs,
@@ -43,7 +45,7 @@ impl<S: UniversalRead> LiveReload for ReadOnlyTurboMultiVectorStorage<S> {
             .live_reload(fs, deleted_points, new_points, hw_counter)?;
         self.offsets
             .live_reload(fs, deleted_points, new_points, hw_counter)?;
-        self.deleted.insert_all(deleted_points);
+        self.deleted.live_reload(fs, deleted_points, new_points)?;
         Ok(())
     }
 }

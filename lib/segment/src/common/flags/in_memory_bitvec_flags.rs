@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use common::bitvec::{BitSlice, BitVec};
 use common::mmap::AdviceSetting;
@@ -14,10 +14,13 @@ use crate::common::operation_error::{OperationError, OperationResult};
 /// In-memory counterpart of `BitvecFlags`: persisted flags materialized into an
 /// owned `BitVec`, no write path.
 ///
-/// Only consumer is the vector storages' `deleted` set, where the live-reload
-/// delta is authoritative (deleted offsets set, appended offsets live so absent).
-/// So unlike `ReadOnlyRoaringFlags` it keeps no file handle and never reopens —
-/// the owned bitvec is the whole state.
+/// Vector-storage `deleted` sets take whole-point deletions from the live-reload
+/// delta (`deleted_points`) and, for appended offsets, also fold per-vector
+/// deletion bits that exist only in the on-disk flags file. Unlike
+/// [`ReadOnlyRoaringFlags`](super::read_only_roaring_flags::ReadOnlyRoaringFlags)
+/// this type does not keep a flags handle: `open` / `live_reload` open a fresh
+/// one so caching backends see in-place bit writes. The owned bitvec is never
+/// replaced wholesale, so in-memory deletions that are not yet flushed survive.
 #[derive(Debug)]
 #[allow(dead_code)] // pending: read-only vector storages will hold `deleted` as this
 pub struct InMemoryBitvecFlags {
@@ -25,6 +28,10 @@ pub struct InMemoryBitvecFlags {
     bitvec: BitVec,
     /// Set-flag count, kept in sync with `bitvec`.
     count: usize,
+    /// Directory of the dynamic flags files, if this set was opened from disk.
+    /// `None` for flags materialized from another format (e.g. immutable dense
+    /// `deleted.dat`).
+    directory: Option<PathBuf>,
 }
 
 /// Read-only mmap options: never writable, lazily paged, nothing populated.
@@ -35,6 +42,22 @@ fn bitslice_open_options(populate: Populate) -> OpenOptions {
         populate,
         advice: AdviceSetting::Global,
     }
+}
+
+/// Logical flag count from the status file. The flags file is padded past this.
+fn read_logical_len<S: UniversalRead>(
+    fs: &impl UniversalReadFs<File = S>,
+    directory: &Path,
+) -> OperationResult<usize> {
+    let status = TypedStorage::<S, DynamicFlagsStatus>::new(fs.open(
+        status_file(directory),
+        bitslice_open_options(Populate::No),
+        Default::default(),
+    )?);
+    Ok(status
+        .read_whole()?
+        .first()
+        .map_or(0, DynamicFlagsStatus::len))
 }
 
 impl InMemoryBitvecFlags {
@@ -63,16 +86,7 @@ impl InMemoryBitvecFlags {
         fs: &impl UniversalReadFs<File = S>,
         directory: &Path,
     ) -> OperationResult<Self> {
-        // Length via TypedStorage; StoredStruct is write-bound.
-        let status = TypedStorage::<S, DynamicFlagsStatus>::new(fs.open(
-            status_file(directory),
-            bitslice_open_options(Populate::No),
-            Default::default(),
-        )?);
-        let len = status
-            .read_whole()?
-            .first()
-            .map_or(0, DynamicFlagsStatus::len);
+        let len = read_logical_len::<S>(fs, directory)?;
 
         let flags_path = directory.join(FLAGS_FILE);
         let flags = StoredBitSlice::<S>::open(
@@ -90,7 +104,11 @@ impl InMemoryBitvecFlags {
         })?;
         let count = bitvec.count_ones();
 
-        Ok(Self { bitvec, count })
+        Ok(Self {
+            bitvec,
+            count,
+            directory: Some(directory.to_path_buf()),
+        })
     }
 
     /// Wrap an already-materialized deletion `bitvec`, computing the set-flag
@@ -98,7 +116,11 @@ impl InMemoryBitvecFlags {
     /// flags read by [`Self::open`] (e.g. the immutable dense `deleted.dat`).
     pub fn from_bitvec(bitvec: BitVec) -> Self {
         let count = bitvec.count_ones();
-        Self { bitvec, count }
+        Self {
+            bitvec,
+            count,
+            directory: None,
+        }
     }
 
     /// Whether the flag at `key` is set; out-of-range keys read as unset.
@@ -128,6 +150,66 @@ impl InMemoryBitvecFlags {
                 self.count += 1;
             }
         }
+    }
+
+    /// Apply a live-reload delta: set `deleted_points`, then fold persisted
+    /// deletion bits for `new_points` from the flags file.
+    ///
+    /// Whole-point deletions come from the id-tracker. An appended point can
+    /// also carry a per-vector deletion that exists only on disk, for example a
+    /// missing named vector stored as a placeholder with its slot marked
+    /// deleted. That bit never appears in `deleted_points`. Already-set
+    /// in-memory flags are never cleared, so unflushed deletions survive.
+    pub fn live_reload<S: UniversalRead>(
+        &mut self,
+        fs: &impl UniversalReadFs<File = S>,
+        deleted_points: &[PointOffsetType],
+        new_points: &[PointOffsetType],
+    ) -> OperationResult<()> {
+        self.insert_all(deleted_points);
+        self.fold_persisted_deletions(fs, new_points)
+    }
+
+    /// Fold on-disk deletion bits for `new_points` into the in-memory set.
+    ///
+    /// Only bits within the logical flag length from the status file are read;
+    /// padding past that length is ignored.
+    fn fold_persisted_deletions<S: UniversalRead>(
+        &mut self,
+        fs: &impl UniversalReadFs<File = S>,
+        new_points: &[PointOffsetType],
+    ) -> OperationResult<()> {
+        let Some(directory) = &self.directory else {
+            return Ok(());
+        };
+        if new_points.is_empty() {
+            return Ok(());
+        }
+
+        let len = read_logical_len::<S>(fs, directory)?;
+        let start = new_points[0] as usize;
+        if start >= len {
+            return Ok(());
+        }
+        let end = (new_points[new_points.len() - 1] as usize + 1).min(len);
+
+        let flags = StoredBitSlice::<S>::open(
+            fs,
+            directory.join(FLAGS_FILE),
+            bitslice_open_options(Populate::No),
+            Default::default(),
+        )?;
+        let bits = flags.read_bit_range(start as u64..end as u64)?;
+
+        let persisted: Vec<PointOffsetType> = new_points
+            .iter()
+            .copied()
+            .take_while(|&point| (point as usize) < len)
+            .filter(|&point| bits.get(point as usize - start).is_some_and(|bit| *bit))
+            .collect();
+        self.insert_all(&persisted);
+
+        Ok(())
     }
 }
 
@@ -208,5 +290,97 @@ mod tests_mod {
         assert!(flags.get(unset as PointOffsetType));
         assert!(flags.get(beyond));
         assert!(!flags.get(beyond + 1));
+    }
+
+    #[test]
+    fn live_reload_folds_persisted_deletion_on_appended_offsets() {
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+        let fs = Fs::default();
+        persist(&fs, dir.path(), &[false, false, true]);
+
+        let mut flags = InMemoryBitvecFlags::open::<S>(&fs, dir.path()).unwrap();
+        assert_eq!(flags.count(), 1);
+
+        // Writer appends two offsets and deletes only the second.
+        {
+            let mut dynamic_flags =
+                DynamicStoredFlags::<S>::open(&fs, dir.path(), Populate::No).unwrap();
+            dynamic_flags.set_len(&fs, 5).unwrap();
+            assert!(!dynamic_flags.set(4, true).unwrap());
+            dynamic_flags.flusher()().unwrap();
+        }
+
+        flags.live_reload::<S>(&fs, &[], &[3, 4]).unwrap();
+
+        assert!(!flags.get(0));
+        assert!(flags.get(2));
+        assert!(!flags.get(3), "live appended offset stays unset");
+        assert!(flags.get(4), "persisted deletion on appended offset");
+        assert_eq!(flags.count(), 2);
+    }
+
+    #[test]
+    fn live_reload_ignores_padding_past_logical_len() {
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+        let fs = Fs::default();
+        persist(&fs, dir.path(), &[true, false, false]);
+
+        // The flags file is preallocated past the logical length. Plant a set
+        // bit in that padding; live-reload must not treat it as a deletion.
+        let padding_bit = 500u64;
+        {
+            let mut stored = StoredBitSlice::<S>::open(
+                &fs,
+                dir.path().join(FLAGS_FILE),
+                OpenOptions {
+                    writeable: true,
+                    need_sequential: false,
+                    populate: Populate::No,
+                    advice: AdviceSetting::Global,
+                },
+                Default::default(),
+            )
+            .unwrap();
+            stored.replace_bit(padding_bit, true).unwrap();
+            stored.flusher()().unwrap();
+        }
+
+        let mut flags = InMemoryBitvecFlags::open::<S>(&fs, dir.path()).unwrap();
+        assert!(flags.get(0));
+        assert!(!flags.get(padding_bit as PointOffsetType));
+
+        flags
+            .live_reload::<S>(&fs, &[], &[1, padding_bit as PointOffsetType])
+            .unwrap();
+
+        assert!(flags.get(0));
+        assert!(
+            !flags.get(padding_bit as PointOffsetType),
+            "padding past logical len must not be folded in"
+        );
+        assert_eq!(flags.count(), 1);
+    }
+
+    #[test]
+    fn live_reload_keeps_unflushed_in_memory_deletions() {
+        let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
+        let fs = Fs::default();
+        persist(&fs, dir.path(), &[false, false, false, false]);
+
+        let mut flags = InMemoryBitvecFlags::open::<S>(&fs, dir.path()).unwrap();
+        // Id-tracker deletion applied in memory, not yet on disk.
+        flags.insert_all(&[1]);
+        assert!(flags.get(1));
+
+        // Disk still has no deletions; appended offset 3 is live on disk.
+        flags.live_reload::<S>(&fs, &[], &[2, 3]).unwrap();
+
+        assert!(
+            flags.get(1),
+            "unflushed in-memory deletion must not be lost"
+        );
+        assert!(!flags.get(2));
+        assert!(!flags.get(3));
+        assert_eq!(flags.count(), 1);
     }
 }
