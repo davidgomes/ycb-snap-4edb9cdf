@@ -305,6 +305,9 @@ pub fn set_up_bin_shim<'a>(
   bin_node_modules_dir_path: &'a Path,
 ) -> Result<EntrySetupOutcome<'a>, std::io::Error> {
   let sys = sys.with_paths_in_errors();
+  if !super::is_valid_bin_target(bin_script) {
+    return Ok(EntrySetupOutcome::Success);
+  }
   let shim_path = bin_node_modules_dir_path.join(bin_name);
   let target_file = package_path.join(bin_script);
 

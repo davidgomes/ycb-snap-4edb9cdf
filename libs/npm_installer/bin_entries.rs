@@ -6,6 +6,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -49,6 +50,45 @@ fn normalize_bin_name(bin_name: &str) -> &str {
     .next()
     .filter(|name| !name.is_empty())
     .unwrap_or(trimmed)
+}
+
+/// Whether `bin_script` is a usable bin target relative to the package
+/// directory. Empty targets, absolute paths, and relative paths that escape
+/// the package via `..` are ignored so we neither create `.bin` entries for
+/// files outside the package nor chmod those files.
+fn is_valid_bin_target(bin_script: &str) -> bool {
+  if bin_script.is_empty() {
+    return false;
+  }
+
+  let original = Path::new(bin_script);
+  if original.is_absolute() || original.has_root() {
+    return false;
+  }
+
+  // Treat `\` as a separator on all platforms so Windows-style traversal
+  // (`..\outside`) is rejected even when running on Unix.
+  let unified = bin_script.replace('\\', "/");
+  let path = Path::new(&unified);
+  if path.is_absolute() || path.has_root() {
+    return false;
+  }
+
+  let mut depth: i32 = 0;
+  for component in path.components() {
+    match component {
+      Component::ParentDir => {
+        if depth == 0 {
+          return false;
+        }
+        depth -= 1;
+      }
+      Component::Normal(_) => depth += 1,
+      Component::CurDir => {}
+      Component::Prefix(_) | Component::RootDir => return false,
+    }
+  }
+  true
 }
 
 pub fn warn_missing_entrypoint(
@@ -161,6 +201,9 @@ impl<'a, TSys: SetupBinEntrySys> BinEntries<'a, TSys> {
       if let Some(bin_entries) = &extra.bin {
         match bin_entries {
           deno_npm::registry::NpmPackageVersionBinEntry::String(script) => {
+            if !is_valid_bin_target(script) {
+              continue;
+            }
             let name = default_bin_name(package);
             if !seen.insert(name) {
               already_seen(self.sys, package_path, script)?;
@@ -171,6 +214,9 @@ impl<'a, TSys: SetupBinEntrySys> BinEntries<'a, TSys> {
           }
           deno_npm::registry::NpmPackageVersionBinEntry::Map(entries) => {
             for (name, script) in entries {
+              if !is_valid_bin_target(script) {
+                continue;
+              }
               let name = normalize_bin_name(name);
               if !seen.insert(name) {
                 already_seen(self.sys, package_path, script)?;
@@ -365,6 +411,9 @@ pub fn set_up_bin_entry<'a>(
   package_path: &'a Path,
   bin_node_modules_dir_path: &Path,
 ) -> Result<EntrySetupOutcome<'a>, std::io::Error> {
+  if !is_valid_bin_target(bin_script) {
+    return Ok(EntrySetupOutcome::Success);
+  }
   let bin_name = normalize_bin_name(bin_name);
   if sys_traits::impls::is_windows() {
     windows_shim::set_up_bin_shim(
@@ -465,6 +514,9 @@ fn symlink_bin_entry<'a>(
   bin_node_modules_dir_path: &Path,
 ) -> Result<EntrySetupOutcome<'a>, std::io::Error> {
   let sys = sys.with_paths_in_errors();
+  if !is_valid_bin_target(bin_script) {
+    return Ok(EntrySetupOutcome::Success);
+  }
   let link = bin_node_modules_dir_path.join(bin_name);
   let original = package_path.join(bin_script);
 
@@ -511,8 +563,8 @@ mod test {
   use deno_npm::resolution::SerializedNpmResolutionSnapshot;
   use deno_semver::package::PackageNv;
   use sys_traits::FsCreateDirAll;
+  use sys_traits::FsRead;
   use sys_traits::FsRemoveDirAll;
-  #[cfg(unix)]
   use sys_traits::FsWrite;
   use sys_traits::PathsInErrorsExt;
 
@@ -577,6 +629,106 @@ mod test {
     assert_eq!(normalize_bin_name("nested/bin/tool"), "tool");
     assert_eq!(normalize_bin_name("nested\\bin\\tool"), "tool");
     assert_eq!(normalize_bin_name("nested/bin/tool/"), "tool");
+  }
+
+  #[test]
+  fn is_valid_bin_target_rejects_empty_absolute_and_escaping() {
+    assert!(!is_valid_bin_target(""));
+    assert!(!is_valid_bin_target("/abs/bin.js"));
+    assert!(!is_valid_bin_target("/"));
+    assert!(!is_valid_bin_target("../outside.js"));
+    assert!(!is_valid_bin_target("foo/../../outside.js"));
+    assert!(!is_valid_bin_target(".."));
+    assert!(!is_valid_bin_target("../"));
+    assert!(!is_valid_bin_target("..\\outside.js"));
+    assert!(!is_valid_bin_target("foo\\..\\..\\outside.js"));
+
+    assert!(is_valid_bin_target("cli.js"));
+    assert!(is_valid_bin_target("bin/cli.js"));
+    assert!(is_valid_bin_target("./bin/cli.js"));
+    assert!(is_valid_bin_target("bin/../cli.js"));
+    assert!(is_valid_bin_target("foo/bar/../baz.js"));
+    assert!(is_valid_bin_target("bin\\cli.js"));
+  }
+
+  #[test]
+  fn collect_bin_files_ignores_invalid_targets() {
+    let sys = sys_traits::impls::RealSys;
+    let package = test_package("mixed-bin");
+    let extra = NpmPackageExtraInfo {
+      bin: Some(deno_npm::registry::NpmPackageVersionBinEntry::Map(
+        [
+          ("ok".to_string(), "bin/cli.js".to_string()),
+          ("empty".to_string(), "".to_string()),
+          ("abs".to_string(), "/tmp/outside.js".to_string()),
+          ("escape".to_string(), "../outside.js".to_string()),
+          (
+            "nested-escape".to_string(),
+            "foo/../../outside.js".to_string(),
+          ),
+          ("still-inside".to_string(), "bin/../cli.js".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+      )),
+      ..Default::default()
+    };
+    let mut entries = BinEntries::new(sys.with_paths_in_errors());
+    entries.add(&package, &extra, PathBuf::from("/node_modules/pkg"));
+
+    let mut bins = entries.collect_bin_files(&empty_snapshot());
+    bins.sort();
+    assert_eq!(
+      bins,
+      vec![
+        (
+          "ok".to_string(),
+          PathBuf::from("/node_modules/pkg/bin/cli.js")
+        ),
+        (
+          "still-inside".to_string(),
+          PathBuf::from("/node_modules/pkg/bin/../cli.js")
+        ),
+      ]
+    );
+  }
+
+  #[test]
+  fn collect_bin_files_ignores_invalid_string_bin_targets() {
+    let sys = sys_traits::impls::RealSys;
+    for script in ["", "/abs/cli.js", "../outside.js"] {
+      let package = test_package("string-bin");
+      let extra = NpmPackageExtraInfo {
+        bin: Some(deno_npm::registry::NpmPackageVersionBinEntry::String(
+          script.to_string(),
+        )),
+        ..Default::default()
+      };
+      let mut entries = BinEntries::new(sys.with_paths_in_errors());
+      entries.add(&package, &extra, PathBuf::from("/node_modules/pkg"));
+      assert_eq!(
+        entries.collect_bin_files(&empty_snapshot()),
+        Vec::<(String, PathBuf)>::new(),
+        "script {script:?} should be ignored"
+      );
+    }
+
+    let package = test_package("string-bin");
+    let extra = NpmPackageExtraInfo {
+      bin: Some(deno_npm::registry::NpmPackageVersionBinEntry::String(
+        "./bin/cli.js".to_string(),
+      )),
+      ..Default::default()
+    };
+    let mut entries = BinEntries::new(sys.with_paths_in_errors());
+    entries.add(&package, &extra, PathBuf::from("/node_modules/pkg"));
+    assert_eq!(
+      entries.collect_bin_files(&empty_snapshot()),
+      vec![(
+        "string-bin".to_string(),
+        PathBuf::from("/node_modules/pkg/./bin/cli.js")
+      )]
+    );
   }
 
   #[test]
@@ -710,5 +862,204 @@ mod test {
     let result = make_executable_if_exists(&sys, &bin_path);
     assert!(result.is_ok());
     assert!(!result.unwrap()); // file does not exist
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn set_up_bin_entry_ignores_invalid_targets_without_touching_outside_files() {
+    let sys = sys_traits::impls::RealSys;
+    let (dir, _cleanup) = test_dir("invalid_bin_targets");
+    let package_path = dir.join("package");
+    let bin_dir = dir.join(".bin");
+    let outside_path = dir.join("outside.js");
+    sys.fs_create_dir_all(package_path.join("bin")).unwrap();
+    sys.fs_create_dir_all(&bin_dir).unwrap();
+    write_and_chmod(
+      &package_path.join("bin/cli.js"),
+      b"#!/usr/bin/env node\nconsole.log('ok');\n",
+      0o644,
+    );
+    write_and_chmod(&outside_path, b"do not touch\n", 0o644);
+    let outside_mode_before = file_mode(&outside_path);
+    let outside_contents_before = sys.fs_read_to_string(&outside_path).unwrap();
+
+    let package = test_package("mixed-bin");
+    let extra = NpmPackageExtraInfo::default();
+
+    for (name, script) in [
+      ("empty", ""),
+      ("abs", outside_path.to_str().unwrap()),
+      ("escape", "../outside.js"),
+      ("nested-escape", "bin/../../outside.js"),
+    ] {
+      let outcome = set_up_bin_entry(
+        &sys,
+        &package,
+        &extra,
+        name,
+        script,
+        &package_path,
+        &bin_dir,
+      )
+      .unwrap();
+      assert!(
+        matches!(outcome, EntrySetupOutcome::Success),
+        "invalid target {script:?} should be ignored"
+      );
+      assert!(
+        !sys.fs_exists(bin_dir.join(name)).unwrap(),
+        "should not create .bin entry for {name}"
+      );
+    }
+
+    let outcome = set_up_bin_entry(
+      &sys,
+      &package,
+      &extra,
+      "ok",
+      "bin/cli.js",
+      &package_path,
+      &bin_dir,
+    )
+    .unwrap();
+    assert!(matches!(outcome, EntrySetupOutcome::Success));
+    assert!(sys.fs_exists(bin_dir.join("ok")).unwrap());
+
+    assert_eq!(file_mode(&outside_path), outside_mode_before);
+    assert_eq!(
+      sys.fs_read_to_string(&outside_path).unwrap(),
+      outside_contents_before
+    );
+  }
+
+  #[test]
+  fn set_up_bin_shim_ignores_invalid_targets_without_touching_outside_files() {
+    let sys = sys_traits::impls::RealSys;
+    let (dir, _cleanup) = test_dir("invalid_bin_shim");
+    let package_path = dir.join("package");
+    let bin_dir = dir.join(".bin");
+    let outside_path = dir.join("outside.js");
+    sys.fs_create_dir_all(package_path.join("bin")).unwrap();
+    sys.fs_create_dir_all(&bin_dir).unwrap();
+    sys
+      .fs_write(
+        package_path.join("bin/cli.js"),
+        b"#!/usr/bin/env node\nconsole.log('ok');\n",
+      )
+      .unwrap();
+    sys.fs_write(&outside_path, b"do not touch\n").unwrap();
+    let outside_contents_before = sys.fs_read_to_string(&outside_path).unwrap();
+
+    let package = test_package("mixed-bin");
+    let extra = NpmPackageExtraInfo::default();
+
+    for (name, script) in [
+      ("empty", ""),
+      ("abs", outside_path.to_str().unwrap()),
+      ("escape", "../outside.js"),
+      ("nested-escape", "bin/../../outside.js"),
+    ] {
+      let outcome = windows_shim::set_up_bin_shim(
+        &sys,
+        &package,
+        &extra,
+        name,
+        script,
+        &package_path,
+        &bin_dir,
+      )
+      .unwrap();
+      assert!(
+        matches!(outcome, EntrySetupOutcome::Success),
+        "invalid target {script:?} should be ignored"
+      );
+      assert!(!sys.fs_exists(bin_dir.join(name)).unwrap());
+      assert!(
+        !sys
+          .fs_exists(bin_dir.join(name).with_extension("cmd"))
+          .unwrap()
+      );
+      assert!(
+        !sys
+          .fs_exists(bin_dir.join(name).with_extension("ps1"))
+          .unwrap()
+      );
+    }
+
+    let outcome = windows_shim::set_up_bin_shim(
+      &sys,
+      &package,
+      &extra,
+      "ok",
+      "bin/cli.js",
+      &package_path,
+      &bin_dir,
+    )
+    .unwrap();
+    assert!(matches!(outcome, EntrySetupOutcome::Success));
+    assert!(sys.fs_exists(bin_dir.join("ok")).unwrap());
+    assert!(sys.fs_exists(bin_dir.join("ok.cmd")).unwrap());
+    assert!(sys.fs_exists(bin_dir.join("ok.ps1")).unwrap());
+
+    assert_eq!(
+      sys.fs_read_to_string(&outside_path).unwrap(),
+      outside_contents_before
+    );
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn finish_installs_valid_bins_and_skips_invalid_from_same_package() {
+    let sys = sys_traits::impls::RealSys;
+    let (dir, _cleanup) = test_dir("finish_mixed_bins");
+    let package_path = dir.join("package");
+    let bin_dir = dir.join(".bin");
+    let outside_path = dir.join("outside.js");
+    sys.fs_create_dir_all(package_path.join("bin")).unwrap();
+    write_and_chmod(
+      &package_path.join("bin/cli.js"),
+      b"#!/usr/bin/env node\nconsole.log('ok');\n",
+      0o644,
+    );
+    write_and_chmod(&outside_path, b"do not touch\n", 0o644);
+    let outside_mode_before = file_mode(&outside_path);
+    let outside_contents_before = sys.fs_read_to_string(&outside_path).unwrap();
+
+    let package = test_package("@scope/mixed-bin");
+    let extra = NpmPackageExtraInfo {
+      bin: Some(deno_npm::registry::NpmPackageVersionBinEntry::Map(
+        [
+          ("@scope/ok".to_string(), "bin/cli.js".to_string()),
+          ("empty".to_string(), "".to_string()),
+          ("escape".to_string(), "../outside.js".to_string()),
+          (
+            "abs".to_string(),
+            outside_path.to_string_lossy().into_owned(),
+          ),
+        ]
+        .into_iter()
+        .collect(),
+      )),
+      ..Default::default()
+    };
+    let mut entries = BinEntries::new(sys.with_paths_in_errors());
+    entries.add(&package, &extra, package_path.clone());
+    entries
+      .finish(&empty_snapshot(), &bin_dir, |outcome| {
+        outcome.warn_if_failed();
+      })
+      .unwrap();
+
+    assert!(sys.fs_exists(bin_dir.join("ok")).unwrap());
+    assert!(!sys.fs_exists(bin_dir.join("empty")).unwrap());
+    assert!(!sys.fs_exists(bin_dir.join("escape")).unwrap());
+    assert!(!sys.fs_exists(bin_dir.join("abs")).unwrap());
+    assert!(!sys.fs_exists(bin_dir.join("@scope")).unwrap());
+
+    assert_eq!(file_mode(&outside_path), outside_mode_before);
+    assert_eq!(
+      sys.fs_read_to_string(&outside_path).unwrap(),
+      outside_contents_before
+    );
   }
 }
