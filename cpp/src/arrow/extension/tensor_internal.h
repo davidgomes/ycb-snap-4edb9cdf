@@ -1,0 +1,59 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+#pragma once
+
+#include <cstdint>
+#include <span>
+#include <vector>
+
+#include "arrow/json/rapidjson_defs.h"  // IWYU pragma: keep
+#include "arrow/result.h"
+#include "arrow/type_fwd.h"
+
+#include <rapidjson/document.h>
+
+namespace arrow::internal {
+
+/// \brief Return the name of a RapidJSON value's type (e.g., "Null", "Array", "Number").
+ARROW_EXPORT
+const char* JsonTypeName(const ::arrow::rapidjson::Value& v);
+
+/// \brief Compute the product of the given shape dimensions.
+///
+/// Returns Status::Invalid if the product would overflow int64_t.
+/// An empty shape returns 1 (the multiplicative identity).
+ARROW_EXPORT
+Result<int64_t> ComputeShapeProduct(std::span<const int64_t> shape);
+
+ARROW_EXPORT
+bool IsPermutationTrivial(std::span<const int64_t> permutation);
+
+ARROW_EXPORT
+Status IsPermutationValid(std::span<const int64_t> permutation);
+
+ARROW_EXPORT
+Result<std::vector<int64_t>> ComputeStrides(const std::shared_ptr<DataType>& value_type,
+                                            std::span<const int64_t> shape,
+                                            std::span<const int64_t> permutation);
+
+ARROW_EXPORT
+Result<std::shared_ptr<Buffer>> SliceTensorBuffer(const Array& data_array,
+                                                  const DataType& value_type,
+                                                  std::span<const int64_t> shape);
+
+}  // namespace arrow::internal

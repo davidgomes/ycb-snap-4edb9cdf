@@ -1,0 +1,61 @@
+{
+  "name": "arrow",
+  "version-string": "25.0.0-SNAPSHOT",
+  "dependencies": [
+    "abseil",
+    {
+      "name": "aws-sdk-cpp",
+      "features": [
+        "config",
+        "cognito-identity",
+        "identity-management",
+        "s3",
+        "sts",
+        "transfer"
+      ]
+    },
+    "benchmark",
+    "boost-beast",
+    "boost-cmake",
+    "boost-crc",
+    "boost-filesystem",
+    "boost-locale",
+    "boost-multiprecision",
+    "boost-optional",
+    "boost-process",
+    "boost-system",
+    "boost-variant",
+    "boost-xpressive",
+    "brotli",
+    "bzip2",
+    "c-ares",
+    "curl",
+    "flatbuffers",
+    "gflags",
+    "glog",
+    {
+      "name": "google-cloud-cpp",
+      "default-features": false,
+      "features": [
+        "storage"
+      ]
+    },
+    "grpc",
+    "gtest",
+    "lz4",
+    "openssl",
+    "orc",
+    "protobuf",
+    "rapidjson",
+    "re2",
+    "snappy",
+    "sqlite3",
+    "thrift",
+    "utf8proc",
+    "xsimd",
+    "zlib",
+    "zstd"
+  ],
+  "$comment": "We can update builtin-baseline by 'vcpkg x-update-baseline'",
+  "builtin-baseline": "40c89449f0ccce12d21f8a906639f6c2c649b9e7"
+}
