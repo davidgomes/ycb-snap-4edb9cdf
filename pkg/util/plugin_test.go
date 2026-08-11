@@ -1,0 +1,93 @@
+// Copyright 2016, Pulumi Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//nolint:revive // Legacy package name we don't want to change
+package util
+
+import (
+	"testing"
+
+	"github.com/blang/semver"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/pulumi/pulumi/sdk/v3/go/common/apitype"
+	"github.com/pulumi/pulumi/sdk/v3/go/common/workspace"
+)
+
+func TestUrlAlreadySet(t *testing.T) {
+	t.Parallel()
+
+	spec := workspace.PluginDescriptor{
+		Name:              "acme",
+		Kind:              apitype.ResourcePlugin,
+		PluginDownloadURL: "github://api.github.com/pulumiverse",
+	}
+	res := SetKnownPluginDownloadURL(&spec)
+	assert.False(t, res)
+}
+
+func TestKnownProvider(t *testing.T) {
+	t.Parallel()
+
+	spec := workspace.PluginDescriptor{
+		Name: "acme",
+		Kind: apitype.ResourcePlugin,
+	}
+	res := SetKnownPluginDownloadURL(&spec)
+	assert.True(t, res)
+	assert.Equal(t, "github://api.github.com/pulumiverse", spec.PluginDownloadURL)
+}
+
+func TestKnownLanguageRuntimeHCL(t *testing.T) {
+	t.Parallel()
+
+	spec := workspace.PluginDescriptor{
+		Name: "hcl",
+		Kind: apitype.LanguagePlugin,
+	}
+	res := SetKnownPluginDownloadURL(&spec)
+	assert.True(t, res)
+
+	// Check that version was set
+	require.NotNil(t, spec.Version)
+	assert.NotZero(t, *spec.Version)
+	// Now unset it for the comparison
+	spec.Version = nil
+
+	assert.Equal(t, workspace.PluginDescriptor{
+		Name:              "hcl",
+		Kind:              apitype.LanguagePlugin,
+		PluginDownloadURL: "github://api.github.com/pulumi-labs/pulumi-hcl",
+	}, spec)
+}
+
+func TestKnownLanguageRuntimePreservesExplicitVersion(t *testing.T) {
+	t.Parallel()
+
+	explicit := semver.MustParse("0.3.0")
+	spec := workspace.PluginDescriptor{
+		Name:    "hcl",
+		Kind:    apitype.LanguagePlugin,
+		Version: &explicit,
+	}
+	res := SetKnownPluginDownloadURL(&spec)
+	assert.True(t, res)
+	assert.Equal(t, workspace.PluginDescriptor{
+		Name:              "hcl",
+		Kind:              apitype.LanguagePlugin,
+		PluginDownloadURL: "github://api.github.com/pulumi-labs/pulumi-hcl",
+		Version:           &explicit,
+	}, spec)
+}
