@@ -1,0 +1,635 @@
+package indexgateway
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"math"
+	"net/http"
+	"sort"
+	"time"
+
+	"github.com/c2h5oh/datasize"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
+	"github.com/grafana/dskit/services"
+	"github.com/grafana/dskit/tenant"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/labels"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
+	iter "github.com/grafana/loki/v3/pkg/iter/v2"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logql/syntax"
+	"github.com/grafana/loki/v3/pkg/querier/plan"
+	v1 "github.com/grafana/loki/v3/pkg/storage/bloom/v1"
+	"github.com/grafana/loki/v3/pkg/storage/chunk"
+	"github.com/grafana/loki/v3/pkg/storage/stores"
+	"github.com/grafana/loki/v3/pkg/storage/stores/index"
+	"github.com/grafana/loki/v3/pkg/storage/stores/index/seriesvolume"
+	tsdb_index "github.com/grafana/loki/v3/pkg/storage/stores/shipper/indexshipper/tsdb/index"
+	"github.com/grafana/loki/v3/pkg/storage/stores/shipper/indexshipper/tsdb/sharding"
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
+)
+
+var tracer = otel.Tracer("pkg/indexgateway")
+
+type IndexQuerier interface {
+	stores.ChunkFetcher
+	index.BaseReader
+	index.StatsReader
+	Stop()
+}
+
+type BloomQuerier interface {
+	FilterChunkRefs(ctx context.Context, tenant string, from, through model.Time, series map[uint64]labels.Labels, chunks []*logproto.ChunkRef, plan plan.QueryPlan) ([]*logproto.ChunkRef, bool, error)
+}
+
+type Gateway struct {
+	services.Service
+
+	indexQuerier IndexQuerier
+	bloomQuerier BloomQuerier
+	metrics      *Metrics
+
+	cfg    Config
+	limits Limits
+	log    log.Logger
+}
+
+// NewIndexGateway instantiates a new Index Gateway and start its services.
+//
+// In case it is configured to be in ring mode, a Basic Service wrapping the ring client is started.
+// Otherwise, it starts an Idle Service that doesn't have lifecycle hooks.
+func NewIndexGateway(cfg Config, limits Limits, log log.Logger, r prometheus.Registerer, indexQuerier IndexQuerier, _ any, bloomQuerier BloomQuerier) (*Gateway, error) {
+	g := &Gateway{
+		indexQuerier: indexQuerier,
+		bloomQuerier: bloomQuerier,
+		cfg:          cfg,
+		limits:       limits,
+		log:          log,
+		metrics:      NewMetrics(r),
+	}
+
+	g.Service = services.NewIdleService(nil, func(_ error) error {
+		g.indexQuerier.Stop()
+		return nil
+	})
+
+	return g, nil
+}
+
+// indexSyncer is implemented by an index store that can trigger an on-demand
+// sync and report per-index sync status. The gateway's indexQuerier satisfies it
+// when backed by a syncable (TSDB) index store.
+type indexSyncer interface {
+	TriggerSync() bool
+	SyncStatuses() []index.SyncStatus
+}
+
+// SyncIndexesHandler triggers an asynchronous index sync (refresh the
+// object-listing cache, then download newly shipped indexes) so freshly flushed
+// indexes become queryable without waiting for the periodic list-cache TTL. It
+// responds 202 if a new sync was started, 409 if one is already in progress, or
+// 503 if the configured index store has no syncable indexes. The operation is
+// cluster-wide (not tenant-scoped).
+func (g *Gateway) SyncIndexesHandler(w http.ResponseWriter, _ *http.Request) {
+	// A store that is not an indexSyncer, or one with no syncable indexes (an
+	// empty status list - e.g. a non-TSDB backend, or a querier backed by an
+	// index-gateway client), does not support on-demand syncing.
+	syncer, ok := g.indexQuerier.(indexSyncer)
+	if !ok || len(syncer.SyncStatuses()) == 0 {
+		level.Warn(g.log).Log("msg", "index sync requested but the configured index store does not support it")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("index sync not supported by the configured index store\n"))
+		return
+	}
+
+	if syncer.TriggerSync() {
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte("index sync started; use GET /sync-indexes for status\n"))
+		return
+	}
+
+	// A sync (manual or periodic) is already running, so we did not start a new
+	// one: a conflict with the current state of the resource.
+	w.WriteHeader(http.StatusConflict)
+	_, _ = w.Write([]byte("index sync already in progress; use GET /sync-indexes for status\n"))
+}
+
+// SyncIndexStatusHandler reports the current/last sync status of each synced
+// index as a JSON array (one entry per index, e.g. per schema period). The
+// per-index JSON shape is defined by index.SyncStatus.MarshalJSON.
+func (g *Gateway) SyncIndexStatusHandler(w http.ResponseWriter, _ *http.Request) {
+	syncer, ok := g.indexQuerier.(indexSyncer)
+	var statuses []index.SyncStatus
+	if ok {
+		statuses = syncer.SyncStatuses()
+	}
+	// No syncable indexes (not an indexSyncer, or an empty status list) means the
+	// configured index store does not support on-demand syncing.
+	if len(statuses) == 0 {
+		level.Warn(g.log).Log("msg", "index sync status requested but the configured index store does not support it")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("index sync not supported by the configured index store\n"))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(statuses); err != nil {
+		level.Error(g.log).Log("msg", "failed encoding index sync status response", "err", err)
+	}
+}
+
+func (g *Gateway) GetChunkRef(ctx context.Context, req *logproto.GetChunkRefRequest) (result *logproto.GetChunkRefResponse, err error) {
+	logger := util_log.WithContext(ctx, g.log)
+	ctx, sp := tracer.Start(ctx, "indexgateway.GetChunkRef")
+	defer sp.End()
+
+	instanceID, err := tenant.TenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	matchers, err := syntax.ParseMatchers(req.Matchers, true)
+	if err != nil {
+		return nil, err
+	}
+
+	predicate := chunk.NewPredicate(matchers, &req.Plan)
+	chunkRefsLookupStart := time.Now()
+	chunks, _, err := g.indexQuerier.GetChunks(ctx, instanceID, req.From, req.Through, predicate, nil)
+	chunkRefsLookupDuration := time.Since(chunkRefsLookupStart)
+	if err != nil {
+		return nil, err
+	}
+
+	result = &logproto.GetChunkRefResponse{
+		Refs: make([]*logproto.ChunkRef, 0, len(chunks)),
+	}
+	for _, cs := range chunks {
+		for i := range cs {
+			result.Refs = append(result.Refs, &cs[i].ChunkRef)
+		}
+	}
+
+	initialChunkCount := len(result.Refs)
+	result.Stats.TotalChunks = int64(initialChunkCount)
+	result.Stats.PostFilterChunks = int64(initialChunkCount) // populate early for error reponses
+	result.Stats.ChunkRefsLookupTime = chunkRefsLookupDuration.Seconds()
+
+	// Compute unique streams matched from chunk refs
+	// Allocate map size based on chunk count since unique streams <= number of chunks
+	{
+		seen := make(map[uint64]struct{}, initialChunkCount)
+		for _, ref := range result.Refs {
+			seen[ref.Fingerprint] = struct{}{}
+		}
+		result.Stats.TotalStreams = int64(len(seen))
+	}
+
+	defer func() {
+		if err == nil {
+			g.metrics.preFilterChunks.WithLabelValues(routeChunkRefs).Observe(float64(initialChunkCount))
+			g.metrics.postFilterChunks.WithLabelValues(routeChunkRefs).Observe(float64(len(result.Refs)))
+		}
+	}()
+
+	// Return unfiltered results if there is no bloom querier (Bloom Gateway disabled)
+	if g.bloomQuerier == nil {
+		return result, nil
+	}
+
+	// Extract testable LabelFilters from the plan. If there is none, we can
+	// short-circuit and return before making a req to the bloom-gateway (through
+	// the g.bloomQuerier)
+	if len(v1.ExtractTestableLabelMatchers(req.Plan.AST)) == 0 {
+		return result, nil
+	}
+
+	// Doing a "duplicate" index lookup is not ideal,
+	// however, modifying the GetChunkRef() response, which contains the logproto.ChunkRef is neither.
+	start := time.Now()
+	series, err := g.indexQuerier.GetSeries(ctx, instanceID, req.From, req.Through, matchers...)
+	seriesMap := make(map[uint64]labels.Labels, len(series))
+	for _, s := range series {
+		seriesMap[labels.StableHash(s)] = s
+	}
+	sp.AddEvent("indexQuerier.GetSeries", trace.WithAttributes(
+		attribute.String("duration", time.Since(start).String()),
+		attribute.Int("count", len(series)),
+	))
+
+	start = time.Now()
+	chunkRefs, used, err := g.bloomQuerier.FilterChunkRefs(ctx, instanceID, req.From, req.Through, seriesMap, result.Refs, req.Plan)
+	bloomFilterDuration := time.Since(start)
+	if err != nil {
+		return nil, err
+	}
+	sp.AddEvent("bloomQuerier.FilterChunkRefs", trace.WithAttributes(
+		attribute.String("duration", bloomFilterDuration.String()),
+	))
+
+	result.Refs = chunkRefs
+	level.Info(logger).Log("msg", "return filtered chunk refs", "unfiltered", initialChunkCount, "filtered", len(result.Refs), "used_blooms", used)
+	result.Stats.PostFilterChunks = int64(len(result.Refs))
+	result.Stats.UsedBloomFilters = used
+	result.Stats.BloomFilterTime = bloomFilterDuration.Seconds()
+	return result, nil
+}
+
+func (g *Gateway) GetSeries(ctx context.Context, req *logproto.GetSeriesRequest) (*logproto.GetSeriesResponse, error) {
+	instanceID, err := tenant.TenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	matchers, err := syntax.ParseMatchers(req.Matchers, true)
+	if err != nil {
+		return nil, err
+	}
+	series, err := g.indexQuerier.GetSeries(ctx, instanceID, req.From, req.Through, matchers...)
+	if err != nil {
+		return nil, err
+	}
+
+	resp := &logproto.GetSeriesResponse{
+		Series: make([]logproto.IndexSeries, len(series)),
+	}
+	for i := range series {
+		resp.Series[i] = logproto.IndexSeries{
+			Labels: logproto.FromLabelsToLabelAdapters(series[i]),
+		}
+	}
+	return resp, nil
+}
+
+func (g *Gateway) LabelNamesForMetricName(ctx context.Context, req *logproto.LabelNamesForMetricNameRequest) (*logproto.LabelResponse, error) {
+	instanceID, err := tenant.TenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var matchers []*labels.Matcher
+	// An empty matchers string cannot be parsed,
+	// therefore we check the string representation of the matchers.
+	if req.Matchers != syntax.EmptyMatchers {
+		expr, err := syntax.ParseExprWithoutValidation(req.Matchers)
+		if err != nil {
+			return nil, err
+		}
+
+		matcherExpr, ok := expr.(*syntax.MatchersExpr)
+		if !ok {
+			return nil, fmt.Errorf("invalid label matchers found of type %T", expr)
+		}
+		matchers = matcherExpr.Mts
+	}
+	names, err := g.indexQuerier.LabelNamesForMetricName(ctx, instanceID, req.From, req.Through, req.MetricName, matchers...)
+	if err != nil {
+		return nil, err
+	}
+	return &logproto.LabelResponse{
+		Values: names,
+	}, nil
+}
+
+func (g *Gateway) LabelValuesForMetricName(ctx context.Context, req *logproto.LabelValuesForMetricNameRequest) (*logproto.LabelResponse, error) {
+	instanceID, err := tenant.TenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var matchers []*labels.Matcher
+	// An empty matchers string cannot be parsed,
+	// therefore we check the string representation of the matchers.
+	if req.Matchers != syntax.EmptyMatchers {
+		expr, err := syntax.ParseExprWithoutValidation(req.Matchers)
+		if err != nil {
+			return nil, err
+		}
+
+		matcherExpr, ok := expr.(*syntax.MatchersExpr)
+		if !ok {
+			return nil, fmt.Errorf("invalid label matchers found of type %T", expr)
+		}
+		matchers = matcherExpr.Mts
+	}
+	names, err := g.indexQuerier.LabelValuesForMetricName(ctx, instanceID, req.From, req.Through, req.MetricName, req.LabelName, matchers...)
+	if err != nil {
+		return nil, err
+	}
+	return &logproto.LabelResponse{
+		Values: names,
+	}, nil
+}
+
+func (g *Gateway) GetStats(ctx context.Context, req *logproto.IndexStatsRequest) (*logproto.IndexStatsResponse, error) {
+	instanceID, err := tenant.TenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	matchers, err := syntax.ParseMatchers(req.Matchers, true)
+	if err != nil {
+		return nil, err
+	}
+
+	return g.indexQuerier.Stats(ctx, instanceID, req.From, req.Through, matchers...)
+}
+
+func (g *Gateway) GetVolume(ctx context.Context, req *logproto.VolumeRequest) (*logproto.VolumeResponse, error) {
+	instanceID, err := tenant.TenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	matchers, err := syntax.ParseMatchers(req.Matchers, true)
+	if err != nil && req.Matchers != seriesvolume.MatchAny {
+		return nil, err
+	}
+
+	return g.indexQuerier.Volume(ctx, instanceID, req.From, req.Through, req.GetLimit(), req.TargetLabels, req.AggregateBy, matchers...)
+}
+
+func (g *Gateway) GetShards(request *logproto.ShardsRequest, server logproto.IndexGateway_GetShardsServer) error {
+	ctx := server.Context()
+	ctx, sp := tracer.Start(ctx, "indexgateway.GetShards")
+	defer sp.End()
+
+	instanceID, err := tenant.TenantID(ctx)
+	if err != nil {
+		return err
+	}
+
+	p, err := ExtractShardRequestMatchersAndAST(request.Query)
+	if err != nil {
+		return err
+	}
+
+	ok := g.indexQuerier.HasChunkSizingInfo(request.From, request.Through)
+	if !ok {
+		sp.AddEvent("index does not support forSeries", trace.WithAttributes(
+			attribute.String("action", "falling back to indexQuerier.GetShards impl"),
+		))
+		shards, err := g.indexQuerier.GetShards(
+			ctx,
+			instanceID,
+			request.From, request.Through,
+			request.TargetBytesPerShard,
+			p,
+		)
+
+		if err != nil {
+			return err
+		}
+
+		return server.Send(shards)
+	}
+
+	return g.boundedShards(ctx, request, server, instanceID, p)
+}
+
+// boundedShards handles bounded shard requests, optionally returning precomputed chunks.
+func (g *Gateway) boundedShards(
+	ctx context.Context,
+	req *logproto.ShardsRequest,
+	server logproto.IndexGateway_GetShardsServer,
+	instanceID string,
+	p chunk.Predicate,
+) error {
+	// TODO(owen-d): instead of using GetChunks which buffers _all_ the chunks
+	// (expensive when looking at the full fingerprint space), we should
+	// use the `ForSeries` implementation to accumulate batches of chunks to dedupe,
+	// but I'm leaving this as a future improvement. This may be difficult considering
+	// fingerprints aren't necessarily iterated in order because multiple underlying TSDBs
+	// can be queried independently. This could also result in the same chunks being present in
+	// multiple batches. However, this is all OK because we can dedupe them post-blooms and in
+	// many cases the majority of chunks will only be present in a single post-compacted TSDB,
+	// making this more of an edge case than a common occurrence (make sure to check this assumption
+	// as getting it _very_ wrong could harm some cache locality benefits on the bloom-gws by
+	// sending multiple requests to the entire keyspace).
+
+	logger := util_log.WithContext(ctx, g.log)
+	ctx, sp := tracer.Start(ctx, "indexgateway.boundedShards")
+	defer sp.End()
+
+	start := time.Now()
+
+	// 1) for all bounds, get chunk refs
+	refs, err := g.indexQuerier.GetChunkRefsWithSizingInfo(ctx, instanceID, req.From, req.Through, p)
+	if err != nil {
+		return err
+	}
+
+	ct := len(refs)
+
+	sp.AddEvent("queried local index", trace.WithAttributes(
+		attribute.Int("index_chunks_resolved", ct),
+	))
+
+	filtered := refs
+
+	// 2) filter via blooms if enabled
+	filters := v1.ExtractTestableLabelMatchers(p.Plan().AST)
+	// NOTE(chaudum): Temporarily disable bloom filtering of chunk refs,
+	// as this doubles the load on bloom gateways.
+	// if g.bloomQuerier != nil && len(filters) > 0 {
+	// 	xs, err := g.bloomQuerier.FilterChunkRefs(ctx, instanceID, req.From, req.Through, refs, p.Plan())
+	// 	if err != nil {
+	// 		level.Error(logger).Log("msg", "failed to filter chunk refs", "err", err)
+	// 	} else {
+	// 		filtered = xs
+	// 	}
+	// 	sp.LogKV(
+	// 		"stage", "queried bloom gateway",
+	// 		"err", err,
+	// 	)
+	// }
+
+	g.metrics.preFilterChunks.WithLabelValues(routeShards).Observe(float64(ct))
+	g.metrics.postFilterChunks.WithLabelValues(routeShards).Observe(float64(len(filtered)))
+
+	resp := &logproto.ShardsResponse{}
+
+	// Edge case: if there are no chunks after filtering, we still need to return a single shard
+	if len(filtered) == 0 {
+		resp.Shards = []logproto.Shard{
+			{
+				Bounds: logproto.FPBounds{Min: 0, Max: math.MaxUint64},
+				Stats:  &logproto.IndexStatsResponse{},
+			},
+		}
+
+	} else {
+		shards, chunkGrps, err := accumulateChunksToShards(req, refs)
+		if err != nil {
+			return err
+		}
+		resp.Shards = shards
+
+		// If the index gateway is configured to precompute chunks, we can return the chunk groups
+		// alongside the shards, otherwise discarding them
+		if g.limits.TSDBPrecomputeChunks(instanceID) {
+			resp.ChunkGroups = chunkGrps
+		}
+	}
+
+	sp.AddEvent("send shards response", trace.WithAttributes(
+		attribute.Int("shards", len(resp.Shards)),
+	))
+
+	var refCt int
+	for _, grp := range resp.ChunkGroups {
+		refCt += len(grp.Refs)
+	}
+
+	ms := syntax.MatchersExpr{Mts: p.Matchers}
+	level.Debug(logger).Log(
+		"msg", "send shards response",
+		"total_chunks", ct,
+		"post_filter_chunks", len(filtered),
+		"shards", len(resp.Shards),
+		"query", req.Query,
+		"target_bytes_per_shard", datasize.ByteSize(req.TargetBytesPerShard).HumanReadable(),
+		"precomputed_refs", refCt,
+		"matchers", ms.String(),
+		"from", req.From.Time().String(),
+		"through", req.Through.Time().String(),
+		"length", req.Through.Time().Sub(req.From.Time()).String(),
+		"end_delta", time.Since(req.Through.Time()).String(),
+		"filters", len(filters),
+	)
+
+	// Populate index statistics for metrics logging
+	resp.Statistics.Index.TotalChunks = int64(ct)
+	resp.Statistics.Index.PostFilterChunks = int64(len(filtered))
+	// compute unique streams matched post-filtering
+	{
+		seen := make(map[model.Fingerprint]struct{}, 1024)
+		for _, ref := range filtered {
+			seen[model.Fingerprint(ref.Fingerprint)] = struct{}{}
+		}
+		resp.Statistics.Index.TotalStreams = int64(len(seen))
+	}
+	resp.Statistics.Index.ShardsDuration = int64(time.Since(start))
+
+	// 3) build shards
+	return server.Send(resp)
+}
+
+// ExtractShardRequestMatchersAndAST extracts the matchers and AST from a query string.
+// It errors if there is more than one matcher group in the AST as this is supposed to be
+// split out during query planning before reaching this point.
+func ExtractShardRequestMatchersAndAST(query string) (chunk.Predicate, error) {
+	expr, err := syntax.ParseExpr(query)
+	if err != nil {
+		return chunk.Predicate{}, err
+	}
+
+	ms, err := syntax.MatcherGroups(expr)
+	if err != nil {
+		return chunk.Predicate{}, err
+	}
+
+	var matchers []*labels.Matcher
+	switch len(ms) {
+	case 0:
+		// nothing to do
+	case 1:
+		matchers = ms[0].Matchers
+	default:
+		return chunk.Predicate{}, fmt.Errorf(
+			"multiple matcher groups are not supported in GetShards. This is likely an internal bug as binary operations should be dispatched separately in planning",
+		)
+	}
+
+	return chunk.NewPredicate(matchers, &plan.QueryPlan{
+		AST: expr,
+	}), nil
+}
+
+func accumulateChunksToShards(
+	req *logproto.ShardsRequest,
+	filtered []logproto.ChunkRefWithSizingInfo,
+) ([]logproto.Shard, []logproto.ChunkRefGroup, error) {
+	// map for looking up post-filtered chunks in O(n) while iterating the index again for sizing info
+	filteredM := make(map[model.Fingerprint][]logproto.ChunkRefWithSizingInfo, 1024)
+	for _, ref := range filtered {
+		filteredM[model.Fingerprint(ref.Fingerprint)] = append(filteredM[model.Fingerprint(ref.Fingerprint)], ref)
+	}
+
+	collectedSeries := sharding.SizedFPs(sharding.SizedFPsPool.Get(len(filteredM)))
+	defer func() { sharding.SizedFPsPool.Put(collectedSeries) }()
+
+	for fp, chks := range filteredM {
+		x := sharding.SizedFP{Fp: fp}
+		x.Stats.Chunks = uint64(len(chks))
+
+		for _, chk := range chks {
+			x.Stats.Entries += uint64(chk.Entries)
+			x.Stats.Bytes += uint64(chk.KB << 10)
+		}
+		collectedSeries = append(collectedSeries, x)
+	}
+	sort.Sort(collectedSeries)
+
+	shards := collectedSeries.ShardsFor(req.TargetBytesPerShard)
+	chkGrps := make([]logproto.ChunkRefGroup, 0, len(shards))
+	for _, s := range shards {
+		from := sort.Search(len(filtered), func(i int) bool {
+			return filtered[i].Fingerprint >= uint64(s.Bounds.Min)
+		})
+		through := sort.Search(len(filtered), func(i int) bool {
+			return filtered[i].Fingerprint > uint64(s.Bounds.Max)
+		})
+		chkGrps = append(chkGrps, logproto.ChunkRefGroup{
+			Refs: refsWithSizingInfoToRefs(filtered[from:through]),
+		})
+	}
+
+	return shards, chkGrps, nil
+}
+
+func refsWithSizingInfoToRefs(refsWithSizingInfo []logproto.ChunkRefWithSizingInfo) []*logproto.ChunkRef {
+	refs := make([]*logproto.ChunkRef, 0, len(refsWithSizingInfo))
+	for _, refWithSizingInfo := range refsWithSizingInfo {
+		refs = append(refs, &refWithSizingInfo.ChunkRef)
+	}
+
+	return refs
+}
+
+type refWithSizingInfo struct {
+	ref     *logproto.ChunkRef
+	KB      uint32
+	Entries uint32
+}
+
+// careful: only checks from,through,checksum
+func (r refWithSizingInfo) Cmp(chk tsdb_index.ChunkMeta) iter.Ord {
+	ref := *r.ref
+	chkFrom := model.Time(chk.MinTime)
+	if ref.From != chkFrom {
+		if ref.From < chkFrom {
+			return iter.Less
+		}
+		return iter.Greater
+	}
+
+	chkThrough := model.Time(chk.MaxTime)
+	if ref.Through != chkThrough {
+		if ref.Through < chkThrough {
+			return iter.Less
+		}
+		return iter.Greater
+	}
+
+	if ref.Checksum != chk.Checksum {
+		if ref.Checksum < chk.Checksum {
+			return iter.Less
+		}
+		return iter.Greater
+	}
+
+	return iter.Eq
+}
