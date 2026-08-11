@@ -604,7 +604,10 @@ function _M.http_log(conf, ctx)
 
     if vars.request_type == "ai_stream" or vars.request_type == "ai_chat" then
         local llm_time_to_first_token = vars.llm_time_to_first_token
-        if llm_time_to_first_token ~= "0" then
+        local status = tonumber(vars.status)
+        -- llm_latency has no status label; it is meant for successfully served
+        -- LLM responses. Skip HTTP >= 400 so 429/5xx do not pollute the histogram.
+        if status and status < 400 and llm_time_to_first_token ~= "0" then
             -- type="total": full response latency. For non-streaming this equals
             -- llm_time_to_first_token; for streaming, that var holds only the
             -- TTFT, so use apisix_upstream_response_time (refreshed on every
