@@ -39,23 +39,38 @@ public class LinuxIoMetricsCollectorTest {
     public void testReadProcFile() throws IOException {
         TestDirectory testDirectory = new TestDirectory();
         Time time = new MockTime(0L, 100L, 1000L);
-        testDirectory.writeProcFile(123L, 456L);
+        testDirectory.writeProcFile(1L, 2L, 3L, 4L, 123L, 456L, 5L);
         LinuxIoMetricsCollector collector = new LinuxIoMetricsCollector(testDirectory.baseDir.getAbsolutePath(), time);
 
         // Test that we can read the values we wrote.
         assertTrue(collector.usable());
+        assertEquals(1L, collector.rchar());
+        assertEquals(2L, collector.wchar());
+        assertEquals(3L, collector.syscr());
+        assertEquals(4L, collector.syscw());
         assertEquals(123L, collector.readBytes());
         assertEquals(456L, collector.writeBytes());
-        testDirectory.writeProcFile(124L, 457L);
+        assertEquals(5L, collector.cancelledWriteBytes());
+        testDirectory.writeProcFile(11L, 22L, 33L, 44L, 124L, 457L, 55L);
 
         // The previous values should still be cached.
+        assertEquals(1L, collector.rchar());
+        assertEquals(2L, collector.wchar());
+        assertEquals(3L, collector.syscr());
+        assertEquals(4L, collector.syscw());
         assertEquals(123L, collector.readBytes());
         assertEquals(456L, collector.writeBytes());
+        assertEquals(5L, collector.cancelledWriteBytes());
 
         // Update the time, and the values should be re-read.
         time.sleep(1);
+        assertEquals(11L, collector.rchar());
+        assertEquals(22L, collector.wchar());
+        assertEquals(33L, collector.syscr());
+        assertEquals(44L, collector.syscw());
         assertEquals(124L, collector.readBytes());
         assertEquals(457L, collector.writeBytes());
+        assertEquals(55L, collector.cancelledWriteBytes());
     }
 
     @Test
@@ -78,14 +93,22 @@ public class LinuxIoMetricsCollectorTest {
             selfDir = Files.createDirectories(baseDir.toPath().resolve("self"));
         }
 
-        void writeProcFile(long readBytes, long writeBytes) throws IOException {
-            String bld = "rchar: 0\n" +
-                         "wchar: 0\n" +
-                         "syschr: 0\n" +
-                         "syscw: 0\n" +
+        void writeProcFile(
+            long rchar,
+            long wchar,
+            long syscr,
+            long syscw,
+            long readBytes,
+            long writeBytes,
+            long cancelledWriteBytes
+        ) throws IOException {
+            String bld = "rchar: " + rchar + "\n" +
+                         "wchar: " + wchar + "\n" +
+                         "syscr: " + syscr + "\n" +
+                         "syscw: " + syscw + "\n" +
                          "read_bytes: " + readBytes + "\n" +
                          "write_bytes: " + writeBytes + "\n" +
-                         "cancelled_write_bytes: 0\n";
+                         "cancelled_write_bytes: " + cancelledWriteBytes + "\n";
             Files.writeString(selfDir.resolve("io"), bld);
         }
     }

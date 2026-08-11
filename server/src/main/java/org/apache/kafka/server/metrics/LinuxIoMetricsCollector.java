@@ -33,19 +33,69 @@ import java.util.List;
 public class LinuxIoMetricsCollector {
 
     private static final Logger LOG = LoggerFactory.getLogger(LinuxIoMetricsCollector.class);
+    private static final String RCHAR_PREFIX = "rchar: ";
+    private static final String WCHAR_PREFIX = "wchar: ";
+    private static final String SYSCR_PREFIX = "syscr: ";
+    private static final String SYSCW_PREFIX = "syscw: ";
     private static final String READ_BYTES_PREFIX = "read_bytes: ";
     private static final String WRITE_BYTES_PREFIX = "write_bytes: ";
+    private static final String CANCELLED_WRITE_BYTES_PREFIX = "cancelled_write_bytes: ";
 
     private final Time time;
     private final Path path;
 
     private long lastUpdateMs = -1L;
+    private long cachedRchar = 0L;
+    private long cachedWchar = 0L;
+    private long cachedSyscr = 0L;
+    private long cachedSyscw = 0L;
     private long cachedReadBytes = 0L;
     private long cachedWriteBytes = 0L;
+    private long cachedCancelledWriteBytes = 0L;
 
     public LinuxIoMetricsCollector(String procRoot, Time time) {
         this.time = time;
         path = Paths.get(procRoot, "self", "io");
+    }
+
+    public long rchar() {
+        synchronized (this) {
+            long curMs = time.milliseconds();
+            if (curMs != lastUpdateMs) {
+                updateValues(curMs);
+            }
+            return cachedRchar;
+        }
+    }
+
+    public long wchar() {
+        synchronized (this) {
+            long curMs = time.milliseconds();
+            if (curMs != lastUpdateMs) {
+                updateValues(curMs);
+            }
+            return cachedWchar;
+        }
+    }
+
+    public long syscr() {
+        synchronized (this) {
+            long curMs = time.milliseconds();
+            if (curMs != lastUpdateMs) {
+                updateValues(curMs);
+            }
+            return cachedSyscr;
+        }
+    }
+
+    public long syscw() {
+        synchronized (this) {
+            long curMs = time.milliseconds();
+            if (curMs != lastUpdateMs) {
+                updateValues(curMs);
+            }
+            return cachedSyscw;
+        }
     }
 
     public long readBytes() {
@@ -68,6 +118,16 @@ public class LinuxIoMetricsCollector {
         }
     }
 
+    public long cancelledWriteBytes() {
+        synchronized (this) {
+            long curMs = time.milliseconds();
+            if (curMs != lastUpdateMs) {
+                updateValues(curMs);
+            }
+            return cachedCancelledWriteBytes;
+        }
+    }
+
     /**
      * Read /proc/self/io.
      * Generally, each line in this file contains a prefix followed by a colon and a number.
@@ -83,14 +143,30 @@ public class LinuxIoMetricsCollector {
     private boolean updateValues(long now) {
         synchronized (this) {
             try {
+                cachedRchar = -1L;
+                cachedWchar = -1L;
+                cachedSyscr = -1L;
+                cachedSyscw = -1L;
                 cachedReadBytes = -1L;
                 cachedWriteBytes = -1L;
+                cachedCancelledWriteBytes = -1L;
                 List<String> lines = Files.readAllLines(path, StandardCharsets.UTF_8);
                 for (String line : lines) {
-                    if (line.startsWith(READ_BYTES_PREFIX)) {
+                    if (line.startsWith(RCHAR_PREFIX)) {
+                        cachedRchar = Long.parseLong(line.substring(RCHAR_PREFIX.length()));
+                    } else if (line.startsWith(WCHAR_PREFIX)) {
+                        cachedWchar = Long.parseLong(line.substring(WCHAR_PREFIX.length()));
+                    } else if (line.startsWith(SYSCR_PREFIX)) {
+                        cachedSyscr = Long.parseLong(line.substring(SYSCR_PREFIX.length()));
+                    } else if (line.startsWith(SYSCW_PREFIX)) {
+                        cachedSyscw = Long.parseLong(line.substring(SYSCW_PREFIX.length()));
+                    } else if (line.startsWith(READ_BYTES_PREFIX)) {
                         cachedReadBytes = Long.parseLong(line.substring(READ_BYTES_PREFIX.length()));
                     } else if (line.startsWith(WRITE_BYTES_PREFIX)) {
                         cachedWriteBytes = Long.parseLong(line.substring(WRITE_BYTES_PREFIX.length()));
+                    } else if (line.startsWith(CANCELLED_WRITE_BYTES_PREFIX)) {
+                        cachedCancelledWriteBytes = Long.parseLong(
+                            line.substring(CANCELLED_WRITE_BYTES_PREFIX.length()));
                     }
                 }
                 lastUpdateMs = now;
