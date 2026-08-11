@@ -10,6 +10,7 @@
 #include "leveldb/env.h"
 #include "leveldb/filter_policy.h"
 #include "leveldb/options.h"
+#include "port/port.h"
 #include "table/block_builder.h"
 #include "table/filter_block.h"
 #include "table/format.h"
@@ -162,6 +163,20 @@ void TableBuilder::WriteBlock(BlockBuilder* block, BlockHandle* handle) {
         block_contents = *compressed;
       } else {
         // Snappy not supported, or compressed less than 12.5%, so just
+        // store uncompressed form
+        block_contents = raw;
+        type = kNoCompression;
+      }
+      break;
+    }
+
+    case kZstdCompression: {
+      std::string* compressed = &r->compressed_output;
+      if (port::Zstd_Compress(raw.data(), raw.size(), compressed) &&
+          compressed->size() < raw.size() - (raw.size() / 8u)) {
+        block_contents = *compressed;
+      } else {
+        // Zstd not supported, or compressed less than 12.5%, so just
         // store uncompressed form
         block_contents = raw;
         type = kNoCompression;

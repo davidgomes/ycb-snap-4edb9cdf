@@ -26,7 +26,8 @@ enum CompressionType {
   // NOTE: do not change the values of existing entries, as these are
   // part of the persistent format on disk.
   kNoCompression = 0x0,
-  kSnappyCompression = 0x1
+  kSnappyCompression = 0x1,
+  kZstdCompression = 0x2
 };
 
 // Options to control the behavior of a database (passed to DB::Open)
@@ -128,6 +129,10 @@ struct LEVELDB_EXPORT Options {
   // worth switching to kNoCompression.  Even if the input data is
   // incompressible, the kSnappyCompression implementation will
   // efficiently detect that and will switch to uncompressed mode.
+  //
+  // kZstdCompression offers higher compression ratios.  If Zstd is not
+  // available, or a block does not shrink enough, LevelDB stores that
+  // block uncompressed (same fallback as Snappy).
   CompressionType compression = kSnappyCompression;
 
   // EXPERIMENTAL: If true, append to existing MANIFEST and log files

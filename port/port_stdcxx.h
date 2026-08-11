@@ -28,6 +28,9 @@
 #if HAVE_SNAPPY
 #include <snappy.h>
 #endif  // HAVE_SNAPPY
+#if HAVE_ZSTD
+#include <zstd.h>
+#endif  // HAVE_ZSTD
 
 #include <cassert>
 #include <condition_variable>  // NOLINT
@@ -124,6 +127,65 @@ inline bool Snappy_Uncompress(const char* input, size_t length, char* output) {
   (void)output;
   return false;
 #endif  // HAVE_SNAPPY
+}
+
+inline bool Zstd_Compress(const char* input, size_t length,
+                          std::string* output) {
+#if HAVE_ZSTD
+  size_t outlen = ZSTD_compressBound(length);
+  if (ZSTD_isError(outlen)) {
+    return false;
+  }
+  output->resize(outlen);
+  outlen = ZSTD_compress(&(*output)[0], output->size(), input, length,
+                         /*compressionLevel=*/1);
+  if (ZSTD_isError(outlen)) {
+    return false;
+  }
+  output->resize(outlen);
+  return true;
+#else
+  // Silence compiler warnings about unused arguments.
+  (void)input;
+  (void)length;
+  (void)output;
+  return false;
+#endif  // HAVE_ZSTD
+}
+
+inline bool Zstd_GetUncompressedLength(const char* input, size_t length,
+                                       size_t* result) {
+#if HAVE_ZSTD
+  unsigned long long size = ZSTD_getFrameContentSize(input, length);
+  if (size == ZSTD_CONTENTSIZE_ERROR || size == ZSTD_CONTENTSIZE_UNKNOWN) {
+    return false;
+  }
+  *result = static_cast<size_t>(size);
+  return true;
+#else
+  // Silence compiler warnings about unused arguments.
+  (void)input;
+  (void)length;
+  (void)result;
+  return false;
+#endif  // HAVE_ZSTD
+}
+
+inline bool Zstd_Uncompress(const char* input, size_t length, char* output) {
+#if HAVE_ZSTD
+  size_t ulength;
+  if (!Zstd_GetUncompressedLength(input, length, &ulength)) {
+    return false;
+  }
+  size_t const outlen = ZSTD_decompress(output, ulength, input, length);
+  return !ZSTD_isError(outlen);
+#else
+  // Silence compiler warnings about unused arguments.
+  (void)input;
+  (void)length;
+  (void)output;
+  return false;
+#endif  // HAVE_ZSTD
 }
 
 inline bool GetHeapProfile(void (*func)(void*, const char*, int), void* arg) {

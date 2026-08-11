@@ -423,6 +423,12 @@ class Benchmark {
     } else if (compressed.size() >= sizeof(text)) {
       std::fprintf(stdout, "WARNING: Snappy compression is not effective\n");
     }
+    compressed.clear();
+    if (!port::Zstd_Compress(text, sizeof(text), &compressed)) {
+      std::fprintf(stdout, "WARNING: Zstd compression is not enabled\n");
+    } else if (compressed.size() >= sizeof(text)) {
+      std::fprintf(stdout, "WARNING: Zstd compression is not effective\n");
+    }
   }
 
   void PrintEnvironment() {
