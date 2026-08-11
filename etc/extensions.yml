@@ -1,0 +1,30 @@
+# mongo/etc/extensions.yml
+
+# Artifact URI is {base_url}{name}-{version}-{variant}.tgz
+#
+# Example: for artifacts at
+#  - https://mongot-extension.s3.amazonaws.com/release/mongot-extension-0.0.0-amazon2023-x86_64.tgz
+#  - https://mongot-extension.s3.amazonaws.com/release/mongot-extension-0.0.0-amazon2023-aarch64.tgz
+#
+#    base_url: https://mongot-extension.s3.amazonaws.com/release/
+#    name: mongot-extension
+#    version: 0.0.0
+#    variants:
+#      amazon2023-x86_64: checksum3
+#      amazon2023-aarch64: checksum4
+
+extensions:
+  mongot_extension:
+    base_url: https://mongot-extension.s3.amazonaws.com/release/
+    name: mongot-extension
+    version: 2.0.5
+    variants:
+      amazon2023-x86_64: 4111da2f44062e139df457f0cfc827b8d48d66f6ececb7ca8858d0a0dfcc7f87
+      amazon2023-aarch64: 71cceca42e58d165fbfb7543ce7dc0a559fa49cb753143cd906e4a77d84601d3
+  rerank_extension:
+    base_url: https://mongot-extension.s3.amazonaws.com/release/
+    name: rerank-extension
+    version: 2.0.5
+    variants:
+      amazon2023-x86_64: 49a5127325154ecd854c1bf094f9a7df3823e27b8c773f485f5adf34d9642ca2
+      amazon2023-aarch64: f8d9eca8571699066c0940c9b8cf9578f2d8aa08fa3a15bff9eaed43833fdc05
