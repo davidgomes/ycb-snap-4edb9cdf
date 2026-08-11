@@ -4871,6 +4871,70 @@ TEST_F(ClusterInfoImplTest, ZeroBufferHighWatermarkTimeout) {
             cluster->info()->perConnectionBufferHighWatermarkTimeout());
 }
 
+TEST_F(ClusterInfoImplTest, ShouldPreconnectWithoutMatcher) {
+  const std::string yaml = R"EOF(
+    name: name
+    connect_timeout: 0.25s
+    type: STATIC
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      endpoints:
+        - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: 127.0.0.1
+                    port_value: 1234
+  )EOF";
+
+  auto cluster = makeCluster(yaml);
+  auto host = makeTestHost(cluster->info(), "tcp://127.0.0.1:80");
+  EXPECT_TRUE(cluster->info()->shouldPreconnect(*host));
+}
+
+TEST_F(ClusterInfoImplTest, ShouldPreconnectWithMetadataMatcher) {
+  const std::string yaml = R"EOF(
+    name: name
+    connect_timeout: 0.25s
+    type: STATIC
+    lb_policy: ROUND_ROBIN
+    preconnect_policy:
+      per_upstream_preconnect_ratio: 1.5
+      preconnect_enabled_metadata:
+        filter: envoy.lb
+        path:
+        - key: can_preconnect
+        value:
+          string_match:
+            exact: "true"
+    load_assignment:
+      endpoints:
+        - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: 127.0.0.1
+                    port_value: 1234
+  )EOF";
+
+  auto cluster = makeCluster(yaml);
+
+  envoy::config::core::v3::Metadata matching;
+  Config::Metadata::mutableMetadataValue(matching, "envoy.lb", "can_preconnect")
+      .set_string_value("true");
+  auto matching_host = makeTestHost(cluster->info(), "tcp://127.0.0.1:80", matching);
+  EXPECT_TRUE(cluster->info()->shouldPreconnect(*matching_host));
+
+  envoy::config::core::v3::Metadata non_matching;
+  Config::Metadata::mutableMetadataValue(non_matching, "envoy.lb", "can_preconnect")
+      .set_string_value("false");
+  auto non_matching_host = makeTestHost(cluster->info(), "tcp://127.0.0.1:81", non_matching);
+  EXPECT_FALSE(cluster->info()->shouldPreconnect(*non_matching_host));
+
+  auto no_metadata_host = makeTestHost(cluster->info(), "tcp://127.0.0.1:82");
+  EXPECT_FALSE(cluster->info()->shouldPreconnect(*no_metadata_host));
+}
+
 // Cluster metadata and common config retrieval.
 TEST_P(ParametrizedClusterInfoImplTest, Metadata) {
   scoped_runtime_.mergeValues(

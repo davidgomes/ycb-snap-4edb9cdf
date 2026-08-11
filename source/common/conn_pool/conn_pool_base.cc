@@ -187,6 +187,15 @@ ConnPoolImplBase::tryCreateNewConnection(float global_preconnect_ratio) {
   if (!shouldCreateNewConnection(global_preconnect_ratio)) {
     return ConnectionResult::ShouldNotConnect;
   }
+
+  // Preconnect is limited to hosts that match preconnect_enabled_metadata, when configured.
+  // On-demand connections needed to serve pending streams are never suppressed.
+  if (!host_->cluster().shouldPreconnect(*host_) &&
+      !shouldConnect(pending_streams_.size(), num_active_streams_,
+                     connecting_and_connected_stream_capacity_, 1.0)) {
+    host_->cluster().trafficStats()->upstream_cx_preconnect_skipped_.inc();
+    return ConnectionResult::ShouldNotConnect;
+  }
   ENVOY_LOG(trace, "creating new preconnect connection");
 
   // Drop new connection attempts if the load shed point indicates overload.

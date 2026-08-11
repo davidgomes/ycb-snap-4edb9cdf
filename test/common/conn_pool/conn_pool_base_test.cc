@@ -361,6 +361,65 @@ TEST_F(ConnPoolImplBaseTest, ExplicitPreconnectNotHealthy) {
   EXPECT_FALSE(pool_.maybePreconnectImpl(1));
 }
 
+TEST_F(ConnPoolImplBaseTest, NoPreconnectIfMetadataIneligible) {
+  ON_CALL(*cluster_, perUpstreamPreconnectRatio).WillByDefault(Return(1.5));
+  ON_CALL(*cluster_, shouldPreconnect(_)).WillByDefault(Return(false));
+
+  // On new stream, create only the on-demand connection.
+  EXPECT_CALL(pool_, instantiateActiveClient);
+  auto cancelable = pool_.newStreamImpl(context_, /*can_send_early_data=*/false);
+  CHECK_STATE(0 /*active*/, 1 /*pending*/, 1 /*connecting capacity*/);
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_preconnect_skipped_.value());
+
+  cancelable->cancel(ConnectionPool::CancelPolicy::CloseExcess);
+  pool_.destructAllConnections();
+}
+
+TEST_F(ConnPoolImplBaseTest, PreconnectIfMetadataEligible) {
+  ON_CALL(*cluster_, perUpstreamPreconnectRatio).WillByDefault(Return(1.5));
+  ON_CALL(*cluster_, shouldPreconnect(_)).WillByDefault(Return(true));
+
+  EXPECT_CALL(pool_, instantiateActiveClient).Times(2);
+  auto cancelable = pool_.newStreamImpl(context_, /*can_send_early_data=*/false);
+  CHECK_STATE(0 /*active*/, 1 /*pending*/, 2 /*connecting capacity*/);
+  EXPECT_EQ(0U, cluster_->traffic_stats_->upstream_cx_preconnect_skipped_.value());
+
+  cancelable->cancel(ConnectionPool::CancelPolicy::CloseExcess);
+  pool_.destructAllConnections();
+}
+
+TEST_F(ConnPoolImplBaseTest, NoSkipCounterWhenNoPreconnectDesired) {
+  ON_CALL(*cluster_, perUpstreamPreconnectRatio).WillByDefault(Return(1.0));
+  ON_CALL(*cluster_, shouldPreconnect(_)).WillByDefault(Return(false));
+
+  EXPECT_CALL(pool_, instantiateActiveClient);
+  auto cancelable = pool_.newStreamImpl(context_, /*can_send_early_data=*/false);
+  CHECK_STATE(0 /*active*/, 1 /*pending*/, 1 /*connecting capacity*/);
+  EXPECT_EQ(0U, cluster_->traffic_stats_->upstream_cx_preconnect_skipped_.value());
+
+  cancelable->cancel(ConnectionPool::CancelPolicy::CloseExcess);
+  pool_.destructAllConnections();
+}
+
+TEST_F(ConnPoolImplBaseTest, ExplicitPreconnectSkippedIfIneligible) {
+  ON_CALL(*cluster_, perUpstreamPreconnectRatio).WillByDefault(Return(1.5));
+  ON_CALL(*cluster_, shouldPreconnect(_)).WillByDefault(Return(false));
+
+  EXPECT_FALSE(pool_.maybePreconnectImpl(1.1));
+  CHECK_STATE(0 /*active*/, 0 /*pending*/, 0 /*connecting capacity*/);
+  EXPECT_EQ(1U, cluster_->traffic_stats_->upstream_cx_preconnect_skipped_.value());
+
+  EXPECT_FALSE(pool_.maybePreconnectImpl(1.1));
+  EXPECT_EQ(2U, cluster_->traffic_stats_->upstream_cx_preconnect_skipped_.value());
+}
+
+TEST_F(ConnPoolImplBaseTest, ExplicitPreconnectNoSkipWhenNotWanted) {
+  ON_CALL(*cluster_, shouldPreconnect(_)).WillByDefault(Return(false));
+
+  EXPECT_FALSE(pool_.maybePreconnectImpl(0));
+  EXPECT_EQ(0U, cluster_->traffic_stats_->upstream_cx_preconnect_skipped_.value());
+}
+
 TEST_F(ConnPoolImplDispatcherBaseTest, MaxConnectionDurationTimerNull) {
   // Force a null max connection duration optional.
   // newActiveClientAndStream() will expect the connection duration timer to remain null.

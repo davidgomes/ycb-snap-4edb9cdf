@@ -487,6 +487,7 @@ envoy_cc_library(
         "//envoy/upstream:upstream_interface",
         "//source/common/common:callback_impl_lib",
         "//source/common/common:enum_to_int",
+        "//source/common/common:matchers_lib",
         "//source/common/common:minimal_logger_lib",
         "//source/common/common:packed_struct_lib",
         "//source/common/config:metadata_lib",

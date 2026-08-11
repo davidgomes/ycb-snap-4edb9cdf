@@ -3,12 +3,14 @@
 #include <string>
 
 #include "envoy/config/bootstrap/v3/bootstrap.pb.h"
+#include "envoy/config/cluster/v3/cluster.pb.h"
 #include "envoy/config/listener/v3/listener.pb.h"
 #include "envoy/config/route/v3/route_components.pb.h"
 #include "envoy/extensions/filters/network/http_connection_manager/v3/http_connection_manager.pb.h"
 #include "envoy/registry/registry.h"
 
 #include "source/common/common/cpu_affinity.h"
+#include "source/common/config/metadata.h"
 #include "source/common/http/header_map_impl.h"
 #include "source/common/http/headers.h"
 #include "source/common/network/socket_option_factory.h"
@@ -2573,6 +2575,83 @@ TEST_P(IntegrationTest, RandomPreconnect) {
     clients.front()->close();
     clients.pop_front();
   }
+}
+
+namespace {
+
+void setPreconnectEnabledMetadata(envoy::config::cluster::v3::Cluster& cluster) {
+  auto* matcher = cluster.mutable_preconnect_policy()->mutable_preconnect_enabled_metadata();
+  matcher->set_filter("envoy.lb");
+  matcher->add_path()->set_key("can_preconnect");
+  matcher->mutable_value()->mutable_string_match()->set_exact("true");
+}
+
+void setEndpointPreconnectMetadata(envoy::config::cluster::v3::Cluster& cluster,
+                                   const std::string& value) {
+  auto* metadata = cluster.mutable_load_assignment()
+                       ->mutable_endpoints(0)
+                       ->mutable_lb_endpoints(0)
+                       ->mutable_metadata();
+  Config::Metadata::mutableMetadataValue(*metadata, "envoy.lb", "can_preconnect")
+      .set_string_value(value);
+}
+
+} // namespace
+
+TEST_P(IntegrationTest, PreconnectSkippedForIneligibleHost) {
+  config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+    auto* cluster = bootstrap.mutable_static_resources()->mutable_clusters(0);
+    cluster->mutable_preconnect_policy()->mutable_per_upstream_preconnect_ratio()->set_value(2.0);
+    setPreconnectEnabledMetadata(*cluster);
+    setEndpointPreconnectMetadata(*cluster, "false");
+  });
+  autonomous_upstream_ = true;
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto response = codec_client_->makeHeaderOnlyRequest(default_request_headers_);
+  ASSERT_TRUE(response->waitForEndStream());
+
+  test_server_->waitForCounter("cluster.cluster_0.upstream_cx_total", Eq(1));
+  test_server_->waitForCounter("cluster.cluster_0.upstream_cx_preconnect_skipped", Eq(1));
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+TEST_P(IntegrationTest, PreconnectOpensForEligibleHost) {
+  config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+    auto* cluster = bootstrap.mutable_static_resources()->mutable_clusters(0);
+    cluster->mutable_preconnect_policy()->mutable_per_upstream_preconnect_ratio()->set_value(2.0);
+    setPreconnectEnabledMetadata(*cluster);
+    setEndpointPreconnectMetadata(*cluster, "true");
+  });
+  autonomous_upstream_ = true;
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto response = codec_client_->makeHeaderOnlyRequest(default_request_headers_);
+  ASSERT_TRUE(response->waitForEndStream());
+
+  test_server_->waitForCounter("cluster.cluster_0.upstream_cx_total", Eq(2));
+  EXPECT_EQ(0, test_server_->counter("cluster.cluster_0.upstream_cx_preconnect_skipped")->value());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+TEST_P(IntegrationTest, PreconnectSkipNotCountedWhenNotDesired) {
+  config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+    auto* cluster = bootstrap.mutable_static_resources()->mutable_clusters(0);
+    setPreconnectEnabledMetadata(*cluster);
+    setEndpointPreconnectMetadata(*cluster, "false");
+  });
+  autonomous_upstream_ = true;
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto response = codec_client_->makeHeaderOnlyRequest(default_request_headers_);
+  ASSERT_TRUE(response->waitForEndStream());
+
+  test_server_->waitForCounter("cluster.cluster_0.upstream_cx_total", Eq(1));
+  EXPECT_EQ(0, test_server_->counter("cluster.cluster_0.upstream_cx_preconnect_skipped")->value());
+  EXPECT_EQ("200", response->headers().getStatusValue());
 }
 
 class TestRetryOptionsPredicateFactory : public Upstream::RetryOptionsPredicateFactory {

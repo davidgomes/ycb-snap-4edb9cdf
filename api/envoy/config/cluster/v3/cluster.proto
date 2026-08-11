@@ -14,6 +14,7 @@ import "envoy/config/core/v3/protocol.proto";
 import "envoy/config/core/v3/resolver.proto";
 import "envoy/config/endpoint/v3/endpoint.proto";
 import "envoy/config/metrics/v3/stats.proto";
+import "envoy/type/matcher/v3/metadata.proto";
 import "envoy/type/metadata/v3/metadata.proto";
 import "envoy/type/v3/percent.proto";
 
@@ -754,6 +755,12 @@ message Cluster {
     // harm latency more than the preconnecting helps.
     google.protobuf.DoubleValue predictive_preconnect_ratio = 2
         [(validate.rules).double = {lte: 3.0 gte: 1.0}];
+
+    // If set, preconnect connections are opened only for hosts whose endpoint
+    // metadata matches this matcher. Hosts that do not match still receive
+    // connections on demand when selected to serve real requests. If unset, all
+    // healthy hosts remain eligible for preconnect.
+    type.matcher.v3.MetadataMatcher preconnect_enabled_metadata = 3;
   }
 
   reserved 12, 15, 7, 11, 35;
