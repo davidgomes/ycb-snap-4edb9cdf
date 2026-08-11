@@ -159,7 +159,7 @@ use crate::aggregates::{
 use crate::execution_plan::{CardinalityEffect, EmissionType};
 use crate::filter_pushdown::{
     ChildFilterDescription, ChildPushdownResult, FilterDescription, FilterPushdownPhase,
-    FilterPushdownPropagation, PushedDownPredicate,
+    FilterPushdownPropagation, FilterRemapper, PushedDownPredicate,
 };
 use crate::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use crate::statistics::{ChildStats, StatisticsArgs};
@@ -493,6 +493,18 @@ impl PhysicalGroupBy {
     /// Returns true if this `PhysicalGroupBy` has no group expressions
     pub fn is_empty(&self) -> bool {
         self.expr.is_empty()
+    }
+
+    /// Returns true if an aggregate with this grouping can emit a row when its
+    /// input is empty: a global aggregate, or a grouping-sets / rollup / cube
+    /// that includes the empty grouping set `()`.
+    fn emits_row_on_empty_input(&self) -> bool {
+        if self.expr.is_empty() {
+            return true;
+        }
+        self.groups.iter().any(|null_mask| {
+            null_mask.len() == self.expr.len() && null_mask.iter().all(|&is_null| is_null)
+        })
     }
 
     /// Returns true if this is a "simple" GROUP BY (not using GROUPING SETS/CUBE/ROLLUP).
@@ -2040,71 +2052,42 @@ impl ExecutionPlan for AggregateExec {
         // after grouping - filtering before just eliminates entire groups early.
         // This optimization is NOT safe for filters on aggregated columns (like filtering on
         // the result of SUM or COUNT), as those require computing all groups first.
-
-        // Build grouping columns using output indices because parent filters reference the
-        // AggregateExec's output schema where grouping columns in the output schema. The
-        // grouping expressions reference input columns which may not match the output schema.
         //
-        // It is safe to assume that the output_schema contains group by columns in the same order
-        // as the group by expression. See [`create_schema`] and [`AggregateExec`].
-        let output_schema = self.schema();
-        let grouping_columns: HashSet<_> = (0..self.group_by.expr().len())
-            .map(|i| Column::new(output_schema.field(i).name(), i))
-            .collect();
+        // Parent pushdown results are matched back to parent filters by position, so
+        // supported / unsupported discriminants must stay in the same order as
+        // `parent_filters`. Reordering them can associate a pushed grouping predicate
+        // with an aggregate-output predicate and drop the residual filter.
+        //
+        // Global aggregates and grouping sets that include `()` emit a row even when
+        // the input is empty. Pushing any parent predicate below them — including a
+        // column-free predicate such as `false` — can change results. Aggregate-
+        // generated dynamic filters are still pushed as self-filters below.
 
-        // Analyze each filter separately to determine if it can be pushed down
-        let mut safe_filters = Vec::new();
-        let mut unsafe_filters = Vec::new();
+        let child = self.children()[0];
+        let mut child_desc = ChildFilterDescription::all_unsupported(&parent_filters);
 
-        for filter in parent_filters {
-            let filter_columns: HashSet<_> =
-                collect_columns(&filter).into_iter().collect();
+        if !self.group_by.emits_row_on_empty_input() {
+            // Parent filters reference the AggregateExec output schema, where grouping
+            // columns occupy the leading fields in expression order. See [`create_schema`].
+            let output_schema = self.schema();
+            let grouping_columns: HashSet<_> = (0..self.group_by.expr().len())
+                .map(|i| Column::new(output_schema.field(i).name(), i))
+                .collect();
 
-            // Check if this filter references non-grouping columns
-            let references_non_grouping = !grouping_columns.is_empty()
-                && !filter_columns.is_subset(&grouping_columns);
-
-            if references_non_grouping {
-                unsafe_filters.push(filter);
-                continue;
-            }
-
-            // For GROUPING SETS, verify this filter's columns appear in all grouping sets
-            if self.group_by.groups().len() > 1 {
-                let filter_column_indices: Vec<usize> = filter_columns
-                    .iter()
-                    .filter_map(|filter_col| {
-                        grouping_columns.get(filter_col).map(|col| col.index())
-                    })
-                    .collect();
-
-                // Check if any of this filter's columns are missing from any grouping set
-                let has_missing_column = self.group_by.groups().iter().any(|null_mask| {
-                    filter_column_indices
-                        .iter()
-                        .any(|&idx| null_mask.get(idx) == Some(&true))
-                });
-
-                if has_missing_column {
-                    unsafe_filters.push(filter);
+            let remapper = FilterRemapper::new(child.schema());
+            for pred in child_desc.parent_filters.iter_mut() {
+                if !is_pushable_grouping_filter(
+                    &pred.predicate,
+                    &grouping_columns,
+                    &self.group_by,
+                ) {
                     continue;
                 }
+                if let Some(remapped) = remapper.try_remap(&pred.predicate)? {
+                    *pred = PushedDownPredicate::supported(remapped);
+                }
             }
-
-            // This filter is safe to push down
-            safe_filters.push(filter);
         }
-
-        // Build child filter description with both safe and unsafe filters
-        let child = self.children()[0];
-        let mut child_desc = ChildFilterDescription::from_child(&safe_filters, child)?;
-
-        // Add unsafe filters as unsupported
-        child_desc.parent_filters.extend(
-            unsafe_filters
-                .into_iter()
-                .map(PushedDownPredicate::unsupported),
-        );
 
         // Include self dynamic filter when it's possible
         if phase == FilterPushdownPhase::Post
@@ -2547,6 +2530,47 @@ impl AggregateExec {
 
         Ok(Arc::new(aggregate))
     }
+}
+
+/// Returns true if `filter` may be pushed below this aggregate.
+///
+/// Only predicates whose columns are grouping outputs present in every grouping
+/// set are pushable. Filters on aggregate-result columns stay above, including
+/// when an aggregate reuses an input column name (e.g. `MAX(a) AS a`).
+fn is_pushable_grouping_filter(
+    filter: &Arc<dyn PhysicalExpr>,
+    grouping_columns: &HashSet<Column>,
+    group_by: &PhysicalGroupBy,
+) -> bool {
+    let filter_columns: HashSet<_> = collect_columns(filter).into_iter().collect();
+
+    // Reject filters on aggregate outputs (or any non-grouping column). Compare
+    // by name and index so `MAX(a) AS a` is not treated as grouping column `a`.
+    if !filter_columns.is_subset(grouping_columns) {
+        return false;
+    }
+
+    // GROUPING SETS: only columns present in every grouping set may be pushed.
+    if group_by.groups().len() > 1 {
+        let filter_column_indices: Vec<usize> = filter_columns
+            .iter()
+            .filter_map(|filter_col| {
+                grouping_columns.get(filter_col).map(|col| col.index())
+            })
+            .collect();
+
+        let has_missing_column = group_by.groups().iter().any(|null_mask| {
+            filter_column_indices
+                .iter()
+                .any(|&idx| null_mask.get(idx) == Some(&true))
+        });
+
+        if has_missing_column {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Creates the output schema for an [`AggregateExec`] containing the group by columns followed

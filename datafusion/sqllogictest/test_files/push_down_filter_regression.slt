@@ -518,6 +518,83 @@ physical_plan
 statement ok
 drop table agg_filter_pushdown;
 
+########
+# Mixed grouping + aggregate-output filters, empty-input aggregates, and
+# aggregate output names that collide with input columns.
+########
+
+statement ok
+COPY (
+  SELECT * FROM (VALUES
+    ('x', 'foo'),
+    ('x', 'foo'),
+    ('y', 'foo'),
+    ('z', 'bar'),
+    ('z', 'bar')
+  ) AS v(a, b)
+) TO 'test_files/scratch/push_down_filter_regression/agg_mixed_filter_pushdown.parquet'
+STORED AS PARQUET;
+
+statement ok
+CREATE EXTERNAL TABLE agg_mixed_filter_pushdown (a VARCHAR, b VARCHAR)
+STORED AS PARQUET
+LOCATION 'test_files/scratch/push_down_filter_regression/agg_mixed_filter_pushdown.parquet';
+
+# Mixed HAVING: grouping predicate may push; count filter must remain.
+# Dropping cnt would incorrectly return (y, foo, 1) as well.
+query TTI rowsort
+SELECT a, b, count(*) AS cnt
+FROM agg_mixed_filter_pushdown
+GROUP BY a, b
+HAVING count(*) = 2 AND b = 'foo';
+----
+x foo 2
+
+query TT
+EXPLAIN SELECT a, b, count(*) AS cnt
+FROM agg_mixed_filter_pushdown
+GROUP BY a, b
+HAVING count(*) = 2 AND b = 'foo';
+----
+physical_plan
+01)ProjectionExec: expr=[a@0 as a, b@1 as b, count(Int64(1))@2 as cnt]
+02)--FilterExec: count(Int64(1))@2 = 2
+03)----AggregateExec: mode=FinalPartitioned, gby=[a@0 as a, b@1 as b], aggr=[count(Int64(1))], ordering_mode=PartiallySorted([1])
+04)------RepartitionExec: partitioning=Hash([a@0, b@1], 4), input_partitions=4
+05)--------AggregateExec: mode=Partial, gby=[a@0 as a, b@1 as b], aggr=[count(Int64(1))], ordering_mode=PartiallySorted([1])
+06)----------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+07)------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/push_down_filter_regression/agg_mixed_filter_pushdown.parquet]]}, projection=[a, b], file_type=parquet, predicate=b@1 = foo, pruning_predicate=b_null_count@2 != row_count@3 AND b_min@0 <= foo AND foo <= b_max@1, required_guarantees=[b in (foo)]
+
+# Global aggregate / empty grouping set HAVING false must not keep the empty-input row.
+query I
+SELECT count(*) FROM agg_mixed_filter_pushdown HAVING false;
+----
+
+query I
+SELECT count(*) FROM agg_mixed_filter_pushdown GROUP BY GROUPING SETS (()) HAVING false;
+----
+
+query I
+SELECT count(*) FROM agg_mixed_filter_pushdown GROUP BY ROLLUP(a) HAVING false;
+----
+
+# Name collision: filter on MAX(a) AS a must apply to the aggregate output.
+# If incorrectly pushed to input column a, max(a)='x' would incorrectly survive.
+query T
+SELECT a FROM (
+  SELECT max(a) AS a FROM agg_mixed_filter_pushdown
+) WHERE a = 'x';
+----
+
+query TT
+SELECT a, b FROM (
+  SELECT b, max(a) AS a FROM agg_mixed_filter_pushdown GROUP BY b
+) q WHERE a = 'x' AND b = 'foo';
+----
+
+statement ok
+drop table agg_mixed_filter_pushdown;
+
 # Config reset
 
 # The SLT runner sets `target_partitions` to 4 instead of using the default, so
