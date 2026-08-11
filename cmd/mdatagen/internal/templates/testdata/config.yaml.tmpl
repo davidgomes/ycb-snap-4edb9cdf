@@ -1,0 +1,115 @@
+{{- $reag := .ReaggregationEnabled -}}
+default:
+all_set:
+{{- if $reag }}
+  {{- if .Metrics }}
+  metrics:
+    {{- range $name, $metric := .Metrics }}
+    {{ $name }}:
+      enabled: true
+      attributes: [{{- range $index, $element := $metric.Attributes -}}{{ if $index }},{{ end }}"{{ (attributeInfo $element).Name }}"{{ end -}}]
+    {{- end }}
+  {{- end }}
+  {{- if .Events }}
+  events:
+    {{- range $name, $_ := .Events }}
+    {{ $name }}:
+      enabled: true
+    {{- end }}
+  {{- end }}
+  {{- if .ResourceAttributes }}
+  resource_attributes:
+    {{- range $name, $_ := .ResourceAttributes }}
+    {{ $name }}:
+      enabled: true
+    {{- end }}
+  {{- end }}
+reaggregate_set:
+{{- end }}
+  {{- if .Metrics }}
+  metrics:
+    {{- range $name, $metric := .Metrics }}
+    {{ $name }}:
+      enabled: true
+      {{- if $reag }}
+      attributes: [{{- range $index, $attr := requiredAttributes $metric.Attributes -}}{{ if $index }},{{ end }}"{{ $attr }}"{{- end -}}]
+      {{- end }}
+    {{- end }}
+  {{- end }}
+  {{- if .Events }}
+  events:
+    {{- range $name, $_ := .Events }}
+    {{ $name }}:
+      enabled: true
+    {{- end }}
+  {{- end }}
+  {{- if .ResourceAttributes }}
+  resource_attributes:
+    {{- range $name, $_ := .ResourceAttributes }}
+    {{ $name }}:
+      enabled: true
+    {{- end }}
+  {{- end }}
+none_set:
+  {{- if .Metrics }}
+  metrics:
+    {{- range $name, $metric := .Metrics }}
+    {{ $name }}:
+      enabled: false
+      {{- if $reag }}
+      attributes: [{{- range $index, $element := $metric.Attributes -}}{{ if $index }},{{ end }}"{{ (attributeInfo $element).Name }}"{{ end -}}]
+      {{- end }}
+    {{- end }}
+  {{- end }}
+  {{- if .Events }}
+  events:
+    {{- range $name, $_ := .Events }}
+    {{ $name }}:
+      enabled: false
+    {{- end }}
+  {{- end }}
+  {{- if .ResourceAttributes }}
+  resource_attributes:
+    {{- range $name, $_ := .ResourceAttributes }}
+    {{ $name }}:
+      enabled: false
+    {{- end }}
+  {{- end }}
+{{- if and (or .Metrics .Events) .ResourceAttributes }}
+filter_set_include:
+  resource_attributes:
+    {{- range $name, $attr := .ResourceAttributes }}
+    {{ $name }}:
+      enabled: true
+      {{- if $.Metrics }}
+      metrics_include:
+        - regexp: ".*"
+      {{- end }}
+      {{- if $.Events }}
+      events_include:
+        - regexp: ".*"
+      {{- end }}
+    {{- end }}
+filter_set_exclude:
+  resource_attributes:
+    {{- range $name, $attr := .ResourceAttributes }}
+    {{ $name }}:
+      enabled: true
+      {{- if $.Metrics }}
+      metrics_exclude:
+        {{- if eq $attr.Type.String "Str" }}
+        - strict: {{ $attr.TestValue }}
+        {{- else }}
+        - regexp: ".*"
+        {{- end }}
+      {{- end }}
+      {{- if $.Events }}
+      events_exclude:
+        {{- if eq $attr.Type.String "Str" }}
+        - strict: {{ $attr.TestValue }}
+        {{- else }}
+        - regexp: ".*"
+        {{- end }}
+      {{- end }}
+    {{- end }}
+{{- end }}
