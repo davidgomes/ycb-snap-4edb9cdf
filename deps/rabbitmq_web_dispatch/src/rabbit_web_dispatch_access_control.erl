@@ -1,0 +1,397 @@
+%% This Source Code Form is subject to the terms of the Mozilla Public
+%% License, v. 2.0. If a copy of the MPL was not distributed with this
+%% file, You can obtain one at https://mozilla.org/MPL/2.0/.
+%%
+%% Copyright (c) 2007-2026 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries. All rights reserved.
+%%
+
+-module(rabbit_web_dispatch_access_control).
+
+-include("rabbitmq_web_dispatch_records.hrl").
+-include_lib("amqp_client/include/amqp_client.hrl").
+-include_lib("rabbit_common/include/logging.hrl").
+-include_lib("kernel/include/logger.hrl").
+
+-export([is_authorized/3, is_authorized/5, is_authorized/7, is_authorized_admin/3,
+         is_authorized_admin/5, vhost/1, vhost_from_headers/1]).
+-export([is_authorized_vhost/3, is_authorized_user/4,
+         is_authorized_user/5, is_authorized_user/6,
+         is_authorized_monitor/3, is_authorized_policies/3,
+         is_authorized_vhost_visible/3,
+         is_authorized_vhost_visible_for_monitoring/3,
+         is_authorized_global_parameters/3]).
+
+-export([id/2]).
+-export([not_authorised/3, not_found/3, halt_response/5]).
+
+-export([is_admin/1, is_policymaker/1, is_monitor/1, is_mgmt_user/1, is_protected_user/1]).
+
+-import(rabbit_misc, [pget/2]).
+
+is_authorized(ReqData, Context, AuthConfig) ->
+    is_authorized(ReqData, Context, '', fun(_) -> true end, AuthConfig).
+
+is_authorized_admin(ReqData, Context, AuthConfig) ->
+    is_authorized(ReqData, Context,
+                  <<"Not administrator user">>,
+                  fun(#user{tags = Tags}) -> is_admin(Tags) end, AuthConfig).
+
+is_authorized_admin(ReqData, Context, Username, Password, AuthConfig) ->
+    case is_basic_auth_disabled(AuthConfig) of
+        true ->
+            Msg = "HTTP access denied: basic auth disabled",
+            ?LOG_WARNING(Msg, [], #{domain => ?RMQLOG_DOMAIN_USER}),
+            not_authorised(Msg, ReqData, Context);
+        false ->
+            is_authorized(ReqData, Context, Username, Password,
+                          <<"Not administrator user">>,
+                          fun(#user{tags = Tags}) -> is_admin(Tags) end, AuthConfig)
+    end.
+
+is_authorized_monitor(ReqData, Context, AuthConfig) ->
+    is_authorized(ReqData, Context,
+                  <<"Not monitor user">>,
+                  fun(#user{tags = Tags}) -> is_monitor(Tags) end,
+                  AuthConfig).
+
+is_authorized_vhost(ReqData, Context, AuthConfig) ->
+    is_authorized(ReqData, Context,
+                  <<"User not authorised to access virtual host">>,
+                  fun(#user{tags = Tags} = User) ->
+                          is_admin(Tags) orelse user_matches_vhost(ReqData, User)
+                  end,
+                  AuthConfig).
+
+is_authorized_vhost_visible(ReqData, Context, AuthConfig) ->
+    is_authorized(ReqData, Context,
+                  <<"User not authorised to access virtual host">>,
+                  fun(#user{tags = Tags} = User) ->
+                          is_admin(Tags) orelse user_matches_vhost_visible(ReqData, User)
+                  end,
+                  AuthConfig).
+
+is_authorized_vhost_visible_for_monitoring(ReqData, Context, AuthConfig) ->
+  is_authorized(ReqData, Context,
+                <<"User not authorised to access virtual host">>,
+                fun(#user{tags = Tags} = User) ->
+                        is_admin(Tags)
+                            orelse is_monitor(Tags)
+                            orelse user_matches_vhost_visible(ReqData, User)
+                end,
+                AuthConfig).
+
+is_authorized(ReqData, Context, ErrorMsg, Fun, AuthConfig) ->
+    case cowboy_req:method(ReqData) of
+        <<"OPTIONS">> -> {true, ReqData, Context};
+        _             -> is_authorized1(ReqData, Context, ErrorMsg, Fun, AuthConfig)
+    end.
+
+is_authorized1(ReqData, Context, ErrorMsg, Fun, AuthConfig) ->
+    BasicAuthDisabled = is_basic_auth_disabled(AuthConfig),
+    case parse_credentials(ReqData, AuthConfig) of
+        {basic, Username, Password} when not BasicAuthDisabled ->
+            is_authorized(ReqData, Context, Username, Password,
+                          ErrorMsg, Fun, AuthConfig);
+        {basic, _, _} ->
+            Msg = "HTTP access denied: basic auth disabled",
+            ?LOG_WARNING(Msg, [], #{domain => ?RMQLOG_DOMAIN_USER}),
+            not_authorised(Msg, ReqData, Context);
+        {bearer, OAuthUsername, Token} ->
+            is_authorized(ReqData, Context, OAuthUsername, Token,
+                          ErrorMsg, Fun, AuthConfig);
+        no_credentials when not BasicAuthDisabled ->
+            Msg = "HTTP access denied: no credentials",
+            ?LOG_WARNING(Msg, [], #{domain => ?RMQLOG_DOMAIN_USER}),
+            {{false, AuthConfig#auth_settings.auth_realm}, ReqData, Context};
+        no_credentials ->
+            Msg = "HTTP access denied: no credentials",
+            ?LOG_WARNING(Msg, [], #{domain => ?RMQLOG_DOMAIN_USER}),
+            not_authorised(Msg, ReqData, Context);
+        {error, Reason} ->
+            not_authorised(Reason, ReqData, Context)
+    end.
+
+parse_credentials(ReqData, AuthConfig) ->
+    case cowboy_req:parse_header(<<"authorization">>, ReqData) of
+        {basic, Username, Password} ->
+            {basic, Username, Password};
+        {bearer, Token} ->
+            case AuthConfig#auth_settings.bearer_token_parser of
+                undefined ->
+                    %% Plain OAuth2 token; username is ignored by the OAuth2 backend.
+                    {bearer, <<"">>, Token};
+                Parser ->
+                    case Parser(Token) of
+                        {basic, U, P} -> {basic, U, P};
+                        {bearer, T}   -> {bearer, <<"">>, T};
+                        {error, _} = E -> E
+                    end
+            end;
+        _ ->
+            no_credentials
+    end.
+
+is_authorized_user(ReqData, Context, Username, Password, AuthConfig) ->
+    Msg = <<"User not authorized">>,
+    Fun = fun(_) -> true end,
+    is_authorized(ReqData, Context, Username, Password, Msg, Fun, AuthConfig).
+
+is_authorized_user(ReqData, Context, Username, Password, ReplyWhenFailed, AuthConfig) ->
+    Msg = <<"User not authorized">>,
+    Fun = fun(_) -> true end,
+    is_authorized(ReqData, Context, Username, Password, Msg, Fun, AuthConfig, ReplyWhenFailed).
+
+is_authorized(ReqData, Context, Username, Password, ErrorMsg, Fun, AuthConfig) ->
+    is_authorized(ReqData, Context, Username, Password, ErrorMsg, Fun, AuthConfig, true).
+
+is_authorized(ReqData, Context, Username, Password, ErrorMsg, Fun, AuthConfig, ReplyWhenFailed) ->
+    ErrFun = fun (ResolvedUserName, Msg) ->
+                     ?LOG_WARNING("HTTP access denied: user '~ts' - ~ts",
+                                  [ResolvedUserName, Msg],
+                                  #{domain => ?RMQLOG_DOMAIN_USER}),
+                     %% Include the resolved username in the access log.
+                     ReqData1 = rabbit_cowboy_stream_h:set_authenticated_username(
+                                  ResolvedUserName, ReqData),
+                     case ReplyWhenFailed of
+                       true -> not_authorised(Msg, ReqData1, Context);
+                       false -> {false, ReqData1, "Not_Authorized"}
+                     end
+             end,
+    {IP, _} = cowboy_req:peer(ReqData),
+
+    AuthProps = [{password, Password},
+                 {is_loopback, rabbit_net:is_loopback(IP)}] ++
+                case vhost(ReqData) of
+                    VHost when is_binary(VHost) -> [{vhost, VHost}];
+                    _                           -> []
+                end,
+
+	{ok, AuthBackends} = get_auth_backends(),
+
+    case rabbit_access_control:check_user_login(Username, AuthProps, AuthBackends) of
+        {ok, User = #user{username = ResolvedUsername, tags = Tags}} ->
+            case rabbit_access_control:check_user_loopback(ResolvedUsername, IP) of
+                ok ->
+                    case is_mgmt_user(Tags) of
+                        true ->
+                            case Fun(User) of
+                                true ->
+                                    rabbit_core_metrics:auth_attempt_succeeded(IP, ResolvedUsername, http),
+                                    ReqData1 = rabbit_cowboy_stream_h:set_authenticated_username(
+                                        ResolvedUsername, ReqData),
+                                    {true, ReqData1,
+                                     Context#context{user     = User,
+                                                     password = Password}};
+                                not_found ->
+                                    rabbit_core_metrics:auth_attempt_failed(IP, ResolvedUsername, http),
+                                    not_found(<<"Not Found">>, ReqData, Context);
+                                false ->
+                                    rabbit_core_metrics:auth_attempt_failed(IP, ResolvedUsername, http),
+                                    ErrFun(ResolvedUsername, ErrorMsg)
+                            end;
+                        false ->
+                            rabbit_core_metrics:auth_attempt_failed(IP, ResolvedUsername, http),
+                            ErrFun(ResolvedUsername, <<"Not management user">>)
+                    end;
+                not_allowed ->
+                    rabbit_core_metrics:auth_attempt_failed(IP, ResolvedUsername, http),
+                    ErrFun(ResolvedUsername, <<"User can only log in via localhost">>)
+            end;
+        {refused, _Username, Msg, Args} ->
+            rabbit_core_metrics:auth_attempt_failed(IP, Username, http),
+            ?LOG_WARNING("HTTP access denied: ~ts",
+                         [rabbit_misc:format(Msg, Args)],
+                         #{domain => ?RMQLOG_DOMAIN_USER}),
+            %% Include the attempted username in the access log.
+            ReqData1 = rabbit_cowboy_stream_h:set_authenticated_username(
+                         Username, ReqData),
+            case ReplyWhenFailed of
+              true -> not_authenticated(<<"Not_Authorized">>, ReqData1, Context, AuthConfig);
+              false -> {false, ReqData1, "Not_Authorized"}
+            end
+    end.
+
+
+%% Used for connections / channels. A normal user can only see / delete
+%% their own stuff. Monitors can see other users' and delete their
+%% own. Admins can do it all.
+is_authorized_user(ReqData, Context, Item, AuthConfig) ->
+    is_authorized(ReqData, Context,
+                  <<"User not authorised to access object">>,
+                  fun(#user{username = Username, tags = Tags}) ->
+                          case cowboy_req:method(ReqData) of
+                              <<"DELETE">> -> is_admin(Tags);
+                              _            -> is_monitor(Tags)
+                          end orelse Username == pget(user, Item)
+                  end,
+                  AuthConfig).
+
+%% For policies / parameters. Like is_authorized_vhost but you have to
+%% be a policymaker.
+is_authorized_policies(ReqData, Context, AuthConfig) ->
+    is_authorized(ReqData, Context,
+                  <<"User not authorised to access object">>,
+                  fun(User = #user{tags = Tags}) ->
+                          is_admin(Tags) orelse
+                                           (is_policymaker(Tags) andalso
+                                            user_matches_vhost(ReqData, User))
+                  end,
+                  AuthConfig).
+
+%% For global parameters. Must be policymaker.
+is_authorized_global_parameters(ReqData, Context, AuthConfig) ->
+    is_authorized(ReqData, Context,
+                  <<"User not authorised to access object">>,
+                  fun(#user{tags = Tags}) ->
+                           is_policymaker(Tags)
+                  end,
+                  AuthConfig).
+
+vhost_from_headers(ReqData) ->
+    case cowboy_req:header(<<"x-vhost">>, ReqData) of
+        undefined -> none;
+        %% blank x-vhost means "All hosts" is selected in the UI
+        <<>>      -> none;
+        VHost     -> VHost
+    end.
+
+vhost(ReqData) ->
+    Value = case id(vhost, ReqData) of
+      none  -> vhost_from_headers(ReqData);
+      VHost -> VHost
+    end,
+    case Value of
+      none -> none;
+      Name ->
+        case rabbit_vhost:exists(Name) of
+          true  -> Name;
+          false -> not_found
+        end
+    end.
+
+is_admin(T)       -> intersects(T, [administrator]).
+is_policymaker(T) -> intersects(T, [administrator, policymaker]).
+is_monitor(T)     -> intersects(T, [administrator, monitoring]).
+is_mgmt_user(T)   -> intersects(T, [administrator, monitoring, policymaker,
+                                    management]).
+is_protected_user(T) -> intersects(T, [protected]).
+
+intersects(A, [B]) ->
+    lists:member(B, A);
+intersects(A, B) ->
+    lists:any(fun(I) -> lists:member(I, B) end, A).
+
+user_matches_vhost(ReqData, User) ->
+    case vhost(ReqData) of
+        not_found -> true;
+        none      -> true;
+        V         ->
+            case check_vhost_access(ReqData, User, V) of
+                true  -> true;
+                false -> not_found
+            end
+    end.
+
+user_matches_vhost_visible(ReqData, User = #user{tags = Tags}) ->
+    case vhost(ReqData) of
+        not_found -> true;
+        none      -> true;
+        V         ->
+            case is_monitor(Tags) of
+                true  ->
+                    rabbit_vhost:exists(V);
+                false ->
+                    case check_vhost_access(ReqData, User, V) of
+                        true  -> true;
+                        false -> not_found
+                    end
+            end
+    end.
+
+get_authz_data(ReqData) ->
+    {PeerAddress, _PeerPort} = cowboy_req:peer(ReqData),
+    {ip, PeerAddress}.
+
+check_vhost_access(ReqData, User, VHost) ->
+    AuthzData = get_authz_data(ReqData),
+    Res = try rabbit_access_control:check_vhost_access(User, VHost, AuthzData, #{})
+          catch _:E -> {error, E}
+          end,
+    case Res of
+        ok -> true;
+        NotOK ->
+            log_access_control_result(NotOK),
+            false
+    end.
+
+not_authorised(Reason, ReqData, Context) ->
+    halt_response(401, not_authorised, Reason, ReqData, Context).
+
+not_found(Reason, ReqData, Context) ->
+    halt_response(404, not_found, Reason, ReqData, Context).
+
+halt_response(Code, Type, Reason, ReqData, Context) ->
+    ReasonFormatted = format_reason(Reason),
+    Json = #{error  => Type,
+             reason => ReasonFormatted},
+    ReqData1 = cowboy_req:reply(Code,
+        #{<<"content-type">> => <<"application/json">>},
+        rabbit_json:encode(Json), ReqData),
+    {stop, ReqData1, Context}.
+
+not_authenticated(Reason, ReqData, Context, _AuthConfig) ->
+    halt_response(401, not_authorized, Reason, ReqData, Context).
+
+format_reason(Tuple) when is_tuple(Tuple) ->
+    tuple(Tuple);
+format_reason(Binary) when is_binary(Binary) ->
+    unicode:characters_to_binary(Binary);
+format_reason(Other) ->
+    case is_string(Other) of
+        true ->  print("~ts", [Other]);
+        false -> print("~tp", [Other])
+    end.
+
+print(Fmt, Val) when is_list(Val) ->
+    list_to_binary(lists:flatten(io_lib:format(Fmt, Val))).
+
+is_string(List) when is_list(List) ->
+    lists:all(
+        fun(El) -> is_integer(El) andalso El > 0 andalso El < 16#10ffff end,
+        List);
+is_string(_) -> false.
+
+tuple(unknown)                    -> unknown;
+tuple(Tuple) when is_tuple(Tuple) -> [tuple(E) || E <- tuple_to_list(Tuple)];
+tuple(Term)                       -> Term.
+
+id(Key, ReqData) when Key =:= exchange;
+                      Key =:= source;
+                      Key =:= destination ->
+    case id0(Key, ReqData) of
+        <<"amq.default">> -> <<"">>;
+        Name              -> Name
+    end;
+id(Key, ReqData) ->
+    id0(Key, ReqData).
+
+id0(Key, ReqData) ->
+    case cowboy_req:binding(Key, ReqData) of
+        undefined -> none;
+        Id        -> Id
+    end.
+
+% rabbitmq/rabbitmq-auth-backend-http#100
+log_access_control_result(NotOK) ->
+    ?LOG_DEBUG("rabbit_access_control:check_vhost_access result: ~tp", [NotOK]).
+
+is_basic_auth_disabled(#auth_settings{basic_auth_enabled = Enabled}) ->
+    not Enabled.
+
+get_auth_backends() ->
+    case application:get_env(rabbitmq_web_dispatch, auth_backends) of
+		{ok, Backends} ->
+            {ok, Backends};
+		undefined ->
+            application:get_env(rabbit, auth_backends)
+	end.

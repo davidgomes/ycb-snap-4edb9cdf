@@ -1,0 +1,131 @@
+%% This Source Code Form is subject to the terms of the Mozilla Public
+%% License, v. 2.0. If a copy of the MPL was not distributed with this
+%% file, You can obtain one at https://mozilla.org/MPL/2.0/.
+%%
+%% Copyright (c) 2007-2026 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries. All rights reserved.
+%% -----------------------------------------------------------------------------
+
+%% Unit test file for RJMS Topic Selector plugin
+
+%% -----------------------------------------------------------------------------
+
+-module(rjms_topic_selector_unit_SUITE).
+
+-compile(export_all).
+
+-include_lib("eunit/include/eunit.hrl").
+-include("rabbit_jms_topic_exchange.hrl").
+-include_lib("amqp_client/include/amqp_client.hrl").
+
+-import(rabbit_jms_topic_exchange, [ description/0
+                                   , serialise_events/0
+                                   , validate/1
+                                   , validate_binding/2 ]).
+
+
+all() ->
+    [
+      {group, parallel_tests}
+    ].
+
+groups() ->
+    [
+      {parallel_tests, [parallel], [
+                                    description_test,
+                                    serialise_events_test,
+                                    validate_test,
+                                    validate_binding_test,
+                                    validate_binding_rejects_unknown_atoms_test,
+                                    validate_binding_no_selector_test,
+                                    validate_binding_accepts_valid_like_pattern_test,
+                                    validate_binding_rejects_oversized_like_pattern_test,
+                                    validate_binding_rejects_invalid_regex_test
+                                   ]}
+    ].
+
+%% -------------------------------------------------------------------
+%% Test suite setup/teardown.
+%% -------------------------------------------------------------------
+
+init_per_suite(Config) ->
+    Config.
+
+end_per_suite(Config) ->
+    Config.
+
+init_per_group(_, Config) ->
+    Config.
+
+end_per_group(_, Config) ->
+    Config.
+
+init_per_testcase(_Testcase, Config) ->
+    Config.
+
+end_per_testcase(_Testcase, Config) ->
+    Config.
+
+%% -------------------------------------------------------------------
+%% Test cases.
+%% -------------------------------------------------------------------
+
+description_test(_Config) ->
+  ?assertMatch([{name, _}, {description, _}], description()).
+
+serialise_events_test(_Config) ->
+  ?assertMatch(false, serialise_events()).
+
+validate_test(_Config) ->
+  ?assertEqual(ok, validate(dummy_exchange())).
+
+validate_binding_test(_Config) ->
+  ?assertEqual(ok, validate_binding(dummy_exchange(), dummy_binding())).
+
+validate_binding_rejects_unknown_atoms_test(_Config) ->
+  B = #binding{ key = <<"BindingKey">>
+              , destination = #resource{name = <<"DName">>}
+              , args = [{?RJMS_COMPILED_SELECTOR_ARG, longstr, <<"{xq7fkd9_3jrvm, 42}.">>}]},
+  ?assertMatch({error, {binding_invalid, _, _}},
+               validate_binding(dummy_exchange(), B)).
+
+validate_binding_no_selector_test(_Config) ->
+  B = #binding{ key = <<"BindingKey">>
+              , destination = #resource{name = <<"DName">>}
+              , args = []},
+  ?assertEqual(ok, validate_binding(dummy_exchange(), B)).
+
+validate_binding_accepts_valid_like_pattern_test(_Config) ->
+  B = selector_binding(<<"{like, {ident, <<\"prop\">>}, <<\"a%b\">>, no_escape}.">>),
+  ?assertEqual(ok, validate_binding(dummy_exchange(), B)).
+
+%% A LIKE pattern that expands past `rabbit_re`'s pattern length limit must
+%% be rejected when the binding is created, not the first time a message
+%% is evaluated against it.
+validate_binding_rejects_oversized_like_pattern_test(_Config) ->
+  LongPattern = binary:copy(<<"a">>, rabbit_re:max_pattern_length() + 1),
+  Selector = iolist_to_binary(
+               ["{like, {ident, <<\"prop\">>}, <<\"", LongPattern, "\">>, no_escape}."]),
+  B = selector_binding(Selector),
+  ?assertMatch({error, {binding_invalid, _, _}},
+               validate_binding(dummy_exchange(), B)).
+
+%% The `regex` selector form passes its pattern straight to `re:compile/1`,
+%% bypassing LIKE escaping entirely, so a malformed pattern must also be
+%% rejected at bind time.
+validate_binding_rejects_invalid_regex_test(_Config) ->
+  B = selector_binding(<<"{like, {ident, <<\"prop\">>}, regex, <<\"(unclosed\">>}.">>),
+  ?assertMatch({error, {binding_invalid, _, _}},
+               validate_binding(dummy_exchange(), B)).
+
+selector_binding(Selector) ->
+  #binding{ key = <<"BindingKey">>
+          , destination = #resource{name = <<"DName">>}
+          , args = [{?RJMS_COMPILED_SELECTOR_ARG, longstr, Selector}]}.
+
+dummy_exchange() ->
+  #exchange{name = <<"XName">>, arguments = []}.
+
+dummy_binding() ->
+  #binding{ key = <<"BindingKey">>
+          , destination = #resource{name = <<"DName">>}
+          , args = [{?RJMS_COMPILED_SELECTOR_ARG, longstr, <<"<<\"false\">>.">>}]}.

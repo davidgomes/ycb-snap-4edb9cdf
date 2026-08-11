@@ -1,0 +1,18 @@
+pull_request_rules:
+  - name: Add make label if a Make file is modified
+    conditions:
+      - files~=(Makefile|\.mk)$
+    actions:
+      label:
+        add:
+          - make
+  - name: Automatically backport to v4.3.x based on label
+    conditions:
+      - base=main
+      - label=backport-v4.3.x
+    actions:
+      backport:
+        branches:
+          - v4.3.x
+        assignees:
+          - "{{ author }}"
