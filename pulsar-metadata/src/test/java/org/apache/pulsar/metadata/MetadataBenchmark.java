@@ -1,0 +1,156 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pulsar.metadata;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Semaphore;
+import java.util.function.Supplier;
+import lombok.Cleanup;
+import lombok.CustomLog;
+import org.apache.pulsar.common.util.FutureUtil;
+import org.apache.pulsar.metadata.api.MetadataStore;
+import org.apache.pulsar.metadata.api.MetadataStoreConfig;
+import org.apache.pulsar.metadata.api.MetadataStoreFactory;
+import org.testng.annotations.Test;
+
+@CustomLog
+public class MetadataBenchmark extends BaseMetadataStoreTest {
+
+    @Test(dataProvider = "impl", enabled = false)
+    public void testGet(String provider, Supplier<String> urlSupplier) throws Exception {
+        @Cleanup
+        MetadataStore store = MetadataStoreFactory.create(urlSupplier.get(), MetadataStoreConfig.builder().build());
+
+        final int nKeys = 128;
+        final int nGets = 1_000_000;
+
+        String key = newKey();
+        generateKeys(store, key, nKeys);
+
+        Semaphore s = new Semaphore(10_000);
+        CountDownLatch latch = new CountDownLatch(nGets);
+
+        long startTime = System.nanoTime();
+        for (int i = 0; i < nGets; i++) {
+            int k = i % (nKeys - 1);
+            s.acquire();
+            store.get(key + "/" + k)
+                    .thenAccept(__ -> {
+                        s.release();
+                        latch.countDown();
+                    }).exceptionally(ex -> {
+                        log.warn().exception(ex).log("Failed to do get operation");
+                        return null;
+                    });
+        }
+
+        latch.await();
+        long endTime = System.nanoTime();
+        double throughput = 1e9 * nGets / (endTime - startTime);
+
+        log.info().attr("provider", provider).attr("throughput", throughput / 1_000).log("Get Throughput (Kops/s)");
+    }
+
+    @Test(dataProvider = "impl", enabled = false)
+    public void testGetChildren(String provider, Supplier<String> urlSupplier) throws Exception {
+        @Cleanup
+        MetadataStore store = MetadataStoreFactory.create(urlSupplier.get(), MetadataStoreConfig.builder().build());
+
+        final int nKeys = 128;
+        final int nGets = 1_000_000;
+
+        String key = newKey();
+        generateKeys(store, key, nKeys);
+
+        Semaphore s = new Semaphore(10_000);
+        CountDownLatch latch = new CountDownLatch(nGets);
+
+        long startTime = System.nanoTime();
+        for (int i = 0; i < nGets; i++) {
+            s.acquire();
+            store.getChildren(key)
+                    .thenAccept(__ -> {
+                        s.release();
+                        latch.countDown();
+                    }).exceptionally(ex -> {
+                        log.warn().exception(ex).log("Failed to do get children operation");
+                        return null;
+                    });
+        }
+
+        latch.await();
+        long endTime = System.nanoTime();
+        double throughput = 1e9 * nGets / (endTime - startTime);
+
+        log.info().attr("provider", provider).attr("throughput", throughput / 1_000)
+                .log("Get Children Throughput (Kops/s)");
+    }
+
+    @Test(dataProvider = "impl", enabled = false)
+    public void testPut(String provider, Supplier<String> urlSupplier) throws Exception {
+        @Cleanup
+        MetadataStore store = MetadataStoreFactory.create(urlSupplier.get(), MetadataStoreConfig.builder().build());
+
+        final int nKeys = 10_000;
+        final int nPuts = 100_000;
+
+        String key = newKey();
+
+        Semaphore s = new Semaphore(10_000);
+        CountDownLatch latch = new CountDownLatch(nPuts);
+
+        generateKeys(store, key, nKeys);
+
+        long startTime = System.nanoTime();
+        byte[] data = new byte[100];
+        for (int i = 0; i < nPuts; i++) {
+            int k = i % (nKeys - 1);
+            s.acquire();
+            store.put(key + "/" + k, data, Optional.empty())
+                    .thenAccept(__ -> {
+                        s.release();
+                        latch.countDown();
+                    }).exceptionally(ex -> {
+                        log.warn().exception(ex).log("Failed to do put operation");
+                        return null;
+                    });
+        }
+
+        latch.await();
+        long endTime = System.nanoTime();
+        double throughput = 1e9 * nPuts / (endTime - startTime);
+
+        log.info().attr("provider", provider).attr("throughput", throughput / 1_000).log("Put Throughput (Kops/s)");
+    }
+
+    private void generateKeys(MetadataStore store, String prefix, int n) {
+        byte[] payload = new byte[128];
+        List<CompletableFuture<?>> futures = new ArrayList<>();
+        for (int i = 0; i < n; i++) {
+            futures.add(store.put(prefix + "/" + i, payload, Optional.empty()));
+        }
+
+        FutureUtil.waitForAll(futures).join();
+    }
+
+}

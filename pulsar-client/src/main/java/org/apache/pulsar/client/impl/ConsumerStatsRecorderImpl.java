@@ -1,0 +1,366 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pulsar.client.impl;
+
+import com.fasterxml.jackson.databind.ObjectWriter;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import io.netty.util.Timeout;
+import io.netty.util.TimerTask;
+import java.io.IOException;
+import java.text.DecimalFormat;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.LongAdder;
+import java.util.stream.Collectors;
+import lombok.CustomLog;
+import org.apache.pulsar.client.api.Consumer;
+import org.apache.pulsar.client.api.ConsumerStats;
+import org.apache.pulsar.client.api.Message;
+import org.apache.pulsar.client.api.ProducerStats;
+import org.apache.pulsar.client.impl.conf.ConsumerConfigurationData;
+import org.apache.pulsar.common.util.ObjectMapperFactory;
+
+@SuppressWarnings("deprecation")
+@CustomLog
+public class ConsumerStatsRecorderImpl implements ConsumerStatsRecorder {
+
+    private static final long serialVersionUID = 1L;
+    private TimerTask stat;
+    private Timeout statTimeout;
+    private final Consumer<?> consumer;
+    private PulsarClientImpl pulsarClient;
+    private long oldTime;
+    private long statsIntervalSeconds;
+    private final LongAdder numMsgsReceived;
+    private final LongAdder numBytesReceived;
+    private final LongAdder numReceiveFailed;
+    private final LongAdder numBatchReceiveFailed;
+    private final LongAdder numAcksSent;
+    private final LongAdder numAcksFailed;
+    private final LongAdder totalMsgsReceived;
+    private final LongAdder totalBytesReceived;
+    private final LongAdder totalReceiveFailed;
+    private final LongAdder totalBatchReceiveFailed;
+    private final LongAdder totalAcksSent;
+    private final LongAdder totalAcksFailed;
+
+    private volatile double receivedMsgsRate;
+    private volatile double receivedBytesRate;
+
+    volatile ProducerStats deadLetterProducerStats;
+
+    volatile ProducerStats retryLetterProducerStats;
+
+    private static final DecimalFormat THROUGHPUT_FORMAT = new DecimalFormat("0.00");
+
+    public ConsumerStatsRecorderImpl() {
+        this(null);
+    }
+
+    public ConsumerStatsRecorderImpl(Consumer<?> consumer) {
+        this.consumer = consumer;
+        numMsgsReceived = new LongAdder();
+        numBytesReceived = new LongAdder();
+        numReceiveFailed = new LongAdder();
+        numBatchReceiveFailed = new LongAdder();
+        numAcksSent = new LongAdder();
+        numAcksFailed = new LongAdder();
+        totalMsgsReceived = new LongAdder();
+        totalBytesReceived = new LongAdder();
+        totalReceiveFailed = new LongAdder();
+        totalBatchReceiveFailed = new LongAdder();
+        totalAcksSent = new LongAdder();
+        totalAcksFailed = new LongAdder();
+    }
+
+    public ConsumerStatsRecorderImpl(PulsarClientImpl pulsarClient, ConsumerConfigurationData<?> conf,
+            Consumer<?> consumer) {
+        this.pulsarClient = pulsarClient;
+        this.consumer = consumer;
+        this.statsIntervalSeconds = pulsarClient.getConfiguration().getStatsIntervalSeconds();
+        numMsgsReceived = new LongAdder();
+        numBytesReceived = new LongAdder();
+        numReceiveFailed = new LongAdder();
+        numBatchReceiveFailed = new LongAdder();
+        numAcksSent = new LongAdder();
+        numAcksFailed = new LongAdder();
+        totalMsgsReceived = new LongAdder();
+        totalBytesReceived = new LongAdder();
+        totalReceiveFailed = new LongAdder();
+        totalBatchReceiveFailed = new LongAdder();
+        totalAcksSent = new LongAdder();
+        totalAcksFailed = new LongAdder();
+        init(conf);
+    }
+
+    private void init(ConsumerConfigurationData<?> conf) {
+        ObjectWriter w = ObjectMapperFactory.getMapperWithIncludeAlways().writer()
+                .without(SerializationFeature.FAIL_ON_EMPTY_BEANS);
+
+        try {
+            log.info().attr("config", w.writeValueAsString(conf))
+                    .log("Starting Pulsar consumer status recorder with config");
+            log.info().attr("config", w.writeValueAsString(pulsarClient.getConfiguration()))
+                    .log("Pulsar client config");
+        } catch (IOException e) {
+            log.error().exception(e).log("Failed to dump config info");
+        }
+
+        stat = (timeout) -> {
+            if (timeout.isCancelled() || !(consumer instanceof ConsumerImpl)) {
+                return;
+            }
+            ConsumerImpl<?> consumerImpl = (ConsumerImpl<?>) consumer;
+            try {
+                long now = System.nanoTime();
+                double elapsed = (now - oldTime) / 1e9;
+                oldTime = now;
+                long currentNumMsgsReceived = numMsgsReceived.sumThenReset();
+                long currentNumBytesReceived = numBytesReceived.sumThenReset();
+                long currentNumReceiveFailed = numReceiveFailed.sumThenReset();
+                long currentNumBatchReceiveFailed = numBatchReceiveFailed.sumThenReset();
+                long currentNumAcksSent = numAcksSent.sumThenReset();
+                long currentNumAcksFailed = numAcksFailed.sumThenReset();
+
+                totalMsgsReceived.add(currentNumMsgsReceived);
+                totalBytesReceived.add(currentNumBytesReceived);
+                totalReceiveFailed.add(currentNumReceiveFailed);
+                totalBatchReceiveFailed.add(currentNumBatchReceiveFailed);
+                totalAcksSent.add(currentNumAcksSent);
+                totalAcksFailed.add(currentNumAcksFailed);
+
+                receivedMsgsRate = currentNumMsgsReceived / elapsed;
+                receivedBytesRate = currentNumBytesReceived / elapsed;
+                int prefetchQueueSize = consumerImpl.incomingMessages.size();
+                if ((currentNumMsgsReceived | currentNumBytesReceived | currentNumReceiveFailed | currentNumAcksSent
+                        | currentNumAcksFailed | prefetchQueueSize) != 0) {
+                    log.info().attr("topic", consumerImpl.getTopic())
+                            .attr("subscription", consumerImpl.getSubscription())
+                            .attr("consumerName", consumerImpl.consumerName)
+                            .attr("prefetchedMessages", prefetchQueueSize)
+                            .attr("receivedMsgRate", THROUGHPUT_FORMAT.format(receivedMsgsRate))
+                            .attr("receivedBytesRateMbps",
+                                    THROUGHPUT_FORMAT.format(receivedBytesRate * 8 / 1024 / 1024))
+                            .attr("ackSentRate", THROUGHPUT_FORMAT.format(currentNumAcksSent / elapsed))
+                            .attr("failedMessages", currentNumReceiveFailed)
+                            .attr("failedBatchMessages", currentNumBatchReceiveFailed)
+                            .attr("failedAcks", currentNumAcksFailed)
+                            .log("Consumer stats");
+                }
+            } catch (Exception e) {
+                log.error().attr("topic", consumerImpl.getTopic())
+                        .attr("subscription", consumerImpl.subscription)
+                        .attr("consumerName", consumerImpl.consumerName)
+                        .exception(e)
+                        .log("Failed to update consumer stats");
+            } finally {
+                // schedule the next stat info
+                statTimeout = pulsarClient.timer().newTimeout(stat, statsIntervalSeconds, TimeUnit.SECONDS);
+            }
+        };
+
+        oldTime = System.nanoTime();
+        statTimeout = pulsarClient.timer().newTimeout(stat, statsIntervalSeconds, TimeUnit.SECONDS);
+    }
+
+    @Override
+    public void updateNumMsgsReceived(Message<?> message) {
+        if (message != null) {
+            numMsgsReceived.increment();
+            numBytesReceived.add(message.size());
+        }
+    }
+
+    @Override
+    public void incrementNumAcksSent(long numAcks) {
+        numAcksSent.add(numAcks);
+    }
+
+    @Override
+    public void incrementNumAcksFailed() {
+        numAcksFailed.increment();
+    }
+
+    @Override
+    public void incrementNumReceiveFailed() {
+        numReceiveFailed.increment();
+    }
+
+    @Override
+    public void incrementNumBatchReceiveFailed() {
+        numBatchReceiveFailed.increment();
+    }
+
+    @Override
+    public Optional<Timeout> getStatTimeout() {
+        return Optional.ofNullable(statTimeout);
+    }
+
+    @Override
+    public void reset() {
+        numMsgsReceived.reset();
+        numBytesReceived.reset();
+        numReceiveFailed.reset();
+        numBatchReceiveFailed.reset();
+        numAcksSent.reset();
+        numAcksFailed.reset();
+        totalMsgsReceived.reset();
+        totalBytesReceived.reset();
+        totalReceiveFailed.reset();
+        totalBatchReceiveFailed.reset();
+        totalAcksSent.reset();
+        totalAcksFailed.reset();
+    }
+
+    @Override
+    public void updateCumulativeStats(ConsumerStats stats) {
+        if (stats == null) {
+            return;
+        }
+        numMsgsReceived.add(stats.getNumMsgsReceived());
+        numBytesReceived.add(stats.getNumBytesReceived());
+        numReceiveFailed.add(stats.getNumReceiveFailed());
+        numBatchReceiveFailed.add(stats.getNumBatchReceiveFailed());
+        numAcksSent.add(stats.getNumAcksSent());
+        numAcksFailed.add(stats.getNumAcksFailed());
+        totalMsgsReceived.add(stats.getTotalMsgsReceived());
+        totalBytesReceived.add(stats.getTotalBytesReceived());
+        totalReceiveFailed.add(stats.getTotalReceivedFailed());
+        totalBatchReceiveFailed.add(stats.getTotaBatchReceivedFailed());
+        totalAcksSent.add(stats.getTotalAcksSent());
+        totalAcksFailed.add(stats.getTotalAcksFailed());
+    }
+
+    @Override
+    public Integer getMsgNumInReceiverQueue() {
+        if (consumer instanceof ConsumerBase) {
+            ConsumerBase<?> consumerBase = (ConsumerBase<?>) consumer;
+            if (consumerBase.listener != null){
+                return ConsumerBase.MESSAGE_LISTENER_QUEUE_SIZE_UPDATER.get(consumerBase);
+            }
+            return consumerBase.incomingMessages.size();
+        }
+        return null;
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public Map<Long, Integer> getMsgNumInSubReceiverQueue() {
+        if (consumer instanceof MultiTopicsConsumerImpl) {
+            List<ConsumerImpl<?>> consumerList = ((MultiTopicsConsumerImpl) consumer).getConsumers();
+            return consumerList.stream().collect(
+                    Collectors.toMap((consumerImpl) -> consumerImpl.consumerId
+                            , (consumerImpl) -> consumerImpl.incomingMessages.size())
+            );
+        }
+        return null;
+    }
+
+    @Override
+    public ProducerStats getDeadLetterProducerStats() {
+        return deadLetterProducerStats;
+    }
+
+    @Override
+    public ProducerStats getRetryLetterProducerStats() {
+        return retryLetterProducerStats;
+    }
+
+    @Override
+    public void setDeadLetterProducerStats(ProducerStats producerStats) {
+        this.deadLetterProducerStats = producerStats;
+    }
+
+    @Override
+    public void setRetryLetterProducerStats(ProducerStats producerStats) {
+        this.retryLetterProducerStats = producerStats;
+    }
+
+    @Override
+    public long getNumMsgsReceived() {
+        return numMsgsReceived.longValue();
+    }
+
+    @Override
+    public long getNumBytesReceived() {
+        return numBytesReceived.longValue();
+    }
+
+    @Override
+    public long getNumAcksSent() {
+        return numAcksSent.longValue();
+    }
+
+    @Override
+    public long getNumAcksFailed() {
+        return numAcksFailed.longValue();
+    }
+
+    @Override
+    public long getNumReceiveFailed() {
+        return numReceiveFailed.longValue();
+    }
+
+    @Override
+    public long getNumBatchReceiveFailed() {
+        return numBatchReceiveFailed.longValue();
+    }
+
+    @Override
+    public long getTotalMsgsReceived() {
+        return totalMsgsReceived.longValue();
+    }
+
+    @Override
+    public long getTotalBytesReceived() {
+        return totalBytesReceived.longValue();
+    }
+
+    @Override
+    public long getTotalReceivedFailed() {
+        return totalReceiveFailed.longValue();
+    }
+
+    @Override
+    public long getTotaBatchReceivedFailed() {
+        return totalBatchReceiveFailed.longValue();
+    }
+
+    @Override
+    public long getTotalAcksSent() {
+        return totalAcksSent.longValue();
+    }
+
+    @Override
+    public long getTotalAcksFailed() {
+        return totalAcksFailed.longValue();
+    }
+
+    @Override
+    public double getRateMsgsReceived() {
+        return receivedMsgsRate;
+    }
+
+    @Override
+    public double getRateBytesReceived() {
+        return receivedBytesRate;
+    }
+}

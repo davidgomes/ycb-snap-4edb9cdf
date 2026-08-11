@@ -1,0 +1,210 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.bookkeeper.mledger.offload.jcloud.impl;
+
+import io.netty.buffer.ByteBuf;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.concurrent.TimeUnit;
+import lombok.CustomLog;
+import org.apache.bookkeeper.mledger.LedgerOffloaderStats;
+import org.apache.bookkeeper.mledger.offload.jcloud.BackedInputStream;
+import org.apache.bookkeeper.mledger.offload.jcloud.impl.DataBlockUtils.VersionCheck;
+import org.apache.pulsar.common.allocator.PulsarByteBufAllocator;
+import org.apache.pulsar.common.naming.TopicName;
+import org.jclouds.blobstore.BlobStore;
+import org.jclouds.blobstore.KeyNotFoundException;
+import org.jclouds.blobstore.domain.Blob;
+import org.jclouds.blobstore.options.GetOptions;
+
+@CustomLog
+public class BlobStoreBackedInputStreamImpl extends BackedInputStream {
+
+    private final BlobStore blobStore;
+    private final String bucket;
+    private final String key;
+    private final VersionCheck versionCheck;
+    private final ByteBuf buffer;
+    private final long objectLen;
+    private final int bufferSize;
+    private LedgerOffloaderStats offloaderStats;
+    private String managedLedgerName;
+    private String topicName;
+
+    private long cursor;
+    private long bufferOffsetStart;
+    private long bufferOffsetEnd;
+
+    public BlobStoreBackedInputStreamImpl(BlobStore blobStore, String bucket, String key,
+                                          VersionCheck versionCheck,
+                                          long objectLen, int bufferSize) {
+        this.blobStore = blobStore;
+        this.bucket = bucket;
+        this.key = key;
+        this.versionCheck = versionCheck;
+        this.buffer = PulsarByteBufAllocator.DEFAULT.buffer(bufferSize, bufferSize);
+        this.objectLen = objectLen;
+        this.bufferSize = bufferSize;
+        this.cursor = 0;
+        this.bufferOffsetStart = this.bufferOffsetEnd = -1;
+    }
+
+
+    public BlobStoreBackedInputStreamImpl(BlobStore blobStore, String bucket, String key,
+                                          VersionCheck versionCheck,
+                                          long objectLen, int bufferSize,
+                                          LedgerOffloaderStats offloaderStats, String managedLedgerName) {
+        this(blobStore, bucket, key, versionCheck, objectLen, bufferSize);
+        this.offloaderStats = offloaderStats;
+        this.managedLedgerName = managedLedgerName;
+        this.topicName = TopicName.fromPersistenceNamingEncoding(managedLedgerName);
+    }
+
+    /**
+     * Refill the buffered input if it is empty.
+     * @return true if there are bytes to read, false otherwise
+     */
+    private boolean refillBufferIfNeeded() throws IOException {
+        if (buffer.readableBytes() == 0) {
+            if (cursor >= objectLen) {
+                return false;
+            }
+            long startRange = cursor;
+            long endRange = Math.min(cursor + bufferSize - 1,
+                                     objectLen - 1);
+            log.debug().attr("startRange", startRange).attr("endRange", endRange)
+                    .attr("bytesToFill", endRange - startRange)
+                    .log("Refilling buffer");
+            try {
+                long startReadTime = System.nanoTime();
+                Blob blob = blobStore.getBlob(bucket, key, new GetOptions().range(startRange, endRange));
+                if (blob == null) {
+                    throw new KeyNotFoundException(bucket, key, "");
+                }
+                versionCheck.check(key, blob);
+
+                try (InputStream stream = blob.getPayload().openStream()) {
+                    buffer.clear();
+                    bufferOffsetStart = startRange;
+                    bufferOffsetEnd = endRange;
+                    long bytesRead = endRange - startRange + 1;
+                    int bytesToCopy = (int) bytesRead;
+                    fillBuffer(stream, bytesToCopy);
+                    cursor += buffer.readableBytes();
+                }
+
+                // here we can get the metrics
+                // because JClouds streams the content
+                // and actually the HTTP call finishes when the stream is fully read
+                if (this.offloaderStats != null) {
+                    this.offloaderStats.recordReadOffloadDataLatency(topicName,
+                            System.nanoTime() - startReadTime, TimeUnit.NANOSECONDS);
+                    this.offloaderStats.recordReadOffloadBytes(topicName, endRange - startRange + 1);
+                }
+            } catch (Throwable e) {
+                if (null != this.offloaderStats) {
+                    this.offloaderStats.recordReadOffloadError(this.topicName);
+                }
+                // If the blob is not found, the original exception is thrown and handled by the caller.
+                if (e instanceof KeyNotFoundException) {
+                    throw e;
+                }
+                throw new IOException("Error reading from BlobStore", e);
+            }
+        }
+        return true;
+    }
+
+    void fillBuffer(InputStream is, int bytesToCopy) throws IOException {
+        while (bytesToCopy > 0) {
+            int writeBytes = buffer.writeBytes(is, bytesToCopy);
+            if (writeBytes < 0) {
+                break;
+            }
+            bytesToCopy -= writeBytes;
+        }
+    }
+
+    ByteBuf getBuffer() {
+        return buffer;
+    }
+
+    @Override
+    public int read() throws IOException {
+        if (refillBufferIfNeeded()) {
+            return buffer.readUnsignedByte();
+        } else {
+            return -1;
+        }
+    }
+
+    @Override
+    public int read(byte[] b, int off, int len) throws IOException {
+        if (refillBufferIfNeeded()) {
+            int bytesToRead = Math.min(len, buffer.readableBytes());
+            buffer.readBytes(b, off, bytesToRead);
+            return bytesToRead;
+        } else {
+            return -1;
+        }
+    }
+
+    @Override
+    public void seek(long position) {
+        log.debug().attr("position", position).attr("bucket", bucket).attr("key", key)
+                .attr("cursor", cursor).attr("bufStart", bufferOffsetStart)
+                .attr("bufEnd", bufferOffsetEnd).log("Seeking");
+        if (position >= bufferOffsetStart && position <= bufferOffsetEnd) {
+            long newIndex = position - bufferOffsetStart;
+            buffer.readerIndex((int) newIndex);
+        } else {
+            bufferOffsetStart = bufferOffsetEnd = -1;
+            this.cursor = position;
+            buffer.clear();
+        }
+    }
+
+    @Override
+    public void seekForward(long position) throws IOException {
+        if (position >= cursor) {
+            seek(position);
+        } else {
+            throw new IOException(String.format("Error seeking, new position %d < current position %d",
+                                                position, cursor));
+        }
+    }
+
+    public long getCurrentPosition() {
+        if (bufferOffsetStart != -1) {
+            return bufferOffsetStart + buffer.readerIndex();
+        }
+        return cursor + buffer.readerIndex();
+    }
+
+    @Override
+    public void close() {
+        buffer.release();
+    }
+
+    @Override
+    public int available() throws IOException {
+        long available = objectLen - cursor + buffer.readableBytes();
+        return available > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) available;
+    }
+}

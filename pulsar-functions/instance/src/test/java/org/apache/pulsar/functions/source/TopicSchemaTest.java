@@ -1,0 +1,73 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pulsar.functions.source;
+
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+import static org.testng.Assert.assertEquals;
+import com.google.protobuf.Any;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import lombok.CustomLog;
+import org.apache.pulsar.client.api.Schema;
+import org.apache.pulsar.client.impl.PulsarClientImpl;
+import org.apache.pulsar.client.impl.schema.AvroSchema;
+import org.apache.pulsar.client.impl.schema.JSONSchema;
+import org.apache.pulsar.client.impl.schema.ProtobufNativeSchema;
+import org.apache.pulsar.client.impl.schema.ProtobufSchema;
+import org.apache.pulsar.common.schema.SchemaType;
+import org.testng.annotations.Test;
+
+@CustomLog
+public class TopicSchemaTest {
+
+    @Test
+    public void testGetSchema() {
+        TopicSchema topicSchema = new TopicSchema(null, Thread.currentThread().getContextClassLoader());
+
+        String topic = "public/default/test";
+        Schema<?> schema = topicSchema.getSchema(topic + "1", DummyClass.class, Optional.of(SchemaType.JSON));
+        assertEquals(schema.getClass(), JSONSchema.class);
+
+        schema = topicSchema.getSchema(topic + "2", DummyClass.class, Optional.of(SchemaType.AVRO));
+        assertEquals(schema.getClass(), AvroSchema.class);
+
+        // use a standard protobuf class (not LightProto) for testing ProtobufSchema
+        schema = topicSchema.getSchema(topic + "3", Any.class, Optional.of(SchemaType.PROTOBUF));
+        assertEquals(schema.getClass(), ProtobufSchema.class);
+
+        schema = topicSchema
+                .getSchema(topic + "4", Any.class, Optional.of(SchemaType.PROTOBUF_NATIVE));
+        assertEquals(schema.getClass(), ProtobufNativeSchema.class);
+    }
+
+    @Test
+    public void testDefaultSchemaTypeInfersProtobufForMessageBaseClass() {
+        PulsarClientImpl client = mock(PulsarClientImpl.class);
+        when(client.getSchema(anyString())).thenReturn(CompletableFuture.completedFuture(Optional.empty()));
+
+        TopicSchema topicSchema = new TopicSchema(client, Thread.currentThread().getContextClassLoader());
+        Schema<?> schema = topicSchema.getSchema("public/default/test-protobuf-default", Any.class, Optional.empty());
+        assertEquals(schema.getClass(), ProtobufSchema.class);
+    }
+
+    private static class DummyClass {
+    }
+}

@@ -1,0 +1,76 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pulsar.functions.worker.scheduler;
+
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import lombok.CustomLog;
+import org.apache.pulsar.functions.proto.Assignment;
+import org.apache.pulsar.functions.proto.FunctionMetaData;
+import org.testng.Assert;
+import org.testng.annotations.Test;
+
+@CustomLog
+public class RoundRobinSchedulerTest {
+
+    @Test
+    public void testRebalance() {
+        FunctionMetaData function1 = new FunctionMetaData();
+        function1.setFunctionDetails().setName("func-1")
+                .setNamespace("namespace-1").setTenant("tenant-1").setParallelism(1);
+        function1.setVersion(0);
+
+        List<Assignment> assignments = new LinkedList<>();
+        for (int i = 0; i < 10; i++) {
+            Assignment assignment = new Assignment();
+            assignment.setWorkerId("worker-1");
+            assignment.setInstance().setFunctionMetaData().copyFrom(function1);
+            assignment.getInstance().setInstanceId(i);
+            assignments.add(assignment);
+        }
+
+        Set<String> workers = new HashSet<>();
+        for (int i = 0; i < 3; i++) {
+            workers.add("worker-" + i);
+        }
+
+        RoundRobinScheduler roundRobinScheduler = new RoundRobinScheduler();
+
+        List<Assignment> newAssignments = roundRobinScheduler.rebalance(assignments, workers);
+
+        Map<String, Integer> workerAssignments = new HashMap<>();
+        for (Assignment assignment : newAssignments) {
+            Integer count = workerAssignments.get((assignment.getWorkerId()));
+            if (count == null) {
+                count = 0;
+            }
+            count++;
+            workerAssignments.put(assignment.getWorkerId(), count);
+        }
+
+        Assert.assertEquals(workerAssignments.size(), 2);
+        for (Map.Entry<String, Integer> entry : workerAssignments.entrySet()) {
+            Assert.assertEquals(entry.getValue().intValue(), 3);
+        }
+    }
+}

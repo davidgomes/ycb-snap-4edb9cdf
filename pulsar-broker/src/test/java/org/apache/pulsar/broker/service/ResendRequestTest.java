@@ -1,0 +1,753 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pulsar.broker.service;
+
+import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertNotNull;
+import static org.testng.Assert.assertNull;
+import static org.testng.Assert.assertTrue;
+import java.lang.reflect.Field;
+import java.util.HashSet;
+import java.util.Random;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import lombok.Cleanup;
+import lombok.CustomLog;
+import org.apache.pulsar.broker.service.persistent.PersistentTopic;
+import org.apache.pulsar.client.api.Consumer;
+import org.apache.pulsar.client.api.ConsumerBuilder;
+import org.apache.pulsar.client.api.ConsumerEventListener;
+import org.apache.pulsar.client.api.Message;
+import org.apache.pulsar.client.api.MessageId;
+import org.apache.pulsar.client.api.MessageRoutingMode;
+import org.apache.pulsar.client.api.Producer;
+import org.apache.pulsar.client.api.PulsarClient;
+import org.apache.pulsar.client.api.SubscriptionType;
+import org.apache.pulsar.client.impl.ConsumerBase;
+import org.apache.pulsar.common.util.collections.GrowableArrayBlockingQueue;
+import org.awaitility.Awaitility;
+import org.testng.annotations.Test;
+
+@Test(groups = "broker")
+@CustomLog
+public class ResendRequestTest extends SharedPulsarBaseTest {
+    private static final long testTimeout = 60000; // 1 min
+
+    @Test(timeOut = testTimeout)
+    public void testExclusiveSingleAckedNormalTopic() throws Exception {
+        final String topicName = newTopicName();
+        final String subscriptionName = "my-ex-subscription";
+        final String messagePredicate = "my-message-";
+        final int totalMessages = 10;
+
+        HashSet<MessageId> messageIdHashSet = new HashSet<>();
+        HashSet<String> messageDataHashSet = new HashSet<>();
+
+        // 1. producer connect
+        Producer<byte[]> producer = pulsarClient.newProducer().topic(topicName)
+            .enableBatching(false)
+            .messageRoutingMode(MessageRoutingMode.SinglePartition)
+            .create();
+
+        PersistentTopic topicRef = (PersistentTopic) getTopicReference(topicName).get();
+        assertNotNull(topicRef);
+        assertEquals(topicRef.getProducers().size(), 1);
+
+        // 2. Create consumer
+        Consumer<byte[]> consumer = pulsarClient.newConsumer().topic(topicName).subscriptionName(subscriptionName)
+                .receiverQueueSize(7).subscribe();
+
+        // 3. producer publish messages
+        for (int i = 0; i < totalMessages; i++) {
+            String message = messagePredicate + i;
+            producer.send(message.getBytes());
+        }
+
+        // 4. Receive messages
+        Message<byte[]> message = consumer.receive();
+        log.info().attr("data", new String(message.getData())).log("Message received");
+
+        for (int i = 1; i < totalMessages; i++) {
+            Message<byte[]> msg = consumer.receive();
+            log.info().attr("data", new String(msg.getData())).log("Message received");
+            messageDataHashSet.add(new String(msg.getData()));
+        }
+        printIncomingMessageQueue(consumer);
+
+        // 5. Ack 1st message and ask for resend
+        consumer.acknowledge(message);
+        log.info().attr("data", new String(message.getData())).log("Message acked");
+        messageIdHashSet.add(message.getMessageId());
+        messageDataHashSet.add(new String(message.getData()));
+
+        consumer.redeliverUnacknowledgedMessages();
+        log.info("Resend Messages Request sent");
+
+        // 6. Check if messages resent in correct order
+        for (int i = 0; i < totalMessages - 1; i++) {
+            message = consumer.receive();
+            log.info().attr("data", new String(message.getData())).log("Message received");
+            if (i < 2) {
+                messageIdHashSet.add(message.getMessageId());
+                consumer.acknowledge(message);
+            }
+            log.info().attr("data", new String(message.getData())).log("Message acked");
+            assertTrue(messageDataHashSet.contains(new String(message.getData())));
+        }
+        assertEquals(messageIdHashSet.size(), 3);
+        assertEquals(messageDataHashSet.size(), totalMessages);
+        printIncomingMessageQueue(consumer);
+
+        // 7. Request resend 2nd time - you should receive 4 messages
+        consumer.redeliverUnacknowledgedMessages();
+        log.info("Resend Messages Request sent");
+        message = consumer.receive(2000, TimeUnit.MILLISECONDS);
+        while (message != null) {
+            log.info().attr("data", new String(message.getData())).log("Message received");
+            consumer.acknowledge(message);
+            log.info().attr("data", new String(message.getData())).log("Message acked");
+            messageIdHashSet.add(message.getMessageId());
+            messageDataHashSet.add(new String(message.getData()));
+            message = consumer.receive(5000, TimeUnit.MILLISECONDS);
+        }
+
+        assertEquals(messageIdHashSet.size(), totalMessages);
+        assertEquals(messageDataHashSet.size(), totalMessages);
+        printIncomingMessageQueue(consumer);
+
+        // 9. Calling resend after acking all messages - expecting 0 messages
+        consumer.redeliverUnacknowledgedMessages();
+        assertNull(consumer.receive(2000, TimeUnit.MILLISECONDS));
+
+        // 10. Checking message contents
+        for (int i = 0; i < totalMessages; i++) {
+            assertTrue(messageDataHashSet.contains(messagePredicate + i));
+        }
+    }
+
+    @Test(timeOut = testTimeout)
+    public void testSharedSingleAckedNormalTopic() throws Exception {
+        final String topicName = newTopicName();
+        final String subscriptionName = "my-shared-subscription";
+        final String messagePredicate = "my-message-";
+        final int totalMessages = 10;
+        // 1. producer connect
+        Producer<byte[]> producer = pulsarClient.newProducer().topic(topicName)
+            .enableBatching(false)
+            .messageRoutingMode(MessageRoutingMode.SinglePartition)
+            .create();
+        PersistentTopic topicRef = (PersistentTopic) getTopicReference(topicName).get();
+        assertNotNull(topicRef);
+        assertEquals(topicRef.getProducers().size(), 1);
+
+        // 2. Create consumer
+        Consumer<byte[]> consumer1 = pulsarClient.newConsumer().topic(topicName)
+                .subscriptionName(subscriptionName).receiverQueueSize(totalMessages / 2)
+                .subscriptionType(SubscriptionType.Shared).subscribe();
+
+        @Cleanup
+        PulsarClient newPulsarClient = newPulsarClient();
+        Consumer<byte[]> consumer2 = newPulsarClient.newConsumer().topic(topicName)
+                .subscriptionName(subscriptionName).receiverQueueSize(totalMessages / 2)
+                .subscriptionType(SubscriptionType.Shared).subscribe();
+
+        // 3. Producer publishes messages
+        for (int i = 0; i < totalMessages; i++) {
+            String message = messagePredicate + i;
+            producer.send(message.getBytes());
+            log.info().attr("message", message).log("Producer produced");
+        }
+
+        // 4. Receive messages
+        int receivedConsumer1 = 0, receivedConsumer2 = 0;
+        Message<byte[]> message1 = consumer1.receive();
+        Message<byte[]> message2 = consumer2.receive();
+        do {
+            if (message1 != null) {
+                log.info().attr("data", new String(message1.getData())).log("Consumer 1 Received");
+                receivedConsumer1 += 1;
+            }
+
+            if (message2 != null) {
+                log.info().attr("data", new String(message2.getData())).log("Consumer 2 Received");
+                receivedConsumer2 += 1;
+            }
+            message1 = consumer1.receive(100, TimeUnit.MILLISECONDS);
+            message2 = consumer2.receive(100, TimeUnit.MILLISECONDS);
+        } while (message1 != null || message2 != null);
+
+        log.info().attr("receivedConsumer1", receivedConsumer1).log("Consumer 1 receives");
+        log.info().attr("receivedConsumer2", receivedConsumer2).log("Consumer 2 receives");
+        log.info().attr("value", (receivedConsumer2 + receivedConsumer1)).log("Total receives");
+        assertEquals(receivedConsumer2 + receivedConsumer1, totalMessages);
+
+        // 5. Send a resend request from Consumer 1
+        log.info("Consumer 1 sent a resend request");
+        consumer1.redeliverUnacknowledgedMessages();
+
+        // 6. Consumer 1's unAcked messages should be sent to Consumer 1 or 2
+        int receivedMessagesAfterRedelivery = 0;
+        receivedConsumer1 = 0;
+        message1 = consumer1.receive(100, TimeUnit.MILLISECONDS);
+        message2 = consumer2.receive(100, TimeUnit.MILLISECONDS);
+        do {
+            if (message1 != null) {
+                log.info().attr("data", new String(message1.getData())).log("Consumer 1 Received");
+                receivedConsumer1 += 1;
+                ++receivedMessagesAfterRedelivery;
+            }
+
+            if (message2 != null) {
+                log.info().attr("data", new String(message2.getData())).log("Consumer 2 Received");
+                receivedConsumer2 += 1;
+                ++receivedMessagesAfterRedelivery;
+            }
+            message1 = consumer1.receive(200, TimeUnit.MILLISECONDS);
+            message2 = consumer2.receive(200, TimeUnit.MILLISECONDS);
+        } while (message1 != null || message2 != null);
+        log.info().attr("receivedMessagesAfterRedelivery", receivedMessagesAfterRedelivery).log("Additional received");
+        assertTrue(receivedMessagesAfterRedelivery > 0);
+
+        assertEquals(receivedConsumer1 + receivedConsumer2, totalMessages);
+    }
+
+    @Test(timeOut = testTimeout)
+    public void testFailoverSingleAckedNormalTopic() throws Exception {
+        final String topicName = newTopicName();
+        final String subscriptionName = "my-failover-subscription";
+        final String messagePredicate = "my-message-";
+        final int totalMessages = 10;
+        // 1. producer connect
+        Producer<byte[]> producer = pulsarClient.newProducer().topic(topicName)
+            .enableBatching(false)
+            .messageRoutingMode(MessageRoutingMode.SinglePartition)
+            .create();
+        PersistentTopic topicRef = (PersistentTopic) getTopicReference(topicName).get();
+        assertNotNull(topicRef);
+        assertEquals(topicRef.getProducers().size(), 1);
+
+        // 2. Create consumers
+        // Use ConsumerEventListener to identify which consumer the dispatcher picks as active.
+        // becameActive may be called once or twice (re-evaluation when consumer-b subscribes).
+        // We track the latest active consumer and wait until both consumers have been registered.
+        AtomicReference<Consumer<?>> activeConsumerRef = new AtomicReference<>();
+        ConsumerEventListener listener = new ConsumerEventListener() {
+            @Override
+            public void becameActive(Consumer<?> consumer, int partitionId) {
+                activeConsumerRef.set(consumer);
+            }
+
+            @Override
+            public void becameInactive(Consumer<?> consumer, int partitionId) {
+            }
+        };
+        ConsumerBuilder<byte[]> consumerBuilder = pulsarClient.newConsumer().topic(topicName)
+                .subscriptionName(subscriptionName).receiverQueueSize(10).subscriptionType(SubscriptionType.Failover)
+                .acknowledgmentGroupTime(0, TimeUnit.SECONDS).consumerEventListener(listener);
+        Consumer<byte[]> consumerA = consumerBuilder.clone().consumerName("consumer-a").subscribe();
+        Consumer<byte[]> consumerB = consumerBuilder.clone().consumerName("consumer-b").subscribe();
+
+        // Wait until the active consumer is assigned (becameActive has been called at least once)
+        Awaitility.await().untilAsserted(() -> assertNotNull(activeConsumerRef.get()));
+
+        Consumer<?> activeConsumer = activeConsumerRef.get();
+        Consumer<byte[]> consumer1;  // active
+        Consumer<byte[]> consumer2;  // standby
+        if (activeConsumer == consumerA) {
+            consumer1 = consumerA;
+            consumer2 = consumerB;
+        } else {
+            consumer1 = consumerB;
+            consumer2 = consumerA;
+        }
+
+        // 3. Producer publishes messages
+        for (int i = 0; i < totalMessages; i++) {
+            String message = messagePredicate + i;
+            producer.send(message.getBytes());
+            log.info().attr("message", message).log("Producer produced");
+        }
+
+        // 4. Receive messages
+        int receivedConsumer1 = 0, receivedConsumer2 = 0;
+        Message<byte[]> message1;
+        Message<byte[]> message2;
+        do {
+            message1 = consumer1.receive(500, TimeUnit.MILLISECONDS);
+            message2 = consumer2.receive(500, TimeUnit.MILLISECONDS);
+            if (message1 != null) {
+                log.info().attr("data", new String(message1.getData())).log("Consumer 1 Received");
+                receivedConsumer1 += 1;
+            }
+            if (message2 != null) {
+                log.info().attr("data", new String(message2.getData())).log("Consumer 2 Received");
+                receivedConsumer2 += 1;
+            }
+
+        } while (message1 != null || message2 != null);
+
+        log.info().attr("receivedConsumer1", receivedConsumer1).log("Consumer 1 receives");
+        log.info().attr("receivedConsumer2", receivedConsumer2).log("Consumer 2 receives");
+        log.info().attr("value", (receivedConsumer2 + receivedConsumer1)).log("Total receives");
+        assertEquals(receivedConsumer2 + receivedConsumer1, totalMessages);
+        // Consumer 2 is on Stand By
+        assertEquals(receivedConsumer2, 0);
+
+        // 5. Consumer 1 asks for resend
+        consumer1.redeliverUnacknowledgedMessages();
+        Thread.sleep(1000);
+
+        // 6. Consumer 1 acknowledges a few messages
+        receivedConsumer1 = receivedConsumer2 = 0;
+        for (int i = 0; i < totalMessages / 2; i++) {
+            message1 = consumer1.receive(500, TimeUnit.MILLISECONDS);
+            message2 = consumer2.receive(500, TimeUnit.MILLISECONDS);
+            if (message1 != null) {
+                log.info().attr("data", new String(message1.getData())).log("Consumer 1 Received");
+                receivedConsumer1 += 1;
+                log.info().attr("data", new String(message1.getData())).log("Consumer 1 Acknowledged");
+                consumer1.acknowledge(message1);
+            }
+
+            if (message2 != null) {
+                log.info().attr("data", new String(message2.getData())).log("Consumer 2 Received");
+                receivedConsumer2 += 1;
+            }
+        }
+        assertEquals(receivedConsumer2 + receivedConsumer1, totalMessages / 2);
+
+        // Consumer 2 is on Stand By
+        assertEquals(receivedConsumer2, 0);
+
+        // 7. Consumer 1 close
+        consumer1.close();
+
+        // 8. Checking if all messages are received by Consumer 2
+        message2 = consumer2.receive();
+        int acknowledgedMessages = 0;
+        int unAcknowledgedMessages = 0;
+        boolean flag = true;
+        do {
+            if (flag) {
+                consumer2.acknowledge(message2);
+                acknowledgedMessages += 1;
+                log.info().attr("data", new String(message2.getData())).log("Consumer 2 Acknowledged");
+            } else {
+                unAcknowledgedMessages += 1;
+            }
+            flag = !flag;
+            log.info().attr("data", new String(message2.getData())).log("Consumer 2 Received");
+            message2 = consumer2.receive(500, TimeUnit.MILLISECONDS);
+        } while (message2 != null);
+        log.info().attr("value", (unAcknowledgedMessages + acknowledgedMessages)).log("Consumer 2 receives");
+        log.info().attr("acknowledgedMessages", acknowledgedMessages).log("Consumer 2 acknowledges");
+        assertEquals(unAcknowledgedMessages + acknowledgedMessages, totalMessages - receivedConsumer1);
+
+        // 9 .Consumer 2 asks for a resend
+        consumer2.redeliverUnacknowledgedMessages();
+        Thread.sleep(1000);
+        message2 = consumer2.receive();
+        receivedConsumer2 = 0;
+        do {
+            receivedConsumer2 += 1;
+            message2 = consumer2.receive(500, TimeUnit.MILLISECONDS);
+        } while (message2 != null);
+        log.info().attr("receivedConsumer2", receivedConsumer2).log("Consumer 2 receives");
+        assertEquals(unAcknowledgedMessages, receivedConsumer2);
+    }
+
+    @Test(timeOut = testTimeout)
+    public void testExclusiveCumulativeAckedNormalTopic() throws Exception {
+        final String topicName = newTopicName();
+        final String subscriptionName = "my-ex-subscription";
+        final String messagePredicate = "my-message-";
+        final int totalMessages = 10;
+
+        // 1. producer connect
+        Producer<byte[]> producer = pulsarClient.newProducer().topic(topicName)
+            .enableBatching(false)
+            .messageRoutingMode(MessageRoutingMode.SinglePartition)
+            .create();
+
+        PersistentTopic topicRef = (PersistentTopic) getTopicReference(topicName).get();
+        assertNotNull(topicRef);
+        assertEquals(topicRef.getProducers().size(), 1);
+
+        // 2. Create consumer
+        Consumer<byte[]> consumer = pulsarClient.newConsumer().topic(topicName).subscriptionName(subscriptionName)
+                .receiverQueueSize(7).subscribe();
+
+        // 3. producer publish messages
+        for (int i = 0; i < totalMessages; i++) {
+            String message = messagePredicate + i;
+            producer.send(message.getBytes());
+        }
+
+        // 4. Receive messages
+        Message<byte[]> message = consumer.receive();
+        log.info().attr("data", new String(message.getData())).log("Message received");
+        for (int i = 0; i < 7; i++) {
+            printIncomingMessageQueue(consumer);
+            message = consumer.receive();
+            log.info().attr("data", new String(message.getData())).log("Message received");
+        }
+
+        consumer.redeliverUnacknowledgedMessages();
+        Thread.sleep(1000);
+        consumer.acknowledgeCumulative(message);
+        do {
+            message = consumer.receive(1000, TimeUnit.MILLISECONDS);
+        } while (message != null);
+
+        log.info("Consumer Requests Messages");
+        consumer.redeliverUnacknowledgedMessages();
+
+        int numOfReceives = 0;
+        message = consumer.receive();
+        do {
+            numOfReceives += 1;
+            log.info().attr("data", new String(message.getData())).log("Message received");
+            message = consumer.receive(1000, TimeUnit.MILLISECONDS);
+        } while (message != null);
+        assertEquals(numOfReceives, 2);
+    }
+
+    @Test(timeOut = testTimeout)
+    public void testExclusiveSingleAckedPartitionedTopic() throws Exception {
+        final String topicName = newTopicName();
+        final String subscriptionName = "my-ex-subscription";
+        final String messagePredicate = "my-message-";
+        final int totalMessages = 10;
+        final int numberOfPartitions = 4;
+        admin.topics().createPartitionedTopic(topicName, numberOfPartitions);
+
+        // 1. producer connect
+        Producer<byte[]> producer = pulsarClient.newProducer().topic(topicName)
+            .enableBatching(false)
+            .messageRoutingMode(MessageRoutingMode.RoundRobinPartition)
+            .create();
+
+        // 2. Create consumer
+        Consumer<byte[]> consumer = pulsarClient.newConsumer().topic(topicName).subscriptionName(subscriptionName)
+                .receiverQueueSize(7).subscribe();
+
+        // 3. producer publish messages
+        for (int i = 0; i < totalMessages; i++) {
+            String message = messagePredicate + i;
+            log.info().attr("message", message).log("Message produced");
+            producer.send(message.getBytes());
+        }
+
+        // 4. Receive messages
+        Message<byte[]> message = consumer.receive();
+        int messageCount = 0;
+        log.info().attr("data", new String(message.getData())).log("Message received");
+        do {
+            messageCount += 1;
+            log.info().attr("data", new String(message.getData())).log("Message received");
+            message = consumer.receive(500, TimeUnit.MILLISECONDS);
+        } while (message != null);
+        assertEquals(messageCount, totalMessages);
+
+        // 5. Ask for redeliver
+        consumer.redeliverUnacknowledgedMessages();
+
+        // 6. Check if Messages redelivered again
+        message = consumer.receive();
+        messageCount = 0;
+        log.info().attr("data", new String(message.getData())).log("Message received");
+        do {
+            messageCount += 1;
+            log.info().attr("data", new String(message.getData())).log("Message received");
+            message = consumer.receive(500, TimeUnit.MILLISECONDS);
+        } while (message != null);
+        assertEquals(messageCount, totalMessages);
+    }
+
+    @Test(timeOut = testTimeout)
+    public void testSharedSingleAckedPartitionedTopic() throws Exception {
+        final String topicName = newTopicName();
+        final String subscriptionName = "my-shared-subscription";
+        final String messagePredicate = "my-message-";
+        final int totalMessages = 10;
+        final int numberOfPartitions = 3;
+        admin.topics().createPartitionedTopic(topicName, numberOfPartitions);
+        Random rn = new Random();
+
+        // 1. producer connect
+        Producer<byte[]> producer = pulsarClient.newProducer().topic(topicName)
+            .enableBatching(false)
+            .messageRoutingMode(MessageRoutingMode.RoundRobinPartition).create();
+
+        // 2. Create consumer
+        Consumer<byte[]> consumer1 = pulsarClient.newConsumer().topic(topicName).subscriptionName(subscriptionName)
+                .receiverQueueSize(7).subscriptionType(SubscriptionType.Shared).subscribe();
+
+        @Cleanup
+        PulsarClient newPulsarClient = newPulsarClient();
+        Consumer<byte[]> consumer2 = newPulsarClient.newConsumer().topic(topicName).subscriptionName(subscriptionName)
+                .receiverQueueSize(7).subscriptionType(SubscriptionType.Shared).subscribe();
+
+        // 3. producer publish messages
+        for (int i = 0; i < totalMessages; i++) {
+            String message = messagePredicate + i;
+            log.info().attr("message", message).log("Message produced");
+            producer.send(message.getBytes());
+        }
+
+        // 4. Receive messages
+        Message<byte[]> message1 = consumer1.receive();
+        Message<byte[]> message2 = consumer2.receive();
+        int messageCount1 = 0;
+        int messageCount2 = 0;
+        int ackCount1 = 0;
+        int ackCount2 = 0;
+        do {
+            if (message1 != null) {
+                log.info().attr("data", new String(message1.getData())).log("Consumer1 received");
+                messageCount1 += 1;
+                if (rn.nextInt() % 3 == 0) {
+                    consumer1.acknowledge(message1);
+                    log.info().attr("data", new String(message1.getData())).log("Consumer1 acked");
+                    ackCount1 += 1;
+                }
+            }
+            if (message2 != null) {
+                log.info().attr("data", new String(message2.getData())).log("Consumer2 received");
+                messageCount2 += 1;
+                if (rn.nextInt() % 3 == 0) {
+                    consumer2.acknowledge(message2);
+                    log.info().attr("data", new String(message2.getData())).log("Consumer2 acked");
+                    ackCount2 += 1;
+                }
+            }
+            message1 = consumer1.receive(500, TimeUnit.MILLISECONDS);
+            message2 = consumer2.receive(500, TimeUnit.MILLISECONDS);
+        } while (message1 != null || message2 != null);
+        log.info().attr("messageCount1", messageCount1).log("messageCount1");
+        log.info().attr("messageCount2", messageCount2).log("messageCount2");
+        log.info().attr("ackCount1", ackCount1).log("ackCount1");
+        log.info().attr("ackCount2", ackCount2).log("ackCount2");
+        assertEquals(messageCount1 + messageCount2, totalMessages);
+
+        // 5. Ask for redeliver
+        log.info("Sent a Redeliver Message Request");
+        consumer1.redeliverUnacknowledgedMessages();
+        if ((ackCount1 + ackCount2) == totalMessages) {
+            return;
+        }
+
+        // 6. Check if Messages redelivered again
+        message1 = consumer1.receive(5000, TimeUnit.MILLISECONDS);
+        message2 = consumer2.receive(5000, TimeUnit.MILLISECONDS);
+        messageCount1 = 0;
+        do {
+            if (message1 != null) {
+                log.info().attr("data", new String(message1.getData())).log("Consumer1 received");
+                messageCount1 += 1;
+            }
+            if (message2 != null) {
+                log.info().attr("data", new String(message2.getData())).log("Consumer2 received");
+                messageCount2 += 1;
+            }
+            message1 = consumer1.receive(1000, TimeUnit.MILLISECONDS);
+            message2 = consumer2.receive(1000, TimeUnit.MILLISECONDS);
+        } while (message1 != null || message2 != null);
+
+        log.info().attr("messageCount1", messageCount1).log("messageCount1");
+        log.info().attr("messageCount2", messageCount2).log("messageCount2");
+        log.info().attr("ackCount1", ackCount1).log("ackCount1");
+        log.info().attr("ackCount2", ackCount2).log("ackCount2");
+        assertEquals(messageCount1 + messageCount2 + ackCount1, totalMessages);
+    }
+
+    @Test(timeOut = testTimeout)
+    public void testFailoverSingleAckedPartitionedTopic() throws Exception {
+        final String topicName = newTopicName();
+        final String subscriptionName = "my-failover-subscription";
+        final String messagePredicate = "my-message-";
+        final int totalMessages = 10;
+        final int numberOfPartitions = 3;
+        admin.topics().createPartitionedTopic(topicName, numberOfPartitions);
+        Random rn = new Random();
+
+        // 1. producer connect
+        Producer<byte[]> producer = pulsarClient.newProducer().topic(topicName)
+            .enableBatching(false)
+            .messageRoutingMode(MessageRoutingMode.RoundRobinPartition)
+            .create();
+
+        // 2. Create consumer
+        ConsumerBuilder<byte[]> consumerBuilder = pulsarClient.newConsumer().topic(topicName)
+                .subscriptionName(subscriptionName).receiverQueueSize(7).subscriptionType(SubscriptionType.Failover);
+        Consumer<byte[]> consumer1 = consumerBuilder.clone().consumerName("Consumer-1").subscribe();
+        Consumer<byte[]> consumer2 = consumerBuilder.clone().consumerName("Consumer-2").subscribe();
+
+        Thread.sleep(1000);
+        // 3. producer publish messages
+        for (int i = 0; i < totalMessages; i++) {
+            String message = messagePredicate + i;
+            log.info().attr("message", message).log("Message produced");
+            producer.send(message.getBytes());
+        }
+
+        // 4. Receive messages
+        Message<byte[]> message1 = consumer1.receive();
+        Message<byte[]> message2 = consumer2.receive();
+        int messageCount1 = 0;
+        int messageCount2 = 0;
+        int ackCount1 = 0;
+        int ackCount2 = 0;
+        do {
+            if (message1 != null) {
+                log.info().attr("data", new String(message1.getData())).log("Consumer1 received");
+                messageCount1 += 1;
+                if (rn.nextInt() % 3 == 0) {
+                    consumer1.acknowledge(message1);
+                    ackCount1 += 1;
+                }
+            }
+            if (message2 != null) {
+                log.info().attr("data", new String(message2.getData())).log("Consumer2 received");
+                messageCount2 += 1;
+                if (rn.nextInt() % 3 == 0) {
+                    consumer2.acknowledge(message2);
+                    ackCount2 += 1;
+                }
+            }
+            message1 = consumer1.receive(500, TimeUnit.MILLISECONDS);
+            message2 = consumer2.receive(500, TimeUnit.MILLISECONDS);
+        } while (message1 != null || message2 != null);
+        log.info().attr("messageCount1", messageCount1).log("messageCount1");
+        log.info().attr("messageCount2", messageCount2).log("messageCount2");
+        log.info().attr("ackCount1", ackCount1).log("ackCount1");
+        log.info().attr("ackCount2", ackCount2).log("ackCount2");
+        assertEquals(messageCount1 + messageCount2, totalMessages);
+        if ((ackCount1 + ackCount2) == totalMessages) {
+            return;
+        }
+        // 5. Ask for redeliver
+        log.info("Sent a Redeliver Message Request");
+        consumer1.redeliverUnacknowledgedMessages();
+        consumer1.close();
+
+        // 6. Check if Messages redelivered again
+        message2 = consumer2.receive();
+        messageCount1 = 0;
+        do {
+            if (message2 != null) {
+                log.info().attr("data", new String(message2.getData())).log("Consumer2 received");
+                messageCount2 += 1;
+            }
+            message2 = consumer2.receive(500, TimeUnit.MILLISECONDS);
+        } while (message2 != null);
+        log.info().attr("messageCount1", messageCount1).log("messageCount1");
+        log.info().attr("messageCount2", messageCount2).log("messageCount2");
+        log.info().attr("ackCount1", ackCount1).log("ackCount1");
+        log.info().attr("ackCount2", ackCount2).log("ackCount2");
+        assertEquals(messageCount2 + ackCount1, totalMessages);
+    }
+
+    @Test(timeOut = testTimeout)
+    public void testFailoverInactiveConsumer() throws Exception {
+        final String topicName = newTopicName();
+        final String subscriptionName = "my-failover-subscription";
+        final String messagePredicate = "my-message-";
+        final int totalMessages = 10;
+        // 1. producer connect
+        Producer<byte[]> producer = pulsarClient.newProducer().topic(topicName)
+            .enableBatching(false)
+            .messageRoutingMode(MessageRoutingMode.SinglePartition)
+            .create();
+        PersistentTopic topicRef = (PersistentTopic) getTopicReference(topicName).get();
+        assertNotNull(topicRef);
+        assertEquals(topicRef.getProducers().size(), 1);
+
+        // 2. Create consumer
+        ConsumerBuilder<byte[]> consumerBuilder = pulsarClient.newConsumer().topic(topicName)
+                .subscriptionName(subscriptionName).receiverQueueSize(10).subscriptionType(SubscriptionType.Failover);
+        Consumer<byte[]> consumer1 = consumerBuilder.clone().consumerName("Consumer-1").subscribe();
+        Consumer<byte[]> consumer2 = consumerBuilder.clone().consumerName("Consumer-2").subscribe();
+
+        // 3. Producer publishes messages
+        for (int i = 0; i < totalMessages; i++) {
+            String message = messagePredicate + i;
+            producer.send(message.getBytes());
+            log.info().attr("message", message).log("Producer produced");
+        }
+
+        // 4. Receive messages - determine which consumer is active (depends on topic name hash)
+        int receivedConsumer1 = 0, receivedConsumer2 = 0;
+        Message<byte[]> message1;
+        Message<byte[]> message2;
+        do {
+            message1 = consumer1.receive(500, TimeUnit.MILLISECONDS);
+            if (message1 != null) {
+                log.info().attr("data", new String(message1.getData())).log("Consumer 1 Received");
+                receivedConsumer1 += 1;
+            }
+        } while (message1 != null);
+        do {
+            message2 = consumer2.receive(500, TimeUnit.MILLISECONDS);
+            if (message2 != null) {
+                log.info().attr("data", new String(message2.getData())).log("Consumer 2 Received");
+                receivedConsumer2 += 1;
+            }
+        } while (message2 != null);
+        log.info().attr("receivedConsumer1", receivedConsumer1).log("Consumer 1 receives");
+        log.info().attr("receivedConsumer2", receivedConsumer2).log("Consumer 2 receives");
+        log.info().attr("value", (receivedConsumer2 + receivedConsumer1)).log("Total receives");
+        assertEquals(receivedConsumer2 + receivedConsumer1, totalMessages);
+        // One consumer is active, the other is on standby
+        Consumer<byte[]> activeConsumer;
+        Consumer<byte[]> standbyConsumer;
+        if (receivedConsumer1 == totalMessages) {
+            activeConsumer = consumer1;
+            standbyConsumer = consumer2;
+            assertEquals(receivedConsumer2, 0);
+        } else {
+            activeConsumer = consumer2;
+            standbyConsumer = consumer1;
+            assertEquals(receivedConsumer1, 0);
+        }
+
+        // 5. Active consumer asks for a redelivery and gets the messages redelivered
+        log.info("Active consumer asks for resend");
+        activeConsumer.redeliverUnacknowledgedMessages();
+        Thread.sleep(1000);
+
+        Message<byte[]> standbyMsg = standbyConsumer.receive(500, TimeUnit.MILLISECONDS);
+        Message<byte[]> activeMsg = activeConsumer.receive(500, TimeUnit.MILLISECONDS);
+        assertNull(standbyMsg);
+        assertNotNull(activeMsg);
+    }
+
+    @SuppressWarnings("unchecked")
+    private BlockingQueue<Message<byte[]>> printIncomingMessageQueue(Consumer<byte[]> consumer) throws Exception {
+        GrowableArrayBlockingQueue<Message<byte[]>> imq = null;
+        ConsumerBase<byte[]> c = (ConsumerBase<byte[]>) consumer;
+        Field field = ConsumerBase.class.getDeclaredField("incomingMessages");
+        field.setAccessible(true);
+        imq = (GrowableArrayBlockingQueue<Message<byte[]>>) field.get(c);
+        log.info().attr("messageQueue", imq.toList()).log("Incoming Message Queue");
+        return imq;
+    }
+
+}

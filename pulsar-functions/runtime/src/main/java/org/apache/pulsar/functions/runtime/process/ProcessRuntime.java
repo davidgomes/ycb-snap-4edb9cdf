@@ -1,0 +1,431 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pulsar.functions.runtime.process;
+
+import static org.apache.pulsar.common.util.Runnables.catchingAndLoggingThrowables;
+import com.google.gson.Gson;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
+import io.grpc.stub.StreamObserver;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import lombok.CustomLog;
+import lombok.Getter;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.pulsar.functions.instance.AuthenticationConfig;
+import org.apache.pulsar.functions.instance.InstanceCache;
+import org.apache.pulsar.functions.instance.InstanceConfig;
+import org.apache.pulsar.functions.proto.Empty;
+import org.apache.pulsar.functions.proto.FunctionDetails;
+import org.apache.pulsar.functions.proto.FunctionStatus;
+import org.apache.pulsar.functions.proto.HealthCheckResult;
+import org.apache.pulsar.functions.proto.InstanceControlGrpc;
+import org.apache.pulsar.functions.proto.MetricsData;
+import org.apache.pulsar.functions.runtime.Runtime;
+import org.apache.pulsar.functions.runtime.RuntimeUtils;
+import org.apache.pulsar.functions.secretsproviderconfigurator.SecretsProviderConfigurator;
+import org.apache.pulsar.functions.utils.FunctionCommon;
+
+/**
+ * A function container implemented using java thread.
+ */
+@CustomLog
+class ProcessRuntime implements Runtime {
+
+    // The thread that invokes the function
+    @Getter
+    private Process process;
+    @Getter
+    private List<String> processArgs;
+    private int instancePort;
+    private int metricsPort;
+    @Getter
+    private Throwable deathException;
+    private ManagedChannel channel;
+    private InstanceControlGrpc.InstanceControlStub stub;
+    private ScheduledFuture<?> timer;
+    private InstanceConfig instanceConfig;
+    private final Long expectedHealthCheckInterval;
+    private final SecretsProviderConfigurator secretsProviderConfigurator;
+    private final String extraDependenciesDir;
+    private final String narExtractionDirectory;
+    private static final long GRPC_TIMEOUT_SECS = 5;
+    private final String funcLogDir;
+
+    ProcessRuntime(InstanceConfig instanceConfig,
+                   String instanceFile,
+                   String extraDependenciesDir,
+                   String narExtractionDirectory,
+                   String logDirectory,
+                   String codeFile,
+                   String transformFunctionFile,
+                   String pulsarServiceUrl,
+                   String stateStorageServiceUrl,
+                   AuthenticationConfig authConfig,
+                   SecretsProviderConfigurator secretsProviderConfigurator,
+                   Long expectedHealthCheckInterval,
+                   String pulsarWebServiceUrl) throws Exception {
+        this.instanceConfig = instanceConfig;
+        this.instancePort = instanceConfig.getPort();
+        this.metricsPort = instanceConfig.getMetricsPort();
+        this.expectedHealthCheckInterval = expectedHealthCheckInterval;
+        this.secretsProviderConfigurator = secretsProviderConfigurator;
+        this.funcLogDir = RuntimeUtils.genFunctionLogFolder(logDirectory, instanceConfig);
+        String logConfigFile = null;
+        String secretsProviderClassName =
+                secretsProviderConfigurator.getSecretsProviderClassName(instanceConfig.getFunctionDetails());
+        String secretsProviderConfig = null;
+        if (secretsProviderConfigurator.getSecretsProviderConfig(instanceConfig.getFunctionDetails()) != null) {
+            secretsProviderConfig = new Gson()
+                    .toJson(secretsProviderConfigurator.getSecretsProviderConfig(instanceConfig.getFunctionDetails()));
+        }
+        switch (instanceConfig.getFunctionDetails().getRuntime()) {
+            case JAVA:
+                String logConfigPath = System.getProperty("pulsar.functions.log.conf");
+                log.debug().attr("logConfigPath", logConfigPath)
+                        .log("The loaded value of pulsar.functions.log.conf");
+                // Added null check to prevent test failures
+                if (logConfigPath != null && Files.exists(Paths.get(logConfigPath))) {
+                    logConfigFile = logConfigPath;
+                } else { // Keeping existing file for backwards compatibility
+                    logConfigFile = "java_instance_log4j2.xml";
+                }
+                break;
+            case PYTHON:
+                logConfigFile = System.getenv("PULSAR_HOME") + "/conf/functions-logging/logging_config.ini";
+                break;
+            case GO:
+                break;
+        }
+        this.extraDependenciesDir = extraDependenciesDir;
+        this.narExtractionDirectory = narExtractionDirectory;
+        this.processArgs = RuntimeUtils.composeCmd(
+            instanceConfig,
+            instanceFile,
+            // DONT SET extra dependencies here (for python or go runtime),
+            // since process runtime is using Java ProcessBuilder,
+            // we have to set the environment variable via ProcessBuilder
+            FunctionDetails.Runtime.JAVA == instanceConfig.getFunctionDetails().getRuntime()
+                    ? extraDependenciesDir : null,
+            logDirectory,
+            codeFile,
+            transformFunctionFile,
+            pulsarServiceUrl,
+            stateStorageServiceUrl,
+            authConfig,
+            instanceConfig.getInstanceName(),
+            instanceConfig.getPort(),
+            expectedHealthCheckInterval,
+            logConfigFile,
+            secretsProviderClassName,
+            secretsProviderConfig,
+            false,
+            null,
+            null,
+                narExtractionDirectory,
+                null,
+                pulsarWebServiceUrl);
+    }
+
+    /**
+     * The core logic that initialize the process container and executes the function.
+     */
+    @Override
+    public void start() {
+        java.lang.Runtime.getRuntime().addShutdownHook(new Thread(() -> process.destroy()));
+
+        // Note: we create the expected log folder before the function process logger attempts to create it
+        // This is because if multiple instances are launched they can encounter a race condition creation of the dir.
+
+        log.info().attr("logDir", funcLogDir).log("Creating function log directory");
+
+        try {
+            Files.createDirectories(Paths.get(funcLogDir));
+        } catch (IOException e) {
+            log.info().attr("logDir", funcLogDir).exception(e)
+                    .log("Exception when creating log folder");
+            throw new RuntimeException("Log folder creation error");
+        }
+
+        log.info().attr("logDir", funcLogDir).log("Created or found function log directory");
+
+        startProcess();
+        if (channel == null && stub == null) {
+            channel = ManagedChannelBuilder.forAddress("127.0.0.1", instancePort)
+                    .usePlaintext()
+                    .build();
+            stub = InstanceControlGrpc.newStub(channel);
+
+            timer = InstanceCache.getInstanceCache().getScheduledExecutorService()
+                    .scheduleAtFixedRate(catchingAndLoggingThrowables(() -> {
+                        CompletableFuture<HealthCheckResult> result = healthCheck();
+                        try {
+                            result.get();
+                        } catch (Exception e) {
+                            log.error().attr("name", instanceConfig.getFunctionDetails().getName())
+                                    .attr("instanceId", instanceConfig.getInstanceId())
+                                    .exception(e).log("Health check failed");
+                        }
+                    }), expectedHealthCheckInterval, expectedHealthCheckInterval, TimeUnit.SECONDS);
+        }
+    }
+
+    @Override
+    public void join() throws Exception {
+        process.waitFor();
+    }
+
+    @Override
+    public void stop() throws InterruptedException {
+        if (timer != null) {
+            timer.cancel(false);
+        }
+        if (channel != null) {
+            channel.shutdown();
+        }
+        channel = null;
+        stub = null;
+
+        // kill process
+        if (process != null) {
+            process.destroy();
+            int i = 0;
+            // gracefully terminate at first
+            while (process.isAlive()) {
+                Thread.sleep(100);
+                if (i > 100) {
+                    break;
+                }
+                i++;
+            }
+
+            // forcibly kill after timeout
+            if (process.isAlive()) {
+                log.warn().attr("instance", FunctionCommon.getFullyQualifiedInstanceId(
+                                instanceConfig.getFunctionDetails().getTenant(),
+                                instanceConfig.getFunctionDetails().getNamespace(),
+                                instanceConfig.getFunctionDetails().getName(),
+                                instanceConfig.getInstanceId()))
+                        .log("Process did not exit within timeout. Forcibly killing");
+                process.destroyForcibly();
+            }
+        }
+    }
+
+    @Override
+    public CompletableFuture<FunctionStatus> getFunctionStatus(int instanceId) {
+        CompletableFuture<FunctionStatus> retval = new CompletableFuture<>();
+        if (stub == null) {
+            retval.completeExceptionally(new RuntimeException("Not alive"));
+            return retval;
+        }
+        stub.withDeadlineAfter(GRPC_TIMEOUT_SECS, TimeUnit.SECONDS)
+                .getFunctionStatus(new Empty(), new StreamObserver<>() {
+            @Override
+            public void onNext(FunctionStatus t) {
+                retval.complete(t);
+            }
+
+            @Override
+            public void onError(Throwable throwable) {
+                FunctionStatus status = new FunctionStatus();
+                status.setRunning(false);
+                if (deathException != null) {
+                    status.setFailureException(deathException.getMessage());
+                } else {
+                    status.setFailureException(throwable.getMessage());
+                }
+                retval.complete(status);
+            }
+
+            @Override
+            public void onCompleted() {
+            }
+        });
+        return retval;
+    }
+
+    @Override
+    public CompletableFuture<MetricsData> getAndResetMetrics() {
+        CompletableFuture<MetricsData> retval = new CompletableFuture<>();
+        if (stub == null) {
+            retval.completeExceptionally(new RuntimeException("Not alive"));
+            return retval;
+        }
+        stub.withDeadlineAfter(GRPC_TIMEOUT_SECS, TimeUnit.SECONDS)
+                .getAndResetMetrics(new Empty(), new StreamObserver<>() {
+            @Override
+            public void onNext(MetricsData t) {
+                retval.complete(t);
+            }
+
+            @Override
+            public void onError(Throwable throwable) {
+                retval.completeExceptionally(throwable);
+            }
+
+            @Override
+            public void onCompleted() {
+            }
+        });
+        return retval;
+    }
+
+    @Override
+    public CompletableFuture<Void> resetMetrics() {
+        CompletableFuture<Void> retval = new CompletableFuture<>();
+        if (stub == null) {
+            retval.completeExceptionally(new RuntimeException("Not alive"));
+            return retval;
+        }
+        stub.withDeadlineAfter(GRPC_TIMEOUT_SECS, TimeUnit.SECONDS).resetMetrics(new Empty(), new StreamObserver<>() {
+            @Override
+            public void onNext(Empty t) {
+                retval.complete(null);
+            }
+
+            @Override
+            public void onError(Throwable throwable) {
+                retval.completeExceptionally(throwable);
+            }
+
+            @Override
+            public void onCompleted() {
+            }
+        });
+        return retval;
+    }
+
+    @Override
+    public CompletableFuture<MetricsData> getMetrics(int instanceId) {
+        CompletableFuture<MetricsData> retval = new CompletableFuture<>();
+        if (stub == null) {
+            retval.completeExceptionally(new RuntimeException("Not alive"));
+            return retval;
+        }
+        stub.withDeadlineAfter(GRPC_TIMEOUT_SECS, TimeUnit.SECONDS).getMetrics(new Empty(), new StreamObserver<>() {
+            @Override
+            public void onNext(MetricsData t) {
+                retval.complete(t);
+            }
+
+            @Override
+            public void onError(Throwable throwable) {
+                retval.completeExceptionally(throwable);
+            }
+
+            @Override
+            public void onCompleted() {
+            }
+        });
+        return retval;
+    }
+
+    @Override
+    public String getPrometheusMetrics() throws IOException {
+        return RuntimeUtils.getPrometheusMetrics(metricsPort);
+    }
+
+    public CompletableFuture<HealthCheckResult> healthCheck() {
+        CompletableFuture<HealthCheckResult> retval = new CompletableFuture<>();
+        if (stub == null) {
+            retval.completeExceptionally(new RuntimeException("Not alive"));
+            return retval;
+        }
+        stub.withDeadlineAfter(GRPC_TIMEOUT_SECS, TimeUnit.SECONDS).healthCheck(new Empty(), new StreamObserver<>() {
+            @Override
+            public void onNext(HealthCheckResult t) {
+                retval.complete(t);
+            }
+
+            @Override
+            public void onError(Throwable throwable) {
+                retval.completeExceptionally(throwable);
+            }
+
+            @Override
+            public void onCompleted() {
+            }
+        });
+        return retval;
+    }
+
+    private void startProcess() {
+        deathException = null;
+        try {
+            ProcessBuilder processBuilder = new ProcessBuilder(processArgs).inheritIO();
+            if (StringUtils.isNotEmpty(extraDependenciesDir)) {
+                processBuilder.environment().put("PYTHONPATH", "${PYTHONPATH}:" + extraDependenciesDir);
+            }
+            secretsProviderConfigurator
+                    .configureProcessRuntimeSecretsProvider(processBuilder, instanceConfig.getFunctionDetails());
+            log.info().attr("args", String.join(" ", processBuilder.command()))
+                    .log("ProcessBuilder starting the process");
+            process = processBuilder.start();
+            log.info().attr("pid", process.pid()).log("Process started");
+        } catch (Exception ex) {
+            log.error().exception(ex).log("Starting process failed");
+            deathException = ex;
+            return;
+        }
+        try {
+            int exitValue = process.exitValue();
+            log.error().attr("pid", process.pid())
+                    .attr("exitValue", exitValue)
+                    .log("Instance Process quit unexpectedly");
+            tryExtractingDeathException();
+        } catch (IllegalThreadStateException ex) {
+            log.info().attr("pid", process.pid()).log("Started process successfully");
+        }
+    }
+
+    @Override
+    public boolean isAlive() {
+        if (process == null) {
+            return false;
+        }
+        if (!process.isAlive()) {
+            if (deathException == null) {
+                tryExtractingDeathException();
+            }
+            return false;
+        }
+        return true;
+    }
+
+    private void tryExtractingDeathException() {
+        InputStream errorStream = process.getErrorStream();
+        try {
+            byte[] errorBytes = new byte[errorStream.available()];
+            errorStream.read(errorBytes);
+            String errorMessage = new String(errorBytes);
+            deathException = new RuntimeException(errorMessage);
+            log.error().exception(deathException).log("Extracted Process death exception");
+        } catch (Exception ex) {
+            deathException = ex;
+            log.error().exception(deathException).log("Error extracting Process death exception");
+        }
+    }
+}

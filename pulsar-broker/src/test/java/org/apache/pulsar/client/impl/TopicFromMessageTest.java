@@ -1,0 +1,105 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pulsar.client.impl;
+
+import com.google.common.collect.Lists;
+import java.util.HashSet;
+import java.util.Set;
+import org.apache.pulsar.broker.service.SharedPulsarBaseTest;
+import org.apache.pulsar.client.api.Consumer;
+import org.apache.pulsar.client.api.Producer;
+import org.testng.Assert;
+import org.testng.annotations.Test;
+
+@Test(groups = "broker-impl")
+public class TopicFromMessageTest extends SharedPulsarBaseTest {
+
+    private static final long TEST_TIMEOUT = 90000; // 1.5 min
+    private static final int BATCHING_MAX_MESSAGES_THRESHOLD = 2;
+
+    @Test(timeOut = TEST_TIMEOUT)
+    public void testSingleTopicConsumerNoBatch() throws Exception {
+        final String topic = newTopicName();
+        try (Consumer<byte[]> consumer = pulsarClient.newConsumer()
+                .topic(topic).subscriptionName("sub1").subscribe();
+             Producer<byte[]> producer = pulsarClient.newProducer()
+                .topic(topic).enableBatching(false).create()) {
+            producer.send("foobar".getBytes());
+            Assert.assertEquals(consumer.receive().getTopicName(), topic);
+        }
+    }
+
+    @Test(timeOut = TEST_TIMEOUT)
+    public void testMultiTopicConsumerNoBatch() throws Exception {
+        final String topic1 = newTopicName();
+        final String topic2 = newTopicName();
+        try (Consumer<byte[]> consumer = pulsarClient.newConsumer()
+                .topics(Lists.newArrayList(topic1, topic2)).subscriptionName("sub1").subscribe();
+             Producer<byte[]> producer1 = pulsarClient.newProducer()
+                .topic(topic1).enableBatching(false).create();
+             Producer<byte[]> producer2 = pulsarClient.newProducer()
+                .topic(topic2).enableBatching(false).create()) {
+
+            Set<String> topicSet = new HashSet<>();
+            topicSet.add(topic1);
+            topicSet.add(topic2);
+            producer1.send("foobar".getBytes());
+            producer2.send("foobar".getBytes());
+            Assert.assertTrue(topicSet.remove(consumer.receive().getTopicName()));
+            Assert.assertTrue(topicSet.remove(consumer.receive().getTopicName()));
+        }
+    }
+
+    @Test(timeOut = TEST_TIMEOUT)
+    public void testSingleTopicConsumerBatch() throws Exception {
+        final String topic = newTopicName();
+        try (Consumer<byte[]> consumer = pulsarClient.newConsumer()
+                .topic(topic).subscriptionName("sub1").subscribe();
+             Producer<byte[]> producer = pulsarClient.newProducer()
+                .topic(topic).enableBatching(true).batchingMaxMessages(BATCHING_MAX_MESSAGES_THRESHOLD).create()) {
+            producer.send("foobar".getBytes());
+
+            Assert.assertEquals(consumer.receive().getTopicName(), topic);
+        }
+    }
+
+    @Test(timeOut = TEST_TIMEOUT)
+    public void testMultiTopicConsumerBatch() throws Exception {
+        final String topic1 = newTopicName();
+        final String topic2 = newTopicName();
+        try (Consumer<byte[]> consumer = pulsarClient.newConsumer()
+                .topics(Lists.newArrayList(topic1, topic2)).subscriptionName("sub1").subscribe();
+             Producer<byte[]> producer1 = pulsarClient.newProducer()
+                .topic(topic1).enableBatching(true).batchingMaxMessages(BATCHING_MAX_MESSAGES_THRESHOLD).create();
+             Producer<byte[]> producer2 = pulsarClient.newProducer()
+                .topic(topic2).enableBatching(true).batchingMaxMessages(BATCHING_MAX_MESSAGES_THRESHOLD).create()) {
+
+            producer1.send("foobar".getBytes());
+            producer2.send("foobar".getBytes());
+
+            // We can't ensure the received order of the message.
+            String topicNameX = consumer.receive().getTopicName();
+            String topicNameY = consumer.receive().getTopicName();
+            Object[] actualTopicNames = new Object[]{topicNameX, topicNameY};
+            Object[] expectedTopicNames = new Object[]{topic1, topic2};
+            Assert.assertEqualsNoOrder(actualTopicNames, expectedTopicNames);
+        }
+    }
+
+}

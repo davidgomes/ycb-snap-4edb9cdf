@@ -1,0 +1,257 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pulsar.broker.service;
+
+import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertNotEquals;
+import static org.testng.Assert.assertNotNull;
+import static org.testng.Assert.assertTrue;
+import static org.testng.Assert.fail;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import lombok.Cleanup;
+import lombok.CustomLog;
+import org.apache.bookkeeper.mledger.ManagedLedgerConfig;
+import org.apache.bookkeeper.mledger.impl.ManagedLedgerImpl;
+import org.apache.pulsar.broker.service.persistent.PersistentTopic;
+import org.apache.pulsar.client.admin.PulsarAdminException;
+import org.apache.pulsar.client.api.Consumer;
+import org.apache.pulsar.client.api.Message;
+import org.apache.pulsar.client.api.MessageId;
+import org.apache.pulsar.client.api.Producer;
+import org.apache.pulsar.common.naming.TopicName;
+import org.apache.pulsar.common.policies.data.RetentionPolicies;
+import org.awaitility.Awaitility;
+import org.testng.Assert;
+import org.testng.annotations.Test;
+
+@CustomLog
+@Test(groups = "broker")
+public class ConsumedLedgersTrimTest extends SharedPulsarBaseTest {
+
+    @Test
+    public void testConsumedLedgersTrim() throws Exception {
+        // Disable dedup so the pulsar.dedup cursor doesn't block ledger trimming
+        admin.namespaces().setDeduplicationStatus(getNamespace(), false);
+        // Set infinite retention at namespace level so ledgers are preserved until explicitly trimmed
+        admin.namespaces().setRetention(getNamespace(), new RetentionPolicies(-1, -1));
+
+        final String topicName = newTopicName();
+        final String subscriptionName = "my-subscriber-name";
+
+        @Cleanup
+        Producer<byte[]> producer = pulsarClient.newProducer()
+                .topic(topicName)
+                .producerName("producer-name")
+                .create();
+        @Cleanup
+        Consumer<byte[]> consumer = pulsarClient.newConsumer().topic(topicName).subscriptionName(subscriptionName)
+                .subscribe();
+        Topic topicRef = getTopicReference(topicName).get();
+        Assert.assertNotNull(topicRef);
+        PersistentTopic persistentTopic = (PersistentTopic) getTopic(topicName, true).get().get();
+
+        ManagedLedgerConfig managedLedgerConfig = persistentTopic.getManagedLedger().getConfig();
+        managedLedgerConfig.setRetentionSizeInMB(1L);
+        managedLedgerConfig.setRetentionTime(1, TimeUnit.SECONDS);
+        managedLedgerConfig.setMaxEntriesPerLedger(2);
+        managedLedgerConfig.setMinimumRolloverTime(1, TimeUnit.MILLISECONDS);
+
+        int msgNum = 10;
+        for (int i = 0; i < msgNum; i++) {
+            producer.send(new byte[1024 * 1024]);
+        }
+
+        ManagedLedgerImpl managedLedger = (ManagedLedgerImpl) persistentTopic.getManagedLedger();
+        Awaitility.await().untilAsserted(() -> {
+            Assert.assertEquals(managedLedger.getLedgersInfoAsList().size() - 1, msgNum / 2);
+        });
+
+        // no traffic, unconsumed ledger will be retained
+        Thread.sleep(1200);
+        Assert.assertEquals(managedLedger.getLedgersInfoAsList().size() - 1, msgNum / 2);
+
+        for (int i = 0; i < msgNum; i++) {
+            Message<byte[]> msg = consumer.receive(2, TimeUnit.SECONDS);
+            assertNotNull(msg);
+            consumer.acknowledge(msg);
+        }
+
+        // Explicitly trigger trim instead of relying on the broker's retention check timer
+        Thread.sleep(1500);
+        CompletableFuture<Void> trimFuture = new CompletableFuture<>();
+        managedLedger.trimConsumedLedgersInBackground(trimFuture);
+        trimFuture.join();
+
+        Assert.assertEquals(managedLedger.getLedgersInfoAsList().size(), 1);
+    }
+
+
+    @Test
+    public void testConsumedLedgersTrimNoSubscriptions() throws Exception {
+        // Disable dedup so the pulsar.dedup cursor doesn't block ledger trimming
+        admin.namespaces().setDeduplicationStatus(getNamespace(), false);
+        // Set infinite retention at namespace level so ledgers are preserved until explicitly trimmed
+        admin.namespaces().setRetention(getNamespace(), new RetentionPolicies(-1, -1));
+
+        final String topicName = newTopicName();
+
+        // write some messages
+        @Cleanup
+        Producer<byte[]> producer = pulsarClient.newProducer()
+                .topic(topicName)
+                .producerName("producer-name")
+                .create();
+
+        // set retention parameters, the ledgers are to be deleted as soon as possible
+        // but the topic is not to be automatically deleted
+        PersistentTopic persistentTopic = (PersistentTopic) getTopic(topicName, true).get().get();
+        ManagedLedgerConfig managedLedgerConfig = persistentTopic.getManagedLedger().getConfig();
+        managedLedgerConfig.setRetentionSizeInMB(-1);
+        managedLedgerConfig.setRetentionTime(-1, TimeUnit.SECONDS);
+        managedLedgerConfig.setMaxEntriesPerLedger(1000);
+        managedLedgerConfig.setMinimumRolloverTime(1, TimeUnit.MILLISECONDS);
+        MessageId initialMessageId = persistentTopic.getLastMessageId().get();
+        log.info().attr("lastMessageId", initialMessageId).log("Last message id");
+
+        int msgNum = 7;
+        for (int i = 0; i < msgNum; i++) {
+            producer.send(new byte[1024 * 1024]);
+        }
+
+        ManagedLedgerImpl managedLedger = (ManagedLedgerImpl) persistentTopic.getManagedLedger();
+        Assert.assertEquals(managedLedger.getLedgersInfoAsList().size(), 1);
+        MessageId messageIdBeforeUnload = admin.topics().getLastMessageId(topicName);
+        log.info().attr("messageId", messageIdBeforeUnload).log("Message id before unload");
+        assertNotEquals(messageIdBeforeUnload, initialMessageId);
+
+        // Unload and close the producer to force a new ledger when the topic is reloaded.
+        // The lastMessageId should still refer to the previous ledger.
+        producer.close();
+        admin.topics().unload(topicName);
+
+        // Force-load the topic again
+        admin.topics().getStats(topicName);
+        MessageId messageIdAfterUnload = admin.topics().getLastMessageId(topicName);
+        log.info().attr("lastMessageId", messageIdAfterUnload).log("Last message id after unload");
+        assertEquals(messageIdAfterUnload, messageIdBeforeUnload);
+
+        persistentTopic = (PersistentTopic) getTopic(topicName, true).get().get();
+        managedLedger = (ManagedLedgerImpl) persistentTopic.getManagedLedger();
+        // now we have two ledgers, the first is expired but is contains the lastMessageId
+        // the second is empty and should be kept as it is the current tail
+        Assert.assertEquals(managedLedger.getLedgersInfoAsList().size(), 2);
+        managedLedgerConfig = persistentTopic.getManagedLedger().getConfig();
+        managedLedgerConfig.setRetentionSizeInMB(-1);
+        managedLedgerConfig.setRetentionTime(1, TimeUnit.SECONDS);
+        managedLedgerConfig.setMaxEntriesPerLedger(1);
+        managedLedgerConfig.setMinimumRolloverTime(1, TimeUnit.MILLISECONDS);
+
+        // force trimConsumedLedgers
+        Thread.sleep(3000);
+        CompletableFuture f = new CompletableFuture();
+        managedLedger.trimConsumedLedgersInBackground(f);
+        f.join();
+
+        // lastMessageId should be available even in this case, but is must
+        // refer to -1
+        MessageId messageIdAfterTrim = admin.topics().getLastMessageId(topicName);
+        log.info().attr("lastMessageId", messageIdAfterTrim).log("Last message id after trim");
+        assertEquals(messageIdAfterTrim, MessageId.earliest);
+
+    }
+
+    @Test
+    public void testAdminTrimLedgers() throws Exception {
+        // Disable dedup so the pulsar.dedup cursor doesn't block ledger trimming
+        admin.namespaces().setDeduplicationStatus(getNamespace(), false);
+        final String subscriptionName = "my-sub";
+        final int maxEntriesPerLedger = 2;
+        final int partitionedNum = 3;
+
+        String partitionedTopic = "persistent://" + getNamespace()
+                + "/trim-ledgers-" + UUID.randomUUID().toString().substring(0, 8);
+        admin.topics().createPartitionedTopic(partitionedTopic, partitionedNum);
+        @Cleanup
+        Producer<byte[]> producer = pulsarClient.newProducer()
+                .topic(partitionedTopic)
+                .enableBatching(false)
+                .create();
+        @Cleanup
+        Consumer<byte[]> consumer = pulsarClient.newConsumer().topic(partitionedTopic)
+                .subscriptionName(subscriptionName).subscribe();
+        for (int i = 0; i < partitionedNum; i++) {
+            String topic = TopicName.get(partitionedTopic).getPartition(i).toString();
+            Topic topicRef = getTopicReference(topic).get();
+            Assert.assertNotNull(topicRef);
+        }
+        PersistentTopic persistentTopic = (PersistentTopic) getTopicReference(
+                TopicName.get(partitionedTopic).getPartition(0).toString()).get();
+        ManagedLedgerConfig managedLedgerConfig = persistentTopic.getManagedLedger().getConfig();
+        managedLedgerConfig.setRetentionSizeInMB(-1);
+        managedLedgerConfig.setRetentionTime(1, TimeUnit.MILLISECONDS);
+        managedLedgerConfig.setMaxEntriesPerLedger(maxEntriesPerLedger);
+        managedLedgerConfig.setMinimumRolloverTime(1, TimeUnit.MILLISECONDS);
+        int msgNum = 50;
+        for (int i = 0; i < msgNum; i++) {
+            producer.send(new byte[0]);
+        }
+        ManagedLedgerImpl managedLedger = (ManagedLedgerImpl) persistentTopic.getManagedLedger();
+        Assert.assertTrue(managedLedger.getLedgersInfoAsList().size() > 1);
+        for (int i = 0; i < msgNum; i++) {
+            Message<byte[]> msg = consumer.receive(10, TimeUnit.SECONDS);
+            assertNotNull(msg);
+            consumer.acknowledge(msg);
+        }
+        //consumed ledger should be cleaned
+        // After trimming, the managed ledger should have at most 2 ledgers remaining:
+        // - The ledger containing the last confirmed entry (cannot be trimmed)
+        // - Possibly an empty active ledger if the last write caused a rollover
+        //   (with maxEntriesPerLedger=2, if partition-0 receives an even number of
+        //   messages, the last ledger is full and a new empty active ledger is created)
+        // Re-trigger trim inside the loop because trimConsumedLedgersInBackground() is async
+        // and the mark-delete position may not have been persisted yet on the first call.
+        Awaitility.await().atMost(30, TimeUnit.SECONDS).untilAsserted(() -> {
+            managedLedger.trimConsumedLedgersInBackground(CompletableFuture.completedFuture(null));
+            Assert.assertTrue(managedLedger.getLedgersInfoAsList().size() <= 2,
+                    "Expected at most 2 ledgers after trim, but found "
+                            + managedLedger.getLedgersInfoAsList().size());
+        });
+    }
+
+    @Test
+    public void trimNonPersistentTopic() throws Exception {
+        String topicName = "non-persistent://" + getNamespace() + "/trimNonPersistentTopic" + UUID.randomUUID();
+        int partitionedNum = 3;
+        admin.topics().createPartitionedTopic(topicName, partitionedNum);
+        @Cleanup
+        Producer<byte[]> producer = pulsarClient.newProducer()
+                .topic(topicName)
+                .enableBatching(false)
+                .producerName("producer-name")
+                .create();
+        try {
+            admin.topics().trimTopic(topicName);
+            fail("should failed");
+        } catch (Exception e) {
+            assertTrue(e instanceof PulsarAdminException.NotAllowedException);
+        }
+    }
+}

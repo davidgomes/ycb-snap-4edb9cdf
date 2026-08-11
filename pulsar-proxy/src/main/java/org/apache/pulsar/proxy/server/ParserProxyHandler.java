@@ -1,0 +1,247 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pulsar.proxy.server;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufUtil;
+import io.netty.buffer.CompositeByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelId;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import lombok.CustomLog;
+import lombok.Getter;
+import org.apache.commons.lang3.mutable.MutableLong;
+import org.apache.pulsar.common.api.proto.BaseCommand;
+import org.apache.pulsar.common.api.raw.MessageParser;
+import org.apache.pulsar.common.api.raw.RawMessage;
+import org.apache.pulsar.common.naming.TopicName;
+import org.apache.pulsar.common.util.StringInterner;
+import org.apache.pulsar.proxy.stats.TopicStats;
+
+
+@CustomLog
+public class ParserProxyHandler extends ChannelInboundHandlerAdapter {
+
+
+    //inbound
+    protected static final String FRONTEND_CONN = "frontendconn";
+    //outbound
+    protected static final String BACKEND_CONN = "backendconn";
+
+    private final String connType;
+
+    private final int maxMessageSize;
+    private final ChannelId peerChannelId;
+    @Getter
+    private final Context context;
+    private final ProxyService service;
+
+
+    public static class Context {
+        /**
+         * producerid as key.
+         */
+        @Getter
+        private final Map<Long, String> producerIdToTopicName = new ConcurrentHashMap<>();
+
+        /**
+         * consumerid as key.
+         */
+        @Getter
+        private final Map<Long, String> consumerIdToTopicName = new ConcurrentHashMap<>();
+
+        private Context() {
+        }
+    }
+
+    public ParserProxyHandler(Context context, ProxyService service, String type, int maxMessageSize,
+                              ChannelId peerChannelId) {
+        this.context = context;
+        this.service = service;
+        this.connType = type;
+        this.maxMessageSize = maxMessageSize;
+        this.peerChannelId = peerChannelId;
+    }
+
+    public static Context createContext() {
+        return new Context();
+    }
+
+    private void logging(Channel conn, BaseCommand.Type cmdtype, String info, List<RawMessage> messages) {
+
+        if (messages != null) {
+            // lag
+            StringBuilder infoBuilder = new StringBuilder(info);
+            for (RawMessage message : messages) {
+                infoBuilder.append("[").append(System.currentTimeMillis() - message.getPublishTime()).append("] ")
+                        .append(new String(ByteBufUtil.getBytes(message.getData()), StandardCharsets.UTF_8));
+            }
+            info = infoBuilder.toString();
+        }
+        // log conn format is like from source to target
+        switch (this.connType) {
+            case ParserProxyHandler.FRONTEND_CONN:
+                log.info()
+                        .attr("localAddress", conn.localAddress())
+                        .attr("remoteAddress", conn.remoteAddress())
+                        .attr("cmd", cmdtype)
+                        .attr("msg", info)
+                        .log(ParserProxyHandler.FRONTEND_CONN);
+                break;
+            case ParserProxyHandler.BACKEND_CONN:
+                log.info()
+                        .attr("localAddress", conn.localAddress())
+                        .attr("remoteAddress", conn.remoteAddress())
+                        .attr("cmd", cmdtype)
+                        .attr("msg", info)
+                        .log(ParserProxyHandler.BACKEND_CONN);
+                break;
+        }
+    }
+
+    private final BaseCommand cmd = new BaseCommand();
+
+    public void channelRead(ChannelHandlerContext ctx, Object msg) {
+        String key;
+        String topicName;
+        List<RawMessage> messages = new ArrayList<>();
+        ByteBuf buffer = (ByteBuf) (msg);
+
+        try {
+            buffer.markReaderIndex();
+            buffer.markWriterIndex();
+
+            int cmdSize = (int) buffer.readUnsignedInt();
+            cmd.parseFrom(buffer,  cmdSize);
+
+            switch (cmd.getType()) {
+                case PRODUCER:
+                    topicName = StringInterner.intern(cmd.getProducer().getTopic());
+                    context.producerIdToTopicName.put(cmd.getProducer().getProducerId(), topicName);
+
+                    String producerName = "";
+                    if (cmd.getProducer().hasProducerName()){
+                        producerName = cmd.getProducer().getProducerName();
+                    }
+                    logging(ctx.channel(), cmd.getType(), "{producer:" + producerName
+                            + ",topic:" + topicName + "}", null);
+                    break;
+                case CLOSE_PRODUCER:
+                    context.producerIdToTopicName.remove(cmd.getCloseProducer().getProducerId());
+                    logging(ctx.channel(), cmd.getType(), "", null);
+                    break;
+                case SEND:
+                    if (service.getProxyLogLevel() != 2) {
+                        logging(ctx.channel(), cmd.getType(), "", null);
+                        break;
+                    }
+                    long producerId = cmd.getSend().getProducerId();
+                    String topicForProducer = context.producerIdToTopicName.get(producerId);
+                    if (topicForProducer != null) {
+                        topicName = TopicName.toFullTopicName(topicForProducer);
+                        MutableLong msgBytes = new MutableLong(0);
+                        MessageParser.parseMessage(topicName, -1L,
+                                -1L, buffer, (message) -> {
+                                    messages.add(message);
+                                    msgBytes.add(message.getData().readableBytes());
+                                }, maxMessageSize);
+                        // update topic stats
+                        TopicStats topicStats = this.service.getTopicStats().computeIfAbsent(topicName,
+                                topic -> new TopicStats());
+                        topicStats.getMsgInRate().recordMultipleEvents(messages.size(), msgBytes.longValue());
+                        logging(ctx.channel(), cmd.getType(), "", messages);
+                    } else {
+                        logging(ctx.channel(), cmd.getType(),
+                                "Cannot find topic name for producerId " + producerId, null);
+                    }
+                    break;
+
+                case SUBSCRIBE:
+                    topicName = StringInterner.intern(cmd.getSubscribe().getTopic());
+                    context.consumerIdToTopicName.put(cmd.getSubscribe().getConsumerId(), topicName);
+
+                    logging(ctx.channel(), cmd.getType(), "{consumer:" + cmd.getSubscribe().getConsumerName()
+                            + ",topic:" + topicName + "}", null);
+                    break;
+                case CLOSE_CONSUMER:
+                    context.consumerIdToTopicName.remove(cmd.getCloseConsumer().getConsumerId());
+                    logging(ctx.channel(), cmd.getType(), "", null);
+                    break;
+                case UNSUBSCRIBE:
+                    context.consumerIdToTopicName.remove(cmd.getUnsubscribe().getConsumerId());
+                    logging(ctx.channel(), cmd.getType(), "", null);
+                    break;
+                case MESSAGE:
+                    if (service.getProxyLogLevel() != 2) {
+                        logging(ctx.channel(), cmd.getType(), "", null);
+                        break;
+                    }
+                    long consumerId = cmd.getMessage().getConsumerId();
+                    String topicForConsumer = context.consumerIdToTopicName.get(consumerId);
+                    if (topicForConsumer != null) {
+                        topicName = TopicName.toFullTopicName(topicForConsumer);
+
+                        MutableLong msgBytes = new MutableLong(0);
+                        MessageParser.parseMessage(topicName, -1L,
+                                -1L, buffer, (message) -> {
+                                    messages.add(message);
+                                    msgBytes.add(message.getData().readableBytes());
+                                }, maxMessageSize);
+                        // update topic stats
+                        TopicStats topicStats = this.service.getTopicStats().computeIfAbsent(topicName.toString(),
+                                topic -> new TopicStats());
+                        topicStats.getMsgOutRate().recordMultipleEvents(messages.size(), msgBytes.longValue());
+                        logging(ctx.channel(), cmd.getType(), "", messages);
+                    } else {
+                        logging(ctx.channel(), cmd.getType(), "Cannot find topic name for consumerId " + consumerId,
+                                null);
+                    }
+                    break;
+
+                 default:
+                    logging(ctx.channel(), cmd.getType(), "", null);
+                    break;
+            }
+        } catch (Exception e){
+            log.error().exception(e).log("channelRead error ");
+        } finally {
+            buffer.resetReaderIndex();
+            buffer.resetWriterIndex();
+
+            // add totalSize to buffer Head
+            ByteBuf totalSizeBuf = Unpooled.buffer(4);
+            totalSizeBuf.writeInt(buffer.readableBytes());
+            CompositeByteBuf compBuf = Unpooled.compositeBuffer();
+            compBuf.addComponents(totalSizeBuf, buffer);
+            compBuf.writerIndex(totalSizeBuf.capacity() + buffer.capacity());
+
+            // Release mssages
+            messages.forEach(RawMessage::release);
+            //next handler
+            ctx.fireChannelRead(compBuf);
+        }
+    }
+}

@@ -1,0 +1,105 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pulsar.websocket.proxy;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.google.gson.Gson;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParseException;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import lombok.CustomLog;
+import org.apache.pulsar.common.util.ObjectMapperFactory;
+import org.apache.pulsar.websocket.data.ProducerMessage;
+import org.eclipse.jetty.websocket.api.Callback;
+import org.eclipse.jetty.websocket.api.Session;
+import org.eclipse.jetty.websocket.api.annotations.OnWebSocketClose;
+import org.eclipse.jetty.websocket.api.annotations.OnWebSocketMessage;
+import org.eclipse.jetty.websocket.api.annotations.OnWebSocketOpen;
+import org.eclipse.jetty.websocket.api.annotations.WebSocket;
+
+@WebSocket
+@CustomLog
+public class SimpleProducerSocket {
+
+    private final CountDownLatch closeLatch;
+    private Session session;
+    private final List<String> producerBuffer;
+    private final int messagesToSendWhenConnected;
+
+    public SimpleProducerSocket() {
+        this(10);
+    }
+
+    public SimpleProducerSocket(int messagesToSendWhenConnected) {
+        this.closeLatch = new CountDownLatch(1);
+        this.producerBuffer = Collections.synchronizedList(new ArrayList<>());
+        this.messagesToSendWhenConnected = messagesToSendWhenConnected;
+    }
+
+    private static String getTestJsonPayload(int index) throws JsonProcessingException {
+        ProducerMessage msg = new ProducerMessage();
+        msg.payload = Base64.getEncoder().encodeToString(("test" + index).getBytes());
+        msg.key = Integer.toString(index);
+        return ObjectMapperFactory.getMapper().writer().writeValueAsString(msg);
+    }
+
+    public boolean awaitClose(int duration, TimeUnit unit) throws InterruptedException {
+        return this.closeLatch.await(duration, unit);
+    }
+
+    @OnWebSocketClose
+    public void onClose(int statusCode, String reason) {
+        log.info().attr("statusCode", statusCode).attr("reason", reason).log("Connection closed");
+        this.session = null;
+        this.closeLatch.countDown();
+    }
+
+    @OnWebSocketOpen
+    public void onConnect(Session session) throws Exception {
+        log.info().attr("session", session).log("Got connect");
+        this.session = session;
+        sendMessage(this.messagesToSendWhenConnected);
+    }
+
+    public void sendMessage(int totalMsgs) throws Exception {
+        for (int i = 0; i < totalMsgs; i++) {
+            this.session.sendText(getTestJsonPayload(i), Callback.NOOP);
+        }
+    }
+
+    @OnWebSocketMessage
+    public synchronized void onMessage(String msg) throws JsonParseException {
+        JsonObject ack = new Gson().fromJson(msg, JsonObject.class);
+        producerBuffer.add(ack.get("messageId").getAsString());
+    }
+
+    public Session getSession() {
+        return this.session;
+    }
+
+    public List<String> getBuffer() {
+        return producerBuffer;
+    }
+
+}

@@ -1,0 +1,743 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pulsar.metadata.impl;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JavaType;
+import com.fasterxml.jackson.databind.type.TypeFactory;
+import com.github.benmanes.caffeine.cache.AsyncCacheLoader;
+import com.github.benmanes.caffeine.cache.AsyncLoadingCache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.LoadingCache;
+import com.github.benmanes.caffeine.cache.RemovalCause;
+import com.github.benmanes.caffeine.cache.RemovalListener;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.util.concurrent.MoreExecutors;
+import io.netty.buffer.ByteBufUtil;
+import io.netty.util.concurrent.DefaultThreadFactory;
+import io.opentelemetry.api.OpenTelemetry;
+import java.time.Instant;
+import java.util.Collections;
+import java.util.EnumSet;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+import lombok.CustomLog;
+import lombok.Getter;
+import org.apache.bookkeeper.common.util.OrderedExecutor;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.pulsar.common.stats.CacheMetricsCollector;
+import org.apache.pulsar.common.util.FutureUtil;
+import org.apache.pulsar.metadata.api.DummyMetadataNodeSizeStats;
+import org.apache.pulsar.metadata.api.GetResult;
+import org.apache.pulsar.metadata.api.MetadataCache;
+import org.apache.pulsar.metadata.api.MetadataCacheConfig;
+import org.apache.pulsar.metadata.api.MetadataEvent;
+import org.apache.pulsar.metadata.api.MetadataEventSynchronizer;
+import org.apache.pulsar.metadata.api.MetadataNodeSizeStats;
+import org.apache.pulsar.metadata.api.MetadataSerde;
+import org.apache.pulsar.metadata.api.MetadataStoreException;
+import org.apache.pulsar.metadata.api.Notification;
+import org.apache.pulsar.metadata.api.NotificationType;
+import org.apache.pulsar.metadata.api.Stat;
+import org.apache.pulsar.metadata.api.extended.CreateOption;
+import org.apache.pulsar.metadata.api.extended.MetadataStoreExtended;
+import org.apache.pulsar.metadata.api.extended.SessionEvent;
+import org.apache.pulsar.metadata.cache.impl.MetadataCacheImpl;
+import org.apache.pulsar.metadata.impl.stats.MetadataStoreStats;
+
+@CustomLog
+public abstract class AbstractMetadataStore implements MetadataStoreExtended, Consumer<Notification> {
+    private static final long CACHE_REFRESH_TIME_MILLIS = TimeUnit.MINUTES.toMillis(5);
+
+    private final CopyOnWriteArrayList<Consumer<Notification>> listeners = new CopyOnWriteArrayList<>();
+    private final CopyOnWriteArrayList<Consumer<SessionEvent>> sessionListeners = new CopyOnWriteArrayList<>();
+    protected final String metadataStoreName;
+    private final OrderedExecutor serDesExecutor;
+    @Getter
+    private final ExecutorService eventExecutor;
+    private final ScheduledExecutorService schedulerExecutor;
+    private final AsyncLoadingCache<String, List<String>> childrenCache;
+    private final AsyncLoadingCache<String, Boolean> existsCache;
+    private final CopyOnWriteArrayList<MetadataCacheImpl<?>> metadataCaches = new CopyOnWriteArrayList<>();
+    private final MetadataStoreStats metadataStoreStats;
+
+    // We don't strictly need to use 'volatile' here because we don't need the precise consistent semantic. Instead,
+    // we want to avoid the overhead of 'volatile'.
+    @Getter
+    private boolean isConnected = true;
+
+    protected final AtomicBoolean isClosed = new AtomicBoolean(false);
+
+    protected abstract CompletableFuture<Boolean> existsFromStore(String path);
+
+    protected MetadataNodeSizeStats nodeSizeStats;
+
+    protected AbstractMetadataStore(
+            String metadataStoreName, OpenTelemetry openTelemetry, MetadataNodeSizeStats nodeSizeStats,
+            int numSerDesThreads) {
+        this.nodeSizeStats = nodeSizeStats == null ? new DummyMetadataNodeSizeStats()
+                : nodeSizeStats;
+        final var namePrefix = StringUtils.isNotBlank(metadataStoreName) ? metadataStoreName
+                : getClass().getSimpleName();
+        this.eventExecutor = Executors.newSingleThreadExecutor(
+                new DefaultThreadFactory(namePrefix + "-event"));
+        this.schedulerExecutor = Executors.newSingleThreadScheduledExecutor(
+                new DefaultThreadFactory(namePrefix + "-scheduler"));
+        this.serDesExecutor = OrderedExecutor.newBuilder()
+                .numThreads(numSerDesThreads)
+                .name(namePrefix + "-worker")
+                .build();
+        registerListener(this);
+
+        long childrenCacheMaxSizeBytes = getChildrenCacheMaxSizeBytes();
+
+        Caffeine<Object, Object> childrenCacheBuilder = Caffeine.newBuilder()
+                .recordStats()
+                .refreshAfterWrite(CACHE_REFRESH_TIME_MILLIS, TimeUnit.MILLISECONDS)
+                .expireAfterWrite(CACHE_REFRESH_TIME_MILLIS * 2, TimeUnit.MILLISECONDS);
+        if (childrenCacheMaxSizeBytes > 0) {
+            childrenCacheBuilder.maximumWeight(childrenCacheMaxSizeBytes)
+                    .weigher((String key, List<String> children) -> {
+                        // calculate the total byte size of the key and entries in the children list
+                        // to get some estimation of the required heap memory required for the entry.
+                        // add 16 bytes overhead for Java object header and 16 bytes for java.lang.String fields.
+                        int totalSize = ByteBufUtil.utf8Bytes(key) + 32;
+                        for (String child : children) {
+                            totalSize += ByteBufUtil.utf8Bytes(child) + 32;
+                        }
+                        return totalSize;
+                    });
+        }
+        this.childrenCache = childrenCacheBuilder
+                .evictionListener(new RemovalListener<String, List<String>>() {
+                    @Override
+                    public void onRemoval(String key, List<String> value, RemovalCause cause) {
+                        if (cause == RemovalCause.SIZE) {
+                            log.warn()
+                                    .attr("store", metadataStoreName)
+                                    .attr("path", key)
+                                    .log("Evicting path from children cache because the size of the cache"
+                                            + " is too large. Consider increasing the maximum heap size.");
+                        }
+                    }
+                })
+                .buildAsync(new AsyncCacheLoader<String, List<String>>() {
+                    @Override
+                    public CompletableFuture<List<String>> asyncLoad(String key, Executor executor) {
+                        return getChildrenFromStore(key);
+                    }
+
+                    @Override
+                    public CompletableFuture<List<String>> asyncReload(String key, List<String> oldValue,
+                            Executor executor) {
+                        if (isConnected) {
+                            return getChildrenFromStore(key);
+                        } else {
+                            // Do not refresh if we're not connected
+                            return CompletableFuture.completedFuture(oldValue);
+                        }
+                    }
+                });
+        CacheMetricsCollector.CAFFEINE.addCache(metadataStoreName + "-children", childrenCache);
+
+        this.existsCache = Caffeine.newBuilder()
+                .recordStats()
+                .refreshAfterWrite(CACHE_REFRESH_TIME_MILLIS, TimeUnit.MILLISECONDS)
+                .expireAfterWrite(CACHE_REFRESH_TIME_MILLIS * 2, TimeUnit.MILLISECONDS)
+                .buildAsync(new AsyncCacheLoader<String, Boolean>() {
+                    @Override
+                    public CompletableFuture<Boolean> asyncLoad(String key, Executor executor) {
+                        return existsFromStore(key);
+                    }
+
+                    @Override
+                    public CompletableFuture<Boolean> asyncReload(String key, Boolean oldValue,
+                            Executor executor) {
+                        if (isConnected) {
+                            return existsFromStore(key);
+                        } else {
+                            // Do not refresh if we're not connected
+                            return CompletableFuture.completedFuture(oldValue);
+                        }
+                    }
+                });
+        CacheMetricsCollector.CAFFEINE.addCache(metadataStoreName + "-exists", existsCache);
+
+        this.metadataStoreName = metadataStoreName;
+        this.metadataStoreStats = new MetadataStoreStats(metadataStoreName, openTelemetry);
+    }
+
+    /**
+     * Return the maximum size of the children cache in bytes.
+     * @return maximum size of the children cache in bytes.
+     */
+    protected long getChildrenCacheMaxSizeBytes() {
+        long heapMaxSizeBytes = Runtime.getRuntime().maxMemory();
+        // default 20% of max heap size, this should be sufficient to prevent OOME in the use case
+        // when a lot of namespaces with lots of topics are listed in the metadata store.
+        long defaultSizeBytes = heapMaxSizeBytes / 5;
+        // min size 20MB
+        int minSizeBytes = 1024 * 1024 * 20;
+        return Math.max(defaultSizeBytes, minSizeBytes);
+    }
+
+    @Override
+    public CompletableFuture<Void> handleMetadataEvent(MetadataEvent event) {
+        CompletableFuture<Void> result = new CompletableFuture<>();
+        get(event.getPath()).thenApply(res -> {
+            Set<CreateOption> options = event.getOptions() != null ? event.getOptions()
+                    : Collections.emptySet();
+            if (res.isPresent()) {
+                GetResult existingValue = res.get();
+                if (shouldIgnoreEvent(event, existingValue)) {
+                    result.complete(null);
+                    return result;
+                }
+            }
+            // else update the event
+            CompletableFuture<?> updateResult = (event.getType() == NotificationType.Deleted)
+                    ? deleteInternal(event.getPath(), Optional.empty())
+                    : putInternal(event.getPath(), event.getValue(),
+                    Optional.ofNullable(event.getExpectedVersion()), options);
+            updateResult.thenApply(stat -> {
+                log.debug().attr("path", event.getPath()).log("successfully updated");
+                return result.complete(null);
+            }).exceptionally(ex -> {
+                log.warn().attr("path", event.getPath()).exception(ex.getCause()).log("Failed to update metadata");
+                if (ex.getCause() instanceof MetadataStoreException.BadVersionException) {
+                    result.complete(null);
+                } else {
+                    result.completeExceptionally(ex);
+                }
+                return false;
+            });
+            return result;
+        });
+        return result;
+    }
+
+    /**
+     *  @deprecated Use {@link #registerSyncListener(Optional)} instead.
+     */
+    @Deprecated
+    protected void registerSyncLister(Optional<MetadataEventSynchronizer> synchronizer) {
+        this.registerSyncListener(synchronizer);
+    }
+
+    protected void registerSyncListener(Optional<MetadataEventSynchronizer> synchronizer) {
+        synchronizer.ifPresent(s -> s.registerSyncListener(this::handleMetadataEvent));
+    }
+
+    @VisibleForTesting
+    protected boolean shouldIgnoreEvent(MetadataEvent event, GetResult existingValue) {
+        long existingVersion = existingValue.getStat() != null ? existingValue.getStat().getVersion() : -1;
+        long existingTimestamp = existingValue.getStat() != null ? existingValue.getStat().getModificationTimestamp()
+                : -1;
+        String sourceClusterName = event.getSourceCluster();
+        Set<CreateOption> options = event.getOptions() != null ? event.getOptions()
+                : Collections.emptySet();
+        String currentClusterName = getMetadataEventSynchronizer().get().getClusterName();
+        // ignore event from the unknown cluster
+        if (sourceClusterName == null || currentClusterName == null) {
+            return true;
+        }
+        // ignore event if metadata is ephemeral or
+        // sequential
+        if (options.contains(CreateOption.Ephemeral) || event.getOptions().contains(CreateOption.Sequential)) {
+            return true;
+        }
+        // ignore the event if event occurred before the
+        // existing update
+        if (event.getLastUpdatedTimestamp() < existingTimestamp) {
+            return true;
+        }
+        if (currentClusterName.equals(sourceClusterName)) {
+            // if expected version doesn't exist then ignore the
+            // event
+            if ((event.getExpectedVersion() != null && event.getExpectedVersion() > 0)
+                    && event.getExpectedVersion() != existingVersion) {
+                return true;
+            }
+
+        } else if ((event.getLastUpdatedTimestamp() == existingTimestamp
+                && sourceClusterName.compareTo(currentClusterName) < 0)) {
+            // ignore: if event is older than existing store
+            // metadata
+            // or if timestamp is same for both the event then
+            // larger cluster-name according to lexical sorting
+            // should win for the update.
+            return true;
+        }
+        return false;
+    }
+
+    @SuppressWarnings("unchecked")
+    @Override
+    public <T> MetadataCache<T> getMetadataCache(Class<T> clazz, MetadataCacheConfig<?> cacheConfig) {
+        JavaType typeRef = TypeFactory.defaultInstance().constructSimpleType(clazz, null);
+        String cacheName = StringUtils.isNotBlank(metadataStoreName) ? metadataStoreName : getClass().getSimpleName();
+        MetadataCacheImpl<T> metadataCache =
+                new MetadataCacheImpl<T>(cacheName, this, typeRef, (MetadataCacheConfig<T>) cacheConfig,
+                        this.serDesExecutor, this.schedulerExecutor);
+        metadataCaches.add(metadataCache);
+        return metadataCache;
+    }
+
+    @SuppressWarnings("unchecked")
+    @Override
+    public <T> MetadataCache<T> getMetadataCache(TypeReference<T> typeRef, MetadataCacheConfig<?> cacheConfig) {
+        String cacheName = StringUtils.isNotBlank(metadataStoreName) ? metadataStoreName : getClass().getSimpleName();
+        MetadataCacheImpl<T> metadataCache =
+                new MetadataCacheImpl<T>(cacheName, this, typeRef, (MetadataCacheConfig<T>) cacheConfig,
+                        this.serDesExecutor, this.schedulerExecutor);
+        metadataCaches.add(metadataCache);
+        return metadataCache;
+    }
+
+    @SuppressWarnings("unchecked")
+    @Override
+    public <T> MetadataCache<T> getMetadataCache(String cacheName, MetadataSerde<T> serde,
+                                                 MetadataCacheConfig<?> cacheConfig) {
+        MetadataCacheImpl<T> metadataCache =
+                new MetadataCacheImpl<>(cacheName, this, serde, (MetadataCacheConfig<T>) cacheConfig,
+                        this.serDesExecutor, this.schedulerExecutor);
+        metadataCaches.add(metadataCache);
+        return metadataCache;
+    }
+
+    @Override
+    public CompletableFuture<Optional<GetResult>> get(String path) {
+        if (isClosed()) {
+            return alreadyClosedFailedFuture();
+        }
+        long start = System.currentTimeMillis();
+        if (!isValidPath(path)) {
+            metadataStoreStats.recordGetOpsFailed(System.currentTimeMillis() - start);
+            return FutureUtil
+                    .failedFuture(new MetadataStoreException.InvalidPathException(path));
+        }
+        return storeGet(path)
+                .whenComplete((v, t) -> {
+                    if (t != null) {
+                        v.ifPresent(getResult -> nodeSizeStats.recordGetRes(path, getResult));
+                        metadataStoreStats.recordGetOpsFailed(System.currentTimeMillis() - start);
+                    } else {
+                        metadataStoreStats.recordGetOpsSucceeded(System.currentTimeMillis() - start);
+                    }
+                });
+    }
+
+    protected abstract CompletableFuture<Optional<GetResult>> storeGet(String path);
+
+    @Override
+    public CompletableFuture<Stat> put(String path, byte[] value, Optional<Long> expectedVersion) {
+        return put(path, value, expectedVersion, EnumSet.noneOf(CreateOption.class));
+    }
+
+    @Override
+    public final CompletableFuture<List<String>> getChildren(String path) {
+        if (isClosed()) {
+            return alreadyClosedFailedFuture();
+        }
+        if (!isValidPath(path)) {
+            return FutureUtil.failedFuture(new MetadataStoreException.InvalidPathException(path));
+        }
+        CompletableFuture<List<String>> listFuture = childrenCache.get(path);
+        listFuture.thenAccept((list) -> {
+            nodeSizeStats.recordGetChildrenRes(path, list);
+        });
+        return listFuture;
+    }
+
+    @Override
+    public final CompletableFuture<Boolean> exists(String path) {
+        if (isClosed()) {
+            return alreadyClosedFailedFuture();
+        }
+        if (!isValidPath(path)) {
+            return FutureUtil.failedFuture(new MetadataStoreException.InvalidPathException(path));
+        }
+        return existsCache.get(path);
+    }
+
+    @Override
+    public void registerListener(Consumer<Notification> listener) {
+        // If the metadata store is closed, do nothing here.
+        if (!isClosed()) {
+            listeners.add(listener);
+        }
+    }
+
+    protected CompletableFuture<Void> receivedNotification(Notification notification) {
+        try {
+            return CompletableFuture.supplyAsync(() -> {
+                listeners.forEach(listener -> {
+                    try {
+                        listener.accept(notification);
+                    } catch (Throwable t) {
+                        log.error().exception(t).log("Failed to process metadata store notification");
+                    }
+                });
+
+                return null;
+            }, eventExecutor);
+        } catch (RejectedExecutionException e) {
+            return FutureUtil.failedFuture(e);
+        }
+    }
+
+    @Override
+    public void accept(Notification n) {
+        String path = n.getPath();
+        NotificationType type = n.getType();
+
+        if (type == NotificationType.Created || type == NotificationType.Deleted) {
+            existsCache.synchronous().invalidate(path);
+            childrenCache.synchronous().invalidate(path);
+            String parent = parent(path);
+            if (parent != null) {
+                childrenCache.synchronous().invalidate(parent);
+            }
+        }
+
+        if (type == NotificationType.ChildrenChanged) {
+            childrenCache.synchronous().invalidate(path);
+        }
+
+        if (type == NotificationType.Created || type == NotificationType.Deleted || type == NotificationType.Modified) {
+            metadataCaches.forEach(c -> c.accept(n));
+        }
+    }
+
+    protected abstract CompletableFuture<Void> storeDelete(String path, Optional<Long> expectedVersion);
+
+    @Override
+    public final CompletableFuture<Void> delete(String path, Optional<Long> expectedVersion) {
+        log.info().attr("path", path).attr("expectedVersion", expectedVersion).log("Deleting path");
+        if (isClosed()) {
+            return alreadyClosedFailedFuture();
+        }
+        long start = System.currentTimeMillis();
+        if (!isValidPath(path)) {
+            metadataStoreStats.recordDelOpsFailed(System.currentTimeMillis() - start);
+            return FutureUtil.failedFuture(new MetadataStoreException.InvalidPathException(path));
+        }
+        if (getMetadataEventSynchronizer().isPresent()) {
+            MetadataEvent event = new MetadataEvent(path, null, new HashSet<>(),
+                    expectedVersion.orElse(null), Instant.now().toEpochMilli(),
+                    getMetadataEventSynchronizer().get().getClusterName(), NotificationType.Deleted);
+            return getMetadataEventSynchronizer().get().notify(event)
+                    .thenCompose(__ -> deleteInternal(path, expectedVersion))
+                    .whenComplete((v, t) -> {
+                        if (null != t) {
+                            metadataStoreStats.recordDelOpsFailed(System.currentTimeMillis() - start);
+                        } else {
+                            metadataStoreStats.recordDelOpsSucceeded(System.currentTimeMillis() - start);
+                        }
+                    });
+        } else {
+            return deleteInternal(path, expectedVersion)
+                    .whenComplete((v, t) -> {
+                        if (null != t) {
+                            metadataStoreStats.recordDelOpsFailed(System.currentTimeMillis() - start);
+                        } else {
+                            metadataStoreStats.recordDelOpsSucceeded(System.currentTimeMillis() - start);
+                        }
+                    });
+        }
+    }
+
+    private CompletableFuture<Void> deleteInternal(String path, Optional<Long> expectedVersion) {
+        // Ensure caches are invalidated before the operation is confirmed
+        return storeDelete(path, expectedVersion).thenRun(() -> {
+            existsCache.synchronous().invalidate(path);
+            childrenCache.synchronous().invalidate(path);
+            String parent = parent(path);
+            if (parent != null) {
+                childrenCache.synchronous().invalidate(parent);
+            }
+
+            metadataCaches.forEach(c -> c.invalidate(path));
+            log.info().attr("path", path).attr("expectedVersion", expectedVersion).log("Deleted path");
+        });
+    }
+
+    @Override
+    public CompletableFuture<Void> deleteRecursive(String path) {
+        log.info().attr("path", path).log("Deleting recursively path");
+        if (isClosed()) {
+            return alreadyClosedFailedFuture();
+        }
+        return getChildren(path)
+                .thenCompose(children -> FutureUtil.waitForAll(
+                        children.stream()
+                                .map(child -> deleteRecursive(path + "/" + child))
+                                .collect(Collectors.toList())))
+                .thenCompose(__ -> {
+                    log.info().attr("path", path).log("After deleting all children, now deleting path");
+                    return deleteIfExists(path, Optional.empty());
+                });
+    }
+
+    protected abstract CompletableFuture<Stat> storePut(String path, byte[] data, Optional<Long> optExpectedVersion,
+                                                        EnumSet<CreateOption> options);
+
+    protected CompletableFuture<Stat> storePut(String path, byte[] data, Optional<Long> optExpectedVersion,
+                                               EnumSet<CreateOption> options,
+                                               Map<String, String> secondaryIndexes) {
+        return storePut(path, data, optExpectedVersion, options);
+    }
+
+    @Override
+    public CompletableFuture<List<GetResult>> findByIndex(
+            String scanPathPrefix, String indexName, String secondaryKey,
+            Predicate<GetResult> fallbackFilter) {
+        if (isClosed()) {
+            return alreadyClosedFailedFuture();
+        }
+        return storeFindByIndex(scanPathPrefix, indexName, secondaryKey, fallbackFilter);
+    }
+
+    protected CompletableFuture<List<GetResult>> storeFindByIndex(
+            String scanPathPrefix, String indexName, String secondaryKey,
+            Predicate<GetResult> fallbackFilter) {
+        // Default fallback: full scan under scanPathPrefix, applying fallbackFilter to each result.
+        return getChildrenFromStore(scanPathPrefix)
+                .thenCompose(children -> {
+                    List<CompletableFuture<Optional<GetResult>>> futures = children.stream()
+                            .map(child -> storeGet(scanPathPrefix + "/" + child))
+                            .toList();
+                    return FutureUtil.waitForAll(futures)
+                            .thenApply(__ -> futures.stream()
+                                    .map(CompletableFuture::join)
+                                    .filter(Optional::isPresent)
+                                    .map(Optional::get)
+                                    .filter(fallbackFilter)
+                                    .toList());
+                });
+    }
+
+    @Override
+    public final CompletableFuture<Stat> put(String path, byte[] data, Optional<Long> optExpectedVersion,
+            EnumSet<CreateOption> options) {
+        return put(path, data, optExpectedVersion, options, Collections.emptyMap());
+    }
+
+    @Override
+    public final CompletableFuture<Stat> put(String path, byte[] data, Optional<Long> optExpectedVersion,
+            EnumSet<CreateOption> options, Map<String, String> secondaryIndexes) {
+        if (isClosed()) {
+            return alreadyClosedFailedFuture();
+        }
+        long start = System.currentTimeMillis();
+        if (!isValidPath(path)) {
+            metadataStoreStats.recordPutOpsFailed(System.currentTimeMillis() - start);
+            return FutureUtil.failedFuture(new MetadataStoreException.InvalidPathException(path));
+        }
+        HashSet<CreateOption> ops = new HashSet<>(options);
+        if (getMetadataEventSynchronizer().isPresent()) {
+            Long version = optExpectedVersion.isPresent() && optExpectedVersion.get() < 0 ? null
+                    : optExpectedVersion.orElse(null);
+            MetadataEvent event = new MetadataEvent(path, data, ops, version,
+                    Instant.now().toEpochMilli(), getMetadataEventSynchronizer().get().getClusterName(),
+                    NotificationType.Modified);
+            return getMetadataEventSynchronizer().get().notify(event)
+                    .thenCompose(__ -> putInternal(path, data, optExpectedVersion, options, secondaryIndexes))
+                    .whenComplete((v, t) -> {
+                        if (t != null) {
+                            metadataStoreStats.recordPutOpsFailed(System.currentTimeMillis() - start);
+                        } else {
+                            int len = data == null ? 0 : data.length;
+                            metadataStoreStats.recordPutOpsSucceeded(System.currentTimeMillis() - start, len);
+                        }
+                    });
+        } else {
+            return putInternal(path, data, optExpectedVersion, options, secondaryIndexes)
+                    .whenComplete((v, t) -> {
+                        if (t != null) {
+                            metadataStoreStats.recordPutOpsFailed(System.currentTimeMillis() - start);
+                        } else {
+                            int len = data == null ? 0 : data.length;
+                            metadataStoreStats.recordPutOpsSucceeded(System.currentTimeMillis() - start, len);
+                        }
+                    });
+        }
+
+    }
+
+    public final CompletableFuture<Stat> putInternal(String path, byte[] data, Optional<Long> optExpectedVersion,
+            Set<CreateOption> options) {
+        return putInternal(path, data, optExpectedVersion, options, Collections.emptyMap());
+    }
+
+    public final CompletableFuture<Stat> putInternal(String path, byte[] data, Optional<Long> optExpectedVersion,
+            Set<CreateOption> options, Map<String, String> secondaryIndexes) {
+        var enumOptions =
+                (options != null && !options.isEmpty()) ? EnumSet.copyOf(options) : EnumSet.noneOf(CreateOption.class);
+        // Ensure caches are invalidated before the operation is confirmed
+        return storePut(path, data, optExpectedVersion, enumOptions, secondaryIndexes)
+                .thenApply(stat -> {
+                    NotificationType type = stat.isFirstVersion() ? NotificationType.Created
+                            : NotificationType.Modified;
+                    if (type == NotificationType.Created) {
+                        nodeSizeStats.recordPut(path, data);
+                        existsCache.synchronous().invalidate(path);
+                        String parent = parent(path);
+                        if (parent != null) {
+                            childrenCache.synchronous().invalidate(parent);
+                        }
+                    }
+
+                    metadataCaches.forEach(c -> c.refresh(path));
+                    return stat;
+                });
+    }
+
+    @Override
+    public void registerSessionListener(Consumer<SessionEvent> listener) {
+        sessionListeners.add(listener);
+    }
+
+    protected void receivedSessionEvent(SessionEvent event) {
+        isConnected = event.isConnected();
+
+        // Clear cache after session expired.
+        if (event == SessionEvent.SessionReestablished || event == SessionEvent.Reconnected) {
+            for (MetadataCacheImpl<?> metadataCache : metadataCaches) {
+                metadataCache.invalidateAll();
+            }
+            invalidateAll();
+        }
+
+        // Notice listeners.
+        try {
+            eventExecutor.execute(() -> {
+                sessionListeners.forEach(l -> {
+                    try {
+                        l.accept(event);
+                    } catch (Throwable t) {
+                        log.warn().attr("event", event).exception(t).log("Error in processing session event");
+                    }
+                });
+            });
+        } catch (RejectedExecutionException e) {
+            log.warn().attr("event", event).exception(e).log("Error in processing session event");
+        }
+    }
+
+    protected boolean isClosed() {
+        return isClosed.get();
+    }
+
+    protected static <T> CompletableFuture<T> alreadyClosedFailedFuture() {
+        return FutureUtil.failedFuture(
+                new MetadataStoreException.AlreadyClosedException());
+    }
+
+    @Override
+    public void close() throws Exception {
+        MoreExecutors.shutdownAndAwaitTermination(serDesExecutor, 10, TimeUnit.SECONDS);
+        MoreExecutors.shutdownAndAwaitTermination(schedulerExecutor, 10, TimeUnit.SECONDS);
+        MoreExecutors.shutdownAndAwaitTermination(eventExecutor, 10, TimeUnit.SECONDS);
+        this.metadataStoreStats.close();
+    }
+
+    @VisibleForTesting
+    public void invalidateAll() {
+        childrenCache.synchronous().invalidateAll();
+        existsCache.synchronous().invalidateAll();
+    }
+
+    public void invalidateCaches(String...paths) {
+        LoadingCache<String, List<String>> loadingCache = childrenCache.synchronous();
+        for (String path : paths) {
+            loadingCache.invalidate(path);
+        }
+    }
+
+    protected final <T> void processEvent(Consumer<T> eventProcessor, T event) {
+        try {
+            eventExecutor.execute(() -> eventProcessor.accept(event));
+        } catch (RejectedExecutionException e) {
+            log.warn().attr("event", event).log("Rejected processing event");
+        }
+    }
+
+    protected final void scheduleDelayedTask(long delay, TimeUnit unit, Runnable task) {
+        schedulerExecutor.schedule(task, delay, unit);
+    }
+
+    protected final void safeExecuteCallback(Runnable task, Consumer<Throwable> exceptionHandler) {
+        try {
+            eventExecutor.execute(task);
+        } catch (Throwable t) {
+            exceptionHandler.accept(t);
+        }
+    }
+
+    protected final void safeExecuteCallback(Runnable task, CompletableFuture<?> future) {
+        safeExecuteCallback(task, future::completeExceptionally);
+    }
+
+    protected static String parent(String path) {
+        int idx = path.lastIndexOf('/');
+        if (idx <= 0) {
+            // No parent
+            return null;
+        }
+
+        return path.substring(0, idx);
+    }
+
+    /**
+     * valid path in metadata store should be
+     * 1. not blank
+     * 2. starts with '/'
+     * 3. not ends with '/', except root path "/"
+     */
+   static boolean isValidPath(String path) {
+        return "/".equals(path)
+                || StringUtils.isNotBlank(path)
+                && path.startsWith("/")
+                && !path.endsWith("/");
+    }
+
+    protected void notifyParentChildrenChanged(String path) {
+        String parent = parent(path);
+        while (parent != null) {
+            receivedNotification(new Notification(NotificationType.ChildrenChanged, parent));
+            parent = parent(parent);
+        }
+    }
+}

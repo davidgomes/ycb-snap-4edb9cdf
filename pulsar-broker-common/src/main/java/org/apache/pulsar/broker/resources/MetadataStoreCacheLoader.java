@@ -1,0 +1,148 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pulsar.broker.resources;
+
+import java.io.Closeable;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
+import lombok.CustomLog;
+import org.apache.bookkeeper.common.util.OrderedScheduler;
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.pulsar.common.util.FutureUtil;
+import org.apache.pulsar.metadata.api.NotificationType;
+import org.apache.pulsar.metadata.api.extended.MetadataStoreExtended;
+import org.apache.pulsar.policies.data.loadbalancer.LoadManagerReport;
+
+/**
+ * Connects with MetadataStore and sets watch to listen changes for active broker list.
+ *
+ */
+@CustomLog
+public class MetadataStoreCacheLoader implements Closeable {
+
+    private final LoadManagerReportResources loadReportResources;
+    private final int operationTimeoutMs;
+
+    private volatile List<LoadManagerReport> availableBrokers;
+    private final FutureUtil.Sequencer<Void> sequencer;
+
+    private final OrderedScheduler orderedExecutor = OrderedScheduler.newSchedulerBuilder().numThreads(8)
+            .name("pulsar-metadata-cache-loader-ordered-cache").build();
+
+    public static final String LOADBALANCE_BROKERS_ROOT = "/loadbalance/brokers";
+
+    public MetadataStoreCacheLoader(PulsarResources pulsarResources, int operationTimeoutMs) throws Exception {
+        this.loadReportResources = pulsarResources.getLoadReportResources();
+        this.operationTimeoutMs = operationTimeoutMs;
+        this.sequencer = FutureUtil.Sequencer.create();
+        init();
+    }
+
+    /**
+     * Initialize ZooKeeper session and creates broker cache list.
+     *
+     * @throws Exception
+     */
+    public void init() throws Exception {
+        Supplier<CompletableFuture<Void>> tryUpdate = () -> {
+            return loadReportResources.getChildrenAsync(LOADBALANCE_BROKERS_ROOT)
+                    .thenComposeAsync(brokerNodes -> {
+                        return updateBrokerList(brokerNodes).thenRun(() -> {
+                            log.info().attr("info", brokerNodes).log("Successfully updated broker info");
+                        });
+                    })
+                    .exceptionally(ex -> {
+                        log.warn().exception(ex).log("Error updating broker info after broker list changed");
+                        return null;
+                    });
+        };
+        loadReportResources.getStore().registerListener((n) -> {
+            if (LOADBALANCE_BROKERS_ROOT.equals(n.getPath()) && NotificationType.ChildrenChanged.equals(n.getType())) {
+                sequencer.sequential(tryUpdate);
+            }
+        });
+        if (loadReportResources.getStore() instanceof MetadataStoreExtended) {
+            ((MetadataStoreExtended) loadReportResources.getStore()).registerSessionListener(sessionEvent ->
+                    sequencer.sequential(tryUpdate));
+        }
+        // Do initial fetch of brokers list
+        tryUpdate.get().get(operationTimeoutMs, TimeUnit.MILLISECONDS);
+    }
+
+    public List<LoadManagerReport> getAvailableBrokers() {
+        if (CollectionUtils.isEmpty(availableBrokers)) {
+            try {
+                updateBrokerList(loadReportResources.getChildren(LOADBALANCE_BROKERS_ROOT));
+            } catch (Exception e) {
+                log.warn().exception(e).log("Error updating broker from zookeeper");
+            }
+        }
+        return availableBrokers;
+    }
+
+    @Override
+    public void close() throws IOException {
+        orderedExecutor.shutdown();
+    }
+
+    private CompletableFuture<Void> updateBrokerList(List<String> brokerNodes) {
+        CompletableFuture<Void> future = new CompletableFuture<>();
+
+        if (brokerNodes.isEmpty()) {
+            availableBrokers = new ArrayList<>();
+            future.complete(null);
+            return future;
+        }
+
+        List<CompletableFuture<Optional<LoadManagerReport>>> loadReportFutureList = new ArrayList<>();
+        for (String broker : brokerNodes) {
+            loadReportFutureList.add(loadReportResources.getAsync(LOADBALANCE_BROKERS_ROOT + '/' + broker));
+        }
+
+        FutureUtil.waitForAll(loadReportFutureList).thenRun(() -> {
+            List<LoadManagerReport> newAvailableBrokers = new ArrayList<>(brokerNodes.size());
+
+            for (CompletableFuture<Optional<LoadManagerReport>> loadReportFuture : loadReportFutureList) {
+                try {
+                    Optional<LoadManagerReport> loadReport = loadReportFuture.get();
+                    if (loadReport.isPresent()) {
+                        newAvailableBrokers.add(loadReport.get());
+                    }
+                } catch (Exception e) {
+                    future.completeExceptionally(e);
+                    return;
+                }
+            }
+
+            availableBrokers = newAvailableBrokers;
+            future.complete(null);
+        }).exceptionally(ex -> {
+            future.completeExceptionally(ex);
+            return null;
+        });
+
+        return future;
+    }
+
+}

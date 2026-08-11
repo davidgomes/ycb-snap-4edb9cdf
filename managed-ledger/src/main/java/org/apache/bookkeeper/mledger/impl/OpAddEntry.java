@@ -1,0 +1,458 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.bookkeeper.mledger.impl;
+
+import static com.google.common.base.Preconditions.checkArgument;
+import io.netty.buffer.ByteBuf;
+import io.netty.util.Recycler;
+import io.netty.util.Recycler.Handle;
+import io.netty.util.ReferenceCountUtil;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+import lombok.CustomLog;
+import lombok.Setter;
+import org.apache.bookkeeper.client.AsyncCallback.AddCallback;
+import org.apache.bookkeeper.client.AsyncCallback.CloseCallback;
+import org.apache.bookkeeper.client.BKException;
+import org.apache.bookkeeper.client.LedgerHandle;
+import org.apache.bookkeeper.mledger.AsyncCallbacks.AddEntryCallback;
+import org.apache.bookkeeper.mledger.ManagedLedgerException;
+import org.apache.bookkeeper.mledger.Position;
+import org.apache.bookkeeper.mledger.PositionFactory;
+import org.apache.bookkeeper.mledger.intercept.ManagedLedgerInterceptor;
+
+
+/**
+ * Handles the life-cycle of an addEntry() operation.
+ *
+ */
+@CustomLog
+public class OpAddEntry implements AddCallback, CloseCallback, Runnable, ManagedLedgerInterceptor.AddEntryOperation {
+    protected ManagedLedgerImpl ml;
+    LedgerHandle ledger;
+    long entryId;
+    private int numberOfMessages;
+
+    @SuppressWarnings("unused")
+    private static final AtomicReferenceFieldUpdater<OpAddEntry, AddEntryCallback> callbackUpdater =
+            AtomicReferenceFieldUpdater.newUpdater(OpAddEntry.class, AddEntryCallback.class, "callback");
+    protected volatile AddEntryCallback callback;
+    Object ctx;
+    volatile long addOpCount;
+    private static final AtomicLongFieldUpdater<OpAddEntry> ADD_OP_COUNT_UPDATER = AtomicLongFieldUpdater
+            .newUpdater(OpAddEntry.class, "addOpCount");
+    private boolean closeWhenDone;
+    private long startTime;
+    volatile long lastInitTime;
+    @SuppressWarnings("unused")
+    ByteBuf data;
+    private int dataLength;
+    private ManagedLedgerInterceptor.PayloadProcessorHandle payloadProcessorHandle = null;
+
+    private static final AtomicReferenceFieldUpdater<OpAddEntry, OpAddEntry.State> STATE_UPDATER =
+            AtomicReferenceFieldUpdater.newUpdater(OpAddEntry.class, OpAddEntry.State.class, "state");
+    volatile State state;
+
+    @Setter
+    private AtomicBoolean timeoutTriggered;
+
+    enum State {
+        OPEN,
+        INITIATED,
+        COMPLETED,
+        CLOSED
+    }
+
+    public static OpAddEntry createNoRetainBuffer(ManagedLedgerImpl ml, ByteBuf data, AddEntryCallback callback,
+                                                  Object ctx, AtomicBoolean timeoutTriggered) {
+        OpAddEntry op = createOpAddEntryNoRetainBuffer(ml, data, callback, ctx, timeoutTriggered);
+        log.debug().attr("op", op).log("Created new OpAddEntry");
+        return op;
+    }
+
+    public static OpAddEntry createNoRetainBuffer(ManagedLedgerImpl ml, ByteBuf data, int numberOfMessages,
+                                                  AddEntryCallback callback, Object ctx,
+                                                  AtomicBoolean timeoutTriggered) {
+        OpAddEntry op = createOpAddEntryNoRetainBuffer(ml, data, callback, ctx, timeoutTriggered);
+        op.numberOfMessages = numberOfMessages;
+        log.debug().attr("op", op).log("Created new OpAddEntry");
+        return op;
+    }
+
+    private static OpAddEntry createOpAddEntryNoRetainBuffer(ManagedLedgerImpl ml, ByteBuf data,
+                                                             AddEntryCallback callback, Object ctx,
+                                                             AtomicBoolean timeoutTriggered) {
+        OpAddEntry op = RECYCLER.get();
+        op.ml = ml;
+        op.ledger = null;
+        op.data = data;
+        op.dataLength = data.readableBytes();
+        op.callback = callback;
+        op.ctx = ctx;
+        op.addOpCount = ManagedLedgerImpl.ADD_OP_COUNT_UPDATER.incrementAndGet(ml);
+        op.closeWhenDone = false;
+        op.entryId = -1;
+        op.startTime = System.nanoTime();
+        op.state = State.OPEN;
+        op.payloadProcessorHandle = null;
+        op.timeoutTriggered = timeoutTriggered;
+        ml.mbean.addAddEntrySample(op.dataLength);
+        return op;
+    }
+
+    public void setLedger(LedgerHandle ledger) {
+        this.ledger = ledger;
+    }
+
+    public void setCloseWhenDone(boolean closeWhenDone) {
+        this.closeWhenDone = closeWhenDone;
+    }
+
+    public void initiate() {
+        if (STATE_UPDATER.compareAndSet(OpAddEntry.this, State.OPEN, State.INITIATED)) {
+            // Fail the add operation if the managed ledger is in a state that prevents adding entries.
+            ManagedLedgerException exbw = ml.interceptorException;
+            if (exbw != null) {
+                ml.pendingAddEntries.remove(this);
+                this.failed(exbw);
+                // Don't recycle the object here, see: https://lists.apache.org/thread/po08w0tkhc7q8gc5khpdft6stxnr1v2y
+                return;
+            }
+
+            ByteBuf duplicateBuffer = data.retainedDuplicate();
+            // internally asyncAddEntry() will take the ownership of the buffer and release it at the end
+            lastInitTime = System.nanoTime();
+            if (ml.getManagedLedgerInterceptor() != null) {
+                long originalDataLen = data.readableBytes();
+                try {
+                    payloadProcessorHandle = ml.getManagedLedgerInterceptor()
+                            .processPayloadBeforeLedgerWrite(this.getCtx(), duplicateBuffer);
+                } catch (Exception e) {
+                    ManagedLedgerException mle = new ManagedLedgerException.ManagedLedgerInterceptException(e);
+                    ml.fenceForInterceptorException(mle);
+                    ml.pendingAddEntries.remove(this);
+                    ReferenceCountUtil.safeRelease(duplicateBuffer);
+                    log.error().attr("managedLedger", ml.getName()).exception(e)
+                            .log("Error processing payload before ledger write");
+                    this.failed(mle);
+                    // Don't recycle the object here
+                    // see: https://lists.apache.org/thread/po08w0tkhc7q8gc5khpdft6stxnr1v2y
+                    return;
+                }
+                if (payloadProcessorHandle != null) {
+                    duplicateBuffer = payloadProcessorHandle.getProcessedPayload();
+                    // If data len of entry changes, correct "dataLength" and "currentLedgerSize".
+                    if (originalDataLen != duplicateBuffer.readableBytes()) {
+                        this.dataLength = duplicateBuffer.readableBytes();
+                        this.ml.currentLedgerSize += (dataLength - originalDataLen);
+                    }
+                }
+            }
+            ledger.asyncAddEntry(duplicateBuffer, this, addOpCount);
+        } else {
+            log.warn().attr("managedLedger", ml.getName())
+                    .attr("state", state)
+                    .log("initiate with unexpected state, expect OPEN state");
+        }
+    }
+
+    public void initiateShadowWrite() {
+        if (STATE_UPDATER.compareAndSet(OpAddEntry.this, State.OPEN, State.INITIATED)) {
+            addOpCount = ManagedLedgerImpl.ADD_OP_COUNT_UPDATER.incrementAndGet(ml);
+            lastInitTime = System.nanoTime();
+            //Use entryId in PublishContext and call addComplete directly.
+            this.addComplete(BKException.Code.OK, ledger, ((Position) ctx).getEntryId(), addOpCount);
+        } else {
+            log.warn().attr("managedLedger", ml.getName())
+                    .attr("state", state)
+                    .log("initiateShadowWrite with unexpected state, expect OPEN state");
+        }
+    }
+
+    public void failed(ManagedLedgerException e) {
+        AddEntryCallback cb = callbackUpdater.getAndSet(this, null);
+        ml.afterFailedAddEntry(this.getNumberOfMessages());
+        if (cb != null) {
+            ReferenceCountUtil.release(data);
+            cb.addFailed(e, ctx);
+            ml.mbean.recordAddEntryError();
+            if (payloadProcessorHandle != null) {
+                payloadProcessorHandle.release();
+            }
+        }
+    }
+
+    @Override
+    public void addComplete(int rc, final LedgerHandle lh, long entryId, Object ctx) {
+        if (!STATE_UPDATER.compareAndSet(OpAddEntry.this, State.INITIATED, State.COMPLETED)) {
+            log.warn().attr("managedLedger", ml.getName())
+                    .attr("ledgerId", lh.getId())
+                    .attr("entryId", entryId)
+                    .log("The add op is terminal legacy callback for entry adding");
+            // Since there is a thread is coping this object, do not recycle this object to avoid other problems.
+            // For example: we recycled this object, other thread get a null "opAddEntry.{variable_name}".
+            // Recycling is not mandatory, JVM GC will collect it.
+            return;
+        }
+
+        if (ledger != null && lh != null) {
+            if (ledger.getId() != lh.getId()) {
+                log.warn().attr("managedLedger", ml.getName())
+                        .attr("ledgerId", ledger.getId())
+                        .attr("ackedLedgerId", lh.getId())
+                        .log("ledgerId doesn't match with acked ledgerId");
+            }
+            checkArgument(ledger.getId() == lh.getId(), "ledgerId %s doesn't match with acked ledgerId %s",
+                    ledger.getId(), lh.getId());
+        }
+
+        if (!checkAndCompleteOp(ctx)) {
+            // means callback might have been completed by different thread (timeout task thread).. so do nothing
+            return;
+        }
+
+        this.entryId = entryId;
+        log.debug().attr("managedLedger", ml.getName())
+                .attr("ledgerId", lh == null ? -1 : lh.getId())
+                .attr("entryId", entryId)
+                .attr("size", dataLength)
+                .attr("rc", rc)
+                .log("write-complete");
+
+        if (rc != BKException.Code.OK || timeoutTriggered.get()) {
+            handleAddFailure(lh, rc);
+        } else {
+            // Trigger addComplete callback in a thread hashed on the managed ledger name
+            ml.getExecutor().execute(this);
+        }
+    }
+
+    // Called in executor hashed on managed ledger name, once the add operation is complete
+    @Override
+    public void run() {
+        if (payloadProcessorHandle != null) {
+            payloadProcessorHandle.release();
+        }
+        // Remove this entry from the head of the pending queue
+        OpAddEntry firstInQueue = ml.pendingAddEntries.poll();
+        if (firstInQueue == null) {
+            return;
+        }
+        if (this != firstInQueue) {
+            firstInQueue.failed(new ManagedLedgerException("Unexpected add entry op when complete the add entry op."));
+            return;
+        }
+
+        ManagedLedgerImpl.NUMBER_OF_ENTRIES_UPDATER.incrementAndGet(ml);
+        ManagedLedgerImpl.TOTAL_SIZE_UPDATER.addAndGet(ml, dataLength);
+
+        // ctx will contain a Position instance only in the case of ShadowManagedLedgerImpl
+        long ledgerId = ledger != null ? ledger.getId() : ((Position) ctx).getLedgerId();
+
+        // Handle caching for tailing reads
+        if (ml.shouldCacheAddedEntry()) {
+            int expectedReadCount = 0;
+            // only use expectedReadCount if cache eviction is enabled by expected read count
+            if (ml.getConfig().isCacheEvictionByExpectedReadCount()) {
+                // use the number of active cursors as the expected read count
+                expectedReadCount = ml.getActiveCursors().size();
+            }
+            EntryImpl entry = EntryImpl.create(ledgerId, entryId, data, expectedReadCount);
+            entry.setDecreaseReadCountOnRelease(false);
+            // EntryCache.insert: duplicates entry by allocating new entry and data. so, recycle entry after calling
+            // insert
+            ml.entryCache.insert(entry);
+            entry.release();
+        }
+
+        Position lastEntry = PositionFactory.create(ledgerId, entryId);
+        ManagedLedgerImpl.ENTRIES_ADDED_COUNTER_UPDATER.incrementAndGet(ml);
+        ml.lastConfirmedEntry = lastEntry;
+
+        if (closeWhenDone) {
+            log.info().attr("managedLedger", ml.getName())
+                    .attr("ledgerId", ledgerId)
+                    .log("Closing ledger for being full");
+            // `data` will be released in `closeComplete`
+            if (ledger != null) {
+                ledger.asyncClose(this, ctx);
+            }
+        } else {
+            updateLatency();
+            completeAdd(lastEntry, ctx);
+        }
+    }
+
+    @Override
+    public void closeComplete(int rc, LedgerHandle lh, Object ctx) {
+        checkArgument(ledger.getId() == lh.getId(), "ledgerId %s doesn't match with acked ledgerId %s", ledger.getId(),
+                lh.getId());
+
+        if (rc == BKException.Code.OK) {
+            log.debug().attr("ledgerId", lh.getId()).log("Successfully closed ledger");
+        } else {
+            log.warn().attr("ledgerId", lh.getId())
+                    .attr("status", BKException.getMessage(rc))
+                    .log("Error when closing ledger");
+        }
+
+        ml.ledgerClosed(lh);
+        updateLatency();
+        completeAdd(PositionFactory.create(lh.getId(), entryId), ctx);
+    }
+
+    private void completeAdd(Position pos, Object ctx) {
+        AddEntryCallback cb = callbackUpdater.getAndSet(this, null);
+        if (cb != null) {
+            cb.addComplete(pos, data.asReadOnly(), ctx);
+            ml.notifyCursors();
+            ml.notifyWaitingEntryCallBacks();
+            ReferenceCountUtil.release(data);
+            this.recycle();
+        } else {
+            ReferenceCountUtil.release(data);
+        }
+    }
+
+    private void updateLatency() {
+        ml.mbean.addAddEntryLatencySample(System.nanoTime() - startTime, TimeUnit.NANOSECONDS);
+        ml.mbean.addLedgerAddEntryLatencySample(System.nanoTime() - lastInitTime, TimeUnit.NANOSECONDS);
+    }
+
+    /**
+     * Checks if add-operation is completed.
+     *
+     * @return true if task is not already completed else returns false.
+     */
+    private boolean checkAndCompleteOp(Object ctx) {
+        long addOpCount = (ctx instanceof Long) ? (long) ctx : -1;
+        if (addOpCount != -1 && ADD_OP_COUNT_UPDATER.compareAndSet(this, addOpCount, -1)) {
+            return true;
+        }
+        log.info().attr("ledgerId", ledger != null ? ledger.getId() : -1)
+                .attr("entryId", entryId)
+                .log("Add-entry already completed");
+        return false;
+    }
+
+    /**
+     * It handles add failure on the given ledger. it can be triggered when add-entry fails or times out.
+     *
+     * @param lh
+     */
+    void handleAddFailure(final LedgerHandle lh, Integer rc) {
+        // If we get a write error, we will try to create a new ledger and re-submit the pending writes. If the
+        // ledger creation fails (persistent bk failure, another instance owning the ML, ...), then the writes will
+        // be marked as failed.
+        ManagedLedgerImpl finalMl = this.ml;
+        finalMl.mbean.recordAddEntryError();
+
+        finalMl.getExecutor().execute(() -> {
+            // Force the creation of a new ledger. Doing it in a background thread to avoid acquiring ML lock
+            // from a BK callback.
+            // If we received a "MetadataVersionException" or a "LedgerFencedException", we should tell the ML that
+            // the ledger has been closed by others, and the entries count in the ledger may is not correct. The ML
+            // will handle it.
+            if (rc != null && (rc.intValue() == BKException.Code.MetadataVersionException
+                    || rc.intValue() == BKException.Code.LedgerFencedException)) {
+                finalMl.addEntryFailedDueToConcurrentlyModified(lh, rc);
+            } else {
+                finalMl.ledgerClosed(lh);
+            }
+        });
+    }
+
+    OpAddEntry duplicateAndClose(AtomicBoolean timeoutTriggered) {
+        STATE_UPDATER.set(OpAddEntry.this, State.CLOSED);
+        OpAddEntry duplicate =
+                OpAddEntry.createNoRetainBuffer(ml, data, getNumberOfMessages(), callback, ctx, timeoutTriggered);
+        return duplicate;
+    }
+
+    public State getState() {
+        return state;
+    }
+
+    public ByteBuf getData() {
+        return data;
+    }
+
+    public int getNumberOfMessages() {
+        return numberOfMessages;
+    }
+
+    public Object getCtx() {
+        return ctx;
+    }
+
+    public void setNumberOfMessages(int numberOfMessages) {
+        this.numberOfMessages = numberOfMessages;
+    }
+
+    public void setData(ByteBuf data) {
+        this.dataLength = data.readableBytes();
+        this.data = data;
+    }
+
+    private final Handle<OpAddEntry> recyclerHandle;
+
+    private OpAddEntry(Handle<OpAddEntry> recyclerHandle) {
+        this.recyclerHandle = recyclerHandle;
+    }
+
+    private static final Recycler<OpAddEntry> RECYCLER = new Recycler<OpAddEntry>() {
+        @Override
+        protected OpAddEntry newObject(Recycler.Handle<OpAddEntry> recyclerHandle) {
+            return new OpAddEntry(recyclerHandle);
+        }
+    };
+
+    public void recycle() {
+        ml = null;
+        ledger = null;
+        data = null;
+        numberOfMessages = 0;
+        dataLength = -1;
+        callback = null;
+        ctx = null;
+        addOpCount = -1;
+        closeWhenDone = false;
+        entryId = -1;
+        startTime = -1;
+        lastInitTime = -1;
+        payloadProcessorHandle = null;
+        timeoutTriggered = null;
+        recyclerHandle.recycle(this);
+    }
+
+    @Override
+    public String toString() {
+        ManagedLedgerImpl ml = this.ml;
+        LedgerHandle ledger = this.ledger;
+        return "OpAddEntry{"
+                + "mlName=" + (ml != null ? ml.getName() : "null")
+                + ", ledgerId=" + (ledger != null ? String.valueOf(ledger.getId()) : "null")
+                + ", entryId=" + entryId
+                + ", startTime=" + startTime
+                + ", dataLength=" + dataLength
+                + '}';
+    }
+}

@@ -1,0 +1,182 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.bookkeeper.test;
+
+import java.lang.reflect.Method;
+import java.util.Optional;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import lombok.CustomLog;
+import lombok.SneakyThrows;
+import org.apache.bookkeeper.client.PulsarMockBookKeeper;
+import org.apache.bookkeeper.common.util.OrderedScheduler;
+import org.apache.bookkeeper.mledger.ManagedLedgerConfig;
+import org.apache.bookkeeper.mledger.ManagedLedgerException;
+import org.apache.bookkeeper.mledger.ManagedLedgerFactoryConfig;
+import org.apache.bookkeeper.mledger.impl.ManagedLedgerFactoryImpl;
+import org.apache.pulsar.metadata.api.MetadataStoreConfig;
+import org.apache.pulsar.metadata.api.MetadataStoreException;
+import org.apache.pulsar.metadata.api.extended.MetadataStoreExtended;
+import org.apache.pulsar.metadata.impl.FaultInjectionMetadataStore;
+import org.testng.annotations.AfterClass;
+import org.testng.annotations.AfterMethod;
+import org.testng.annotations.BeforeClass;
+import org.testng.annotations.BeforeMethod;
+
+/**
+ * A class runs several bookie servers for testing.
+ */
+@CustomLog
+public abstract class MockedBookKeeperTestCase {
+
+    // BookKeeper related variables
+    protected PulsarMockBookKeeper bkc;
+    protected int numBookies;
+
+    protected ManagedLedgerFactoryImpl factory;
+
+    protected OrderedScheduler executor;
+    protected ExecutorService cachedExecutor;
+
+    protected FaultInjectionMetadataStore metadataStore;
+
+    public MockedBookKeeperTestCase() {
+        // By default start a 3 bookies cluster
+        this(3);
+    }
+
+    public MockedBookKeeperTestCase(int numBookies) {
+        this.numBookies = numBookies;
+    }
+
+    @BeforeMethod(alwaysRun = true)
+    public final void setUp(Method method) throws Exception {
+        log.info().attr("method", method).log(">>>>>> Starting test method");
+        metadataStore = new FaultInjectionMetadataStore(
+                MetadataStoreExtended.create("memory:local",
+                        MetadataStoreConfig.builder().metadataStoreName("metastore-" + method.getName()).build()));
+
+        try {
+            // start bookkeeper service
+            startBookKeeper();
+        } catch (Exception e) {
+            log.error().exception(e).log("Error setting up");
+            throw e;
+        }
+
+        ManagedLedgerFactoryConfig managedLedgerFactoryConfig = new ManagedLedgerFactoryConfig();
+        initManagedLedgerFactoryConfig(managedLedgerFactoryConfig);
+        ManagedLedgerConfig managedLedgerConfig = new ManagedLedgerConfig();
+        initManagedLedgerConfig(managedLedgerConfig);
+        factory =
+                new ManagedLedgerFactoryImpl(metadataStore, bkc, managedLedgerFactoryConfig, managedLedgerConfig);
+
+        setUpTestCase();
+    }
+
+    protected ManagedLedgerConfig initManagedLedgerConfig(ManagedLedgerConfig config) {
+        config.setCacheEvictionByExpectedReadCount(false);
+        return config;
+    }
+
+    protected void initManagedLedgerFactoryConfig(ManagedLedgerFactoryConfig config) {
+        // increase default cache eviction interval so that caching could be tested with less flakyness
+        config.setCacheEvictionIntervalMs(200);
+    }
+
+    protected void setUpTestCase() throws Exception {
+
+    }
+
+    @AfterMethod(alwaysRun = true)
+    @SneakyThrows
+    public final void tearDown(Method method) {
+        try {
+            cleanUpTestCase();
+        } catch (Exception e) {
+            log.error().exception(e).log("tearDown Error");
+        }
+        try {
+            log.info().attr("method", method).log("@@@@@@@@@ Stopping test method");
+            if (factory != null) {
+                try {
+                    factory.shutdownAsync().get(10, TimeUnit.SECONDS);
+                } catch (ManagedLedgerException.ManagedLedgerFactoryClosedException e) {
+                    // ignore
+                }
+                factory = null;
+            }
+            stopBookKeeper();
+            if (metadataStore != null) {
+                metadataStore.close();
+                metadataStore = null;
+            }
+            log.info().attr("method", method).log("--------- Stopped test method");
+        } catch (Exception e) {
+            log.error().exception(e).log("tearDown Error");
+        }
+    }
+
+    protected void cleanUpTestCase() throws Exception {
+
+    }
+
+    @BeforeClass(alwaysRun = true)
+    public final void setUpClass() {
+        executor = OrderedScheduler.newSchedulerBuilder().numThreads(2).name("test").build();
+        cachedExecutor = Executors.newCachedThreadPool();
+    }
+
+    @AfterClass(alwaysRun = true)
+    public final void tearDownClass() {
+        if (executor != null) {
+            executor.shutdownNow();
+        }
+        if (cachedExecutor != null) {
+            cachedExecutor.shutdownNow();
+        }
+    }
+
+    /**
+     * Start cluster.
+     *
+     * @throws Exception
+     */
+    protected void startBookKeeper() throws Exception {
+        for (int i = 0; i < numBookies; i++) {
+            metadataStore.put("/ledgers/available/192.168.1.1:" + (5000 + i), new byte[0], Optional.empty()).join();
+        }
+
+        metadataStore.put("/ledgers/LAYOUT", "1\nflat:1".getBytes(), Optional.empty()).join();
+
+        bkc = new PulsarMockBookKeeper(executor);
+    }
+
+    protected void stopBookKeeper() {
+        if (bkc != null) {
+            bkc.shutdown();
+            bkc = null;
+        }
+    }
+
+    protected void stopMetadataStore() {
+        metadataStore.setAlwaysFail(new MetadataStoreException("failed"));
+    }
+}

@@ -1,0 +1,529 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pulsar.client.impl;
+
+import static com.google.common.base.Preconditions.checkArgument;
+import static org.apache.pulsar.client.impl.conf.ProducerConfigurationData.DEFAULT_MAX_PENDING_MESSAGES;
+import static org.apache.pulsar.client.impl.conf.ProducerConfigurationData.DEFAULT_MAX_PENDING_MESSAGES_ACROSS_PARTITIONS;
+import com.google.common.annotations.VisibleForTesting;
+import io.github.merlimat.slog.Logger;
+import io.netty.util.Timeout;
+import io.netty.util.TimerTask;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiConsumer;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+import org.apache.pulsar.client.api.Message;
+import org.apache.pulsar.client.api.MessageId;
+import org.apache.pulsar.client.api.MessageRouter;
+import org.apache.pulsar.client.api.MessageRoutingMode;
+import org.apache.pulsar.client.api.Producer;
+import org.apache.pulsar.client.api.ProducerAccessMode;
+import org.apache.pulsar.client.api.PulsarClientException;
+import org.apache.pulsar.client.api.PulsarClientException.NotSupportedException;
+import org.apache.pulsar.client.api.Schema;
+import org.apache.pulsar.client.api.TopicMetadata;
+import org.apache.pulsar.client.api.transaction.Transaction;
+import org.apache.pulsar.client.impl.conf.ProducerConfigurationData;
+import org.apache.pulsar.client.impl.transaction.TransactionImpl;
+import org.apache.pulsar.common.naming.TopicName;
+import org.apache.pulsar.common.util.FutureUtil;
+
+public class PartitionedProducerImpl<T> extends ProducerBase<T> {
+
+    private static final Logger LOG = Logger.get(PartitionedProducerImpl.class);
+    private final Logger log;
+
+    private final Map<Integer, ProducerImpl<T>> producers = new ConcurrentHashMap<>();
+    private final MessageRouter routerPolicy;
+    private final PartitionedTopicProducerStatsRecorderImpl stats;
+    private TopicMetadata topicMetadata;
+    private final int firstPartitionIndex;
+    private String overrideProducerName;
+
+    // timeout related to auto check and subscribe partition increasement
+    private volatile Timeout partitionsAutoUpdateTimeout = null;
+    TopicsPartitionChangedListener topicsPartitionChangedListener;
+    CompletableFuture<Void> partitionsAutoUpdateFuture = null;
+
+    public PartitionedProducerImpl(PulsarClientImpl client, String topic, ProducerConfigurationData conf,
+                                   int numPartitions, CompletableFuture<Producer<T>> producerCreatedFuture,
+                                   Schema<T> schema, ProducerInterceptors interceptors) {
+        super(client, topic, conf, producerCreatedFuture, schema, interceptors);
+        this.log = LOG.with()
+                .attr("topic", topic)
+                .attr("producerName", () -> overrideProducerName)
+                .build();
+        this.topicMetadata = new TopicMetadataImpl(numPartitions);
+        this.routerPolicy = getMessageRouter();
+        stats = client.getConfiguration().getStatsIntervalSeconds() > 0
+                ? new PartitionedTopicProducerStatsRecorderImpl()
+                : null;
+
+        // MaxPendingMessagesAcrossPartitions doesn't support partial partition such as SinglePartition correctly
+        int maxPendingMessages = conf.getMaxPendingMessages();
+        int maxPendingMessagesAcrossPartitions = conf.getMaxPendingMessagesAcrossPartitions();
+        if (maxPendingMessagesAcrossPartitions != DEFAULT_MAX_PENDING_MESSAGES_ACROSS_PARTITIONS) {
+            int maxPendingMsgsForOnePartition = maxPendingMessagesAcrossPartitions / numPartitions;
+            maxPendingMessages = (maxPendingMessages == DEFAULT_MAX_PENDING_MESSAGES)
+                    ? maxPendingMsgsForOnePartition
+                    : Math.min(maxPendingMessages, maxPendingMsgsForOnePartition);
+            conf.setMaxPendingMessages(maxPendingMessages);
+        }
+
+
+        final List<Integer> indexList;
+        if (conf.isLazyStartPartitionedProducers()
+                && conf.getAccessMode() == ProducerAccessMode.Shared) {
+            // try to create producer at least one partition
+            indexList = Collections.singletonList(routerPolicy
+                    .choosePartition(((TypedMessageBuilderImpl<T>) newMessage()).getMessage(), topicMetadata));
+        } else {
+            // try to create producer for all partitions
+            indexList = IntStream.range(0, topicMetadata.numPartitions()).boxed().collect(Collectors.toList());
+        }
+
+        firstPartitionIndex = indexList.get(0);
+        start(indexList);
+
+        // start track and auto subscribe partition increasement
+        if (conf.isAutoUpdatePartitions()) {
+            topicsPartitionChangedListener = new TopicsPartitionChangedListener();
+            partitionsAutoUpdateTimeout = client.timer()
+                .newTimeout(partitionsAutoUpdateTimerTask,
+                        conf.getAutoUpdatePartitionsIntervalSeconds(), TimeUnit.SECONDS);
+        }
+    }
+
+    private MessageRouter getMessageRouter() {
+        MessageRouter messageRouter;
+
+        MessageRoutingMode messageRouteMode = conf.getMessageRoutingMode();
+
+        switch (messageRouteMode) {
+            case CustomPartition:
+                messageRouter = Objects.requireNonNull(conf.getCustomMessageRouter());
+                break;
+            case SinglePartition:
+                messageRouter = new SinglePartitionMessageRouterImpl(
+                        ThreadLocalRandom.current().nextInt(topicMetadata.numPartitions()), conf.getHashingScheme());
+                break;
+            case RoundRobinPartition:
+            default:
+                messageRouter = new RoundRobinPartitionMessageRouterImpl(
+                        conf.getHashingScheme(),
+                        ThreadLocalRandom.current().nextInt(topicMetadata.numPartitions()),
+                        conf.isBatchingEnabled(),
+                        TimeUnit.MICROSECONDS.toMillis(conf.batchingPartitionSwitchFrequencyIntervalMicros()));
+        }
+
+        return messageRouter;
+    }
+
+    @Override
+    public String getProducerName() {
+        return producers.get(firstPartitionIndex).getProducerName();
+    }
+
+    @Override
+    public long getLastSequenceId() {
+        // Return the highest sequence id across all partitions. This will be correct,
+        // since there is a single id generator across all partitions for the same producer
+        return producers.values().stream().map(Producer::getLastSequenceId).mapToLong(Long::longValue).max().orElse(-1);
+    }
+
+    private void start(List<Integer> indexList) {
+        AtomicReference<Throwable> createFail = new AtomicReference<Throwable>();
+        AtomicInteger completed = new AtomicInteger();
+
+        final BiConsumer<Boolean, Throwable> afterCreatingProducer = (failFast, createException) -> {
+            final Runnable closeRunnable = () -> {
+                log.error()
+                        .exception(createFail.get().getCause())
+                        .log("Could not create partitioned producer.");
+                closeAsync().handle((ok, closeException) -> {
+                    producerCreatedFuture().completeExceptionally(createFail.get());
+                    client.cleanupProducer(this);
+                    return null;
+                });
+            };
+
+            if (createException != null) {
+                setState(State.Failed);
+                createFail.compareAndSet(null, createException);
+                if (failFast) {
+                    closeRunnable.run();
+                }
+            }
+            // we mark success if all the partitions are created
+            // successfully, else we throw an exception
+            // due to any
+            // failure in one of the partitions and close the successfully
+            // created partitions
+            if (completed.incrementAndGet() == indexList.size()) {
+                if (createFail.get() == null) {
+                    setState(State.Ready);
+                    log.info("Created partitioned producer");
+                    producerCreatedFuture().complete(PartitionedProducerImpl.this);
+                } else {
+                    closeRunnable.run();
+                }
+            }
+        };
+
+        final ProducerImpl<T> firstProducer = createProducer(indexList.get(0));
+        firstProducer.producerCreatedFuture().handle((prod, createException) -> {
+            afterCreatingProducer.accept(true, createException);
+            if (createException != null) {
+                throw new RuntimeException(createException);
+            }
+            overrideProducerName = firstProducer.getProducerName();
+            return Optional.of(overrideProducerName);
+        }).thenApply(name -> {
+            for (int i = 1; i < indexList.size(); i++) {
+                createProducer(indexList.get(i), name).producerCreatedFuture().handle((prod, createException) -> {
+                    afterCreatingProducer.accept(false, createException);
+                    return null;
+                });
+            }
+            return null;
+        });
+    }
+
+    private ProducerImpl<T> createProducer(final int partitionIndex) {
+        return createProducer(partitionIndex, Optional.empty());
+    }
+
+    private ProducerImpl<T> createProducer(final int partitionIndex, final Optional<String> overrideProducerName) {
+        return producers.computeIfAbsent(partitionIndex, (idx) -> {
+            String partitionName = TopicName.get(topic).getPartition(idx).toString();
+            return client.newProducerImpl(partitionName, idx,
+                    conf, schema, interceptors, new CompletableFuture<>(), overrideProducerName);
+        });
+    }
+
+    @Override
+    CompletableFuture<MessageId> internalSendAsync(Message<?> message) {
+        return internalSendWithTxnAsync(message, null);
+    }
+
+    @Override
+    CompletableFuture<MessageId> internalSendWithTxnAsync(Message<?> message, Transaction txn) {
+        CompletableFuture<MessageId> completableFuture = new CompletableFuture<>();
+        if (txn != null && !((TransactionImpl) txn).checkIfOpen(completableFuture)) {
+            return completableFuture;
+        }
+        int partition = routerPolicy.choosePartition(message, topicMetadata);
+        checkArgument(partition >= 0 && partition < topicMetadata.numPartitions(),
+                "Illegal partition index chosen by the message routing policy: " + partition);
+
+        if (conf.isLazyStartPartitionedProducers() && !producers.containsKey(partition)) {
+            final ProducerImpl<T> newProducer = createProducer(partition, Optional.ofNullable(overrideProducerName));
+            final State createState = newProducer.producerCreatedFuture().handle((prod, createException) -> {
+                if (createException != null) {
+                    log.error()
+                            .attr("partitionIndex", partition)
+                            .exception(createException)
+                            .log("Could not create internal producer");
+                    try {
+                        producers.remove(partition, newProducer);
+                        newProducer.close();
+                    } catch (PulsarClientException e) {
+                        log.error()
+                                .attr("partitionIndex", partition)
+                                .exception(e)
+                                .log("Could not close internal producer");
+                    }
+                    return State.Failed;
+                }
+                    log.debug()
+                            .attr("partitionIndex", partition)
+                            .log("Created internal producer");
+                return State.Ready;
+            }).join();
+            if (createState == State.Failed) {
+                return FutureUtil.failedFuture(new PulsarClientException.NotConnectedException());
+            }
+        }
+
+        switch (getState()) {
+            case Ready:
+            case Connecting:
+                break; // Ok
+            case Closing:
+            case Closed:
+                return FutureUtil.failedFuture(
+                        new PulsarClientException.AlreadyClosedException("Producer already closed"));
+            case ProducerFenced:
+                return FutureUtil.failedFuture(
+                        new PulsarClientException.ProducerFencedException("Producer was fenced"));
+            case Terminated:
+                return FutureUtil.failedFuture(
+                        new PulsarClientException.TopicTerminatedException("Topic was terminated"));
+            case Failed:
+            case Uninitialized:
+                return FutureUtil.failedFuture(new PulsarClientException.NotConnectedException());
+        }
+
+        return producers.get(partition).internalSendWithTxnAsync(message, txn);
+    }
+
+    @Override
+    public CompletableFuture<Void> flushAsync() {
+        return CompletableFuture.allOf(
+                producers.values().stream().map(ProducerImpl::flushAsync).toArray(CompletableFuture[]::new));
+    }
+
+    @Override
+    void triggerFlush() {
+        producers.values().forEach(ProducerImpl::triggerFlush);
+    }
+
+    @Override
+    public boolean isConnected() {
+        // returns false if any of the partition is not connected
+        return producers.values().stream().allMatch(ProducerImpl::isConnected);
+    }
+
+    @Override
+    public long getLastDisconnectedTimestamp() {
+        long lastDisconnectedTimestamp = 0;
+        Optional<ProducerImpl<T>> p = producers.values().stream()
+                .max(Comparator.comparingLong(ProducerImpl::getLastDisconnectedTimestamp));
+        if (p.isPresent()) {
+            lastDisconnectedTimestamp = p.get().getLastDisconnectedTimestamp();
+        }
+        return lastDisconnectedTimestamp;
+    }
+
+    @Override
+    public CompletableFuture<Void> closeAsync() {
+        if (getState() == State.Closing || getState() == State.Closed) {
+            return CompletableFuture.completedFuture(null);
+        }
+        setState(State.Closing);
+
+        if (partitionsAutoUpdateTimeout != null) {
+            partitionsAutoUpdateTimeout.cancel();
+            partitionsAutoUpdateTimeout = null;
+        }
+
+        AtomicReference<Throwable> closeFail = new AtomicReference<Throwable>();
+        AtomicInteger completed = new AtomicInteger(producers.size());
+        CompletableFuture<Void> closeFuture = new CompletableFuture<>();
+        for (Producer<T> producer : producers.values()) {
+            if (producer != null) {
+                producer.closeAsync().handle((closed, ex) -> {
+                    if (ex != null) {
+                        closeFail.compareAndSet(null, ex);
+                    }
+                    if (completed.decrementAndGet() == 0) {
+                        if (closeFail.get() == null) {
+                            setState(State.Closed);
+                            closeFuture.complete(null);
+                            log.info("Closed Partitioned Producer");
+                            client.cleanupProducer(this);
+                        } else {
+                            setState(State.Failed);
+                            closeFuture.completeExceptionally(closeFail.get());
+                            log.error()
+                                    .exception(closeFail.get().getCause())
+                                    .log("Could not close Partitioned Producer");
+                        }
+                    }
+
+                    return null;
+                });
+            }
+
+        }
+
+        return closeFuture;
+    }
+
+    @Override
+    public synchronized ProducerStatsRecorderImpl getStats() {
+        if (stats == null) {
+            return null;
+        }
+        stats.reset();
+        producers.forEach(
+                (partition, producer) -> stats.updateCumulativeStats(producer.getTopic(), producer.getStats()));
+        return stats;
+    }
+
+    public List<ProducerImpl<T>> getProducers() {
+        return producers.values().stream()
+                .sorted(Comparator.comparingInt(e -> TopicName.getPartitionIndex(e.getTopic())))
+                .collect(Collectors.toList());
+    }
+
+    @Override
+    String getHandlerName() {
+        return "partition-producer";
+    }
+
+    // This listener is triggered when topics partitions are updated.
+    private class TopicsPartitionChangedListener implements PartitionsChangedListener {
+        // Check partitions changes of passed in topics, and add new topic partitions.
+        @Override
+        public CompletableFuture<Void> onTopicsExtended(Collection<String> topicsExtended) {
+            CompletableFuture<Void> future = new CompletableFuture<>();
+            if (topicsExtended.isEmpty() || !topicsExtended.contains(topic)) {
+                future.complete(null);
+                return future;
+            }
+
+            client.getPartitionsForTopic(topic, false).thenCompose(list -> {
+                int oldPartitionNumber = topicMetadata.numPartitions();
+                int currentPartitionNumber = list.size();
+                    log.debug()
+                            .attr("old", oldPartitionNumber)
+                            .attr("new", currentPartitionNumber)
+                            .log("Topic partitions changed");
+
+                if (oldPartitionNumber == currentPartitionNumber) {
+                    // topic partition number not changed
+                    future.complete(null);
+                    return future;
+                } else if (oldPartitionNumber < currentPartitionNumber) {
+                    if (conf.isLazyStartPartitionedProducers() && conf.getAccessMode() == ProducerAccessMode.Shared) {
+                        topicMetadata = new TopicMetadataImpl(currentPartitionNumber);
+                        future.complete(null);
+                        // call interceptor with the metadata change
+                        onPartitionsChange(topic, currentPartitionNumber);
+                        return future;
+                    } else {
+                        List<CompletableFuture<Producer<T>>> futureList = list
+                                .subList(oldPartitionNumber, currentPartitionNumber)
+                                .stream()
+                                .map(partitionName -> {
+                                    int partitionIndex = TopicName.getPartitionIndex(partitionName);
+                                    return producers.computeIfAbsent(partitionIndex, (idx) -> new ProducerImpl<>(
+                                            client, partitionName, conf, new CompletableFuture<>(),
+                                            idx, schema, interceptors,
+                                            Optional.ofNullable(overrideProducerName))).producerCreatedFuture();
+                                }).collect(Collectors.toList());
+
+                        FutureUtil.waitForAll(futureList)
+                                .thenAccept(finalFuture -> {
+                                        log.debug()
+                                                .attr("old", oldPartitionNumber)
+                                                .attr("new", currentPartitionNumber)
+                                                .log("success create producers for"
+                                                        + " extended partitions");
+                                    topicMetadata = new TopicMetadataImpl(currentPartitionNumber);
+                                    future.complete(null);
+                                })
+                                .exceptionally(ex -> {
+                                    // error happened, remove
+                                    log.warn()
+                                            .attr("old", oldPartitionNumber)
+                                            .attr("new", currentPartitionNumber)
+                                            .log("Failed to create producers for extended partitions");
+                                    IntStream.range(oldPartitionNumber, producers.size())
+                                            .forEach(i -> producers.remove(i).closeAsync());
+                                    future.completeExceptionally(ex);
+                                    return null;
+                                });
+                        // call interceptor with the metadata change
+                        onPartitionsChange(topic, currentPartitionNumber);
+                        return future;
+                    }
+                } else {
+                    log.error()
+                            .attr("old", oldPartitionNumber)
+                            .attr("new", currentPartitionNumber)
+                            .log("Shrinking topic partitions is not supported");
+                    future.completeExceptionally(new NotSupportedException("not support shrink topic partitions"));
+                }
+                return future;
+            }).exceptionally(throwable -> {
+                log.error().exception(throwable).log("Auto getting partitions failed");
+                future.completeExceptionally(throwable);
+                return null;
+            });
+
+            return future;
+        }
+    }
+
+    private TimerTask partitionsAutoUpdateTimerTask = new TimerTask() {
+        @Override
+        public void run(Timeout timeout) throws Exception {
+            try {
+                if (timeout.isCancelled() || getState() != State.Ready) {
+                    return;
+                }
+                    log.debug("run partitionsAutoUpdateTimerTask for partitioned producer");
+
+                // if last auto update not completed yet, do nothing.
+                if (partitionsAutoUpdateFuture == null || partitionsAutoUpdateFuture.isDone()) {
+                    partitionsAutoUpdateFuture =
+                            topicsPartitionChangedListener.onTopicsExtended(List.of(topic));
+                }
+            } catch (Throwable th) {
+                log.warn().exception(th)
+                        .log("Encountered error in partition auto update"
+                                + " timer task for partition producer."
+                                + " Another task will be scheduled.");
+            } finally {
+                // schedule the next re-check task
+                partitionsAutoUpdateTimeout = client.timer()
+                        .newTimeout(partitionsAutoUpdateTimerTask,
+                                conf.getAutoUpdatePartitionsIntervalSeconds(), TimeUnit.SECONDS);
+            }
+        }
+    };
+
+    @VisibleForTesting
+    public CompletableFuture<Void> getPartitionsAutoUpdateFuture() {
+        return partitionsAutoUpdateFuture;
+    }
+
+    @VisibleForTesting
+    public Timeout getPartitionsAutoUpdateTimeout() {
+        return partitionsAutoUpdateTimeout;
+    }
+
+    @VisibleForTesting
+    public CompletableFuture<Void> getOriginalLastSendFuture() {
+        return CompletableFuture.allOf(
+                producers.values().stream().map(ProducerImpl::getOriginalLastSendFuture)
+                        .toArray(CompletableFuture[]::new));
+    }
+
+    @Override
+    public int getNumOfPartitions() {
+        return topicMetadata.numPartitions();
+    }
+
+}

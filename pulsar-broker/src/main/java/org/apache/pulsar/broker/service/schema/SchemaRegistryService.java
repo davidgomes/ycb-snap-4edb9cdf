@@ -1,0 +1,72 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pulsar.broker.service.schema;
+
+import io.github.merlimat.slog.Logger;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Set;
+import org.apache.pulsar.broker.PulsarService;
+import org.apache.pulsar.broker.service.schema.validator.SchemaRegistryServiceWithSchemaDataValidator;
+import org.apache.pulsar.common.protocol.schema.SchemaStorage;
+import org.apache.pulsar.common.schema.SchemaType;
+import org.apache.pulsar.common.util.Reflections;
+
+public interface SchemaRegistryService extends SchemaRegistry {
+    Logger LOG = Logger.get(SchemaRegistryService.class);
+    long NO_SCHEMA_VERSION = -1L;
+
+    static Map<SchemaType, SchemaCompatibilityCheck> getCheckers(Set<String> checkerClasses) throws Exception {
+        Map<SchemaType, SchemaCompatibilityCheck> checkers = new HashMap<>();
+        for (String className : checkerClasses) {
+            SchemaCompatibilityCheck schemaCompatibilityCheck = Reflections.createInstance(className,
+                    SchemaCompatibilityCheck.class, Thread.currentThread().getContextClassLoader());
+            checkers.put(schemaCompatibilityCheck.getSchemaType(), schemaCompatibilityCheck);
+        }
+        return checkers;
+    }
+
+    static SchemaRegistryService create(SchemaStorage schemaStorage, Set<String> schemaRegistryCompatibilityCheckers,
+                                        PulsarService pulsarService) {
+        if (schemaStorage != null) {
+            try {
+                Map<SchemaType, SchemaCompatibilityCheck> checkers = getCheckers(schemaRegistryCompatibilityCheckers);
+                checkers.put(SchemaType.KEY_VALUE, new KeyValueSchemaCompatibilityCheck(checkers));
+
+                // PIP-464: propagate schemaJsonAllowLegacyJacksonFormat to JsonSchemaCompatibilityCheck
+                boolean allowLegacyJacksonFormat =
+                        pulsarService.getConfiguration().isSchemaJsonAllowLegacyJacksonFormat();
+                SchemaCompatibilityCheck jsonCheck = checkers.get(SchemaType.JSON);
+                if (jsonCheck instanceof JsonSchemaCompatibilityCheck) {
+                    ((JsonSchemaCompatibilityCheck) jsonCheck)
+                            .setAllowLegacyJacksonFormat(allowLegacyJacksonFormat);
+                }
+
+                return SchemaRegistryServiceWithSchemaDataValidator.of(
+                        new SchemaRegistryServiceImpl(schemaStorage, checkers, pulsarService),
+                        allowLegacyJacksonFormat);
+            } catch (Exception e) {
+                LOG.warn().exception(e).log("Unable to create schema registry storage, defaulting to empty storage");
+            }
+        }
+        return new DefaultSchemaRegistryService();
+    }
+
+    void close() throws Exception;
+}

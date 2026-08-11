@@ -1,0 +1,668 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.pulsar.broker.service.schema;
+
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.Objects.isNull;
+import static java.util.concurrent.CompletableFuture.completedFuture;
+import static org.apache.pulsar.common.policies.data.SchemaCompatibilityStrategy.BACKWARD_TRANSITIVE;
+import static org.apache.pulsar.common.policies.data.SchemaCompatibilityStrategy.FORWARD_TRANSITIVE;
+import static org.apache.pulsar.common.policies.data.SchemaCompatibilityStrategy.FULL_TRANSITIVE;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.hash.HashFunction;
+import com.google.common.hash.Hashing;
+import java.time.Clock;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.stream.Collectors;
+import lombok.CustomLog;
+import org.apache.avro.Schema;
+import org.apache.bookkeeper.common.concurrent.FutureUtils;
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.commons.lang3.mutable.MutableLong;
+import org.apache.commons.lang3.tuple.Pair;
+import org.apache.pulsar.broker.PulsarService;
+import org.apache.pulsar.broker.service.schema.exceptions.IncompatibleSchemaException;
+import org.apache.pulsar.broker.service.schema.exceptions.NotExistSchemaException;
+import org.apache.pulsar.broker.service.schema.exceptions.SchemaException;
+import org.apache.pulsar.broker.service.schema.proto.SchemaInfo;
+import org.apache.pulsar.broker.service.schema.validator.StructSchemaDataValidator;
+import org.apache.pulsar.common.policies.data.SchemaCompatibilityStrategy;
+import org.apache.pulsar.common.protocol.schema.SchemaData;
+import org.apache.pulsar.common.protocol.schema.SchemaHash;
+import org.apache.pulsar.common.protocol.schema.SchemaStorage;
+import org.apache.pulsar.common.protocol.schema.SchemaVersion;
+import org.apache.pulsar.common.protocol.schema.StoredSchema;
+import org.apache.pulsar.common.schema.LongSchemaVersion;
+import org.apache.pulsar.common.schema.SchemaType;
+import org.apache.pulsar.common.util.FutureUtil;
+import org.jspecify.annotations.NonNull;
+
+@CustomLog
+public class SchemaRegistryServiceImpl implements SchemaRegistryService {
+    private static HashFunction hashFunction = Hashing.sha256();
+    private final Map<SchemaType, SchemaCompatibilityCheck> compatibilityChecks;
+    private final SchemaStorage schemaStorage;
+    private final Clock clock;
+    private final SchemaRegistryStats stats;
+
+    @VisibleForTesting
+    SchemaRegistryServiceImpl(SchemaStorage schemaStorage,
+                              Map<SchemaType, SchemaCompatibilityCheck> compatibilityChecks,
+                              Clock clock,
+                              PulsarService pulsarService) {
+        this.schemaStorage = schemaStorage;
+        this.compatibilityChecks = compatibilityChecks;
+        this.clock = clock;
+        this.stats = new SchemaRegistryStats(pulsarService);
+    }
+
+    SchemaRegistryServiceImpl(SchemaStorage schemaStorage,
+                              Map<SchemaType, SchemaCompatibilityCheck> compatibilityChecks,
+                              PulsarService pulsarService) {
+        this(schemaStorage, compatibilityChecks, Clock.systemUTC(), pulsarService);
+    }
+
+    @Override
+    @NonNull
+    public CompletableFuture<SchemaAndMetadata> getSchema(String schemaId) {
+        return getSchema(schemaId, SchemaVersion.Latest).thenApply((schema) -> {
+            if (schema != null && schema.schema.isDeleted()) {
+                return null;
+            } else {
+                return schema;
+            }
+        });
+    }
+
+    @Override
+    @NonNull
+    public CompletableFuture<SchemaAndMetadata> getSchema(String schemaId, SchemaVersion version) {
+        long start = this.clock.millis();
+
+        CompletableFuture<StoredSchema> completableFuture;
+        if (version == SchemaVersion.Latest) {
+            completableFuture = schemaStorage.get(schemaId, version);
+        } else {
+            long longVersion = ((LongSchemaVersion) version).getVersion();
+            //If the schema has been deleted, it cannot be obtained
+            completableFuture = trimDeletedSchemaAndGetList(schemaId)
+                .thenApply(metadataList -> metadataList.stream().filter(schemaAndMetadata ->
+                        ((LongSchemaVersion) schemaAndMetadata.version).getVersion() == longVersion)
+                        .collect(Collectors.toList())
+                ).thenCompose(metadataList -> {
+                        log.debug()
+                                .attr("schemaId", schemaId)
+                                .attr("size", CollectionUtils.isEmpty(metadataList) ? 0 : metadataList.size())
+                                .log("Meta data list size");
+                        if (CollectionUtils.isNotEmpty(metadataList)) {
+                            return schemaStorage.get(schemaId, version);
+                        }
+                        return completedFuture(null);
+                    }
+                );
+        }
+
+        return completableFuture
+                .thenCompose(stored -> {
+                    if (isNull(stored)) {
+                        return completedFuture(null);
+                    } else {
+                        return Functions.bytesToSchemaInfo(stored.data)
+                                .thenApply(Functions::schemaInfoToSchema)
+                                .thenApply(schema -> new SchemaAndMetadata(schemaId, schema, stored.version));
+                    }
+                })
+                .whenComplete((v, t) -> {
+                    var latencyMs = this.clock.millis() - start;
+                    if (t != null) {
+                        log.debug().attr("schemaId", schemaId).log("Get schema failed");
+                        this.stats.recordGetFailed(schemaId, latencyMs);
+                    } else {
+                        log.debugf(null == v ? "[%s] Schema not found" : "[%s] Schema is present", schemaId);
+                        this.stats.recordGetLatency(schemaId, latencyMs);
+                    }
+                });
+    }
+
+    @Override
+    public CompletableFuture<List<CompletableFuture<SchemaAndMetadata>>> getAllSchemas(String schemaId) {
+        long start = this.clock.millis();
+
+        return schemaStorage.getAll(schemaId)
+                .thenCompose(schemas -> convertToSchemaAndMetadata(schemaId, schemas))
+                .whenComplete((v, t) -> {
+                    var latencyMs = this.clock.millis() - start;
+                    if (t != null) {
+                        this.stats.recordListFailed(schemaId, latencyMs);
+                    } else {
+                        this.stats.recordListLatency(schemaId, latencyMs);
+                    }
+                });
+    }
+
+    private CompletableFuture<List<CompletableFuture<SchemaAndMetadata>>> convertToSchemaAndMetadata(String schemaId,
+             List<CompletableFuture<StoredSchema>> schemas) {
+        List<CompletableFuture<SchemaAndMetadata>> list = schemas.stream()
+                .map(future -> future.thenCompose(stored ->
+                        Functions.bytesToSchemaInfo(stored.data)
+                                .thenApply(Functions::schemaInfoToSchema)
+                                .thenApply(schema ->
+                                        new SchemaAndMetadata(schemaId, schema, stored.version)
+                                )
+                ))
+                .collect(Collectors.toList());
+        log.debug().attr("schemaId", schemaId).attr("size", list.size()).log("schemas is found");
+        return CompletableFuture.completedFuture(list);
+    }
+
+    @Override
+    @NonNull
+    public CompletableFuture<SchemaVersion> putSchemaIfAbsent(String schemaId, SchemaData schema,
+                                                              SchemaCompatibilityStrategy strategy) {
+        MutableLong start = new MutableLong(0);
+        CompletableFuture<SchemaVersion> promise = new CompletableFuture<>();
+        schemaStorage.put(schemaId,
+            schemasFuture -> schemasFuture
+                .thenCompose(schemaFutureList -> trimDeletedSchemaAndGetList(schemaId,
+                        convertToSchemaAndMetadata(schemaId, schemaFutureList)))
+                .thenCompose(schemaAndMetadataList -> getSchemaVersionBySchemaData(schemaAndMetadataList, schema)
+                    .thenCompose(schemaVersion -> {
+                        if (schemaVersion != null) {
+                            log.debug().attr("schemaId", schemaId).log("Schema is already exists");
+                            promise.complete(schemaVersion);
+                            return CompletableFuture.completedFuture(null);
+                        }
+                        CompletableFuture<Void> checkCompatibilityFuture = new CompletableFuture<>();
+                        if (schemaAndMetadataList.size() != 0) {
+                            if (isTransitiveStrategy(strategy)) {
+                                checkCompatibilityFuture =
+                                        checkCompatibilityWithAll(schemaId, schema, strategy, schemaAndMetadataList);
+                            } else {
+                                checkCompatibilityFuture = checkCompatibilityWithLatest(schemaId, schema, strategy);
+                            }
+                        } else {
+                            checkCompatibilityFuture.complete(null);
+                        }
+                        return checkCompatibilityFuture.thenCompose(v -> {
+                            byte[] context = hashFunction.hashBytes(schema.getData()).asBytes();
+                            SchemaInfo info = new SchemaInfo()
+                                    .setType(Functions.convertFromDomainType(schema.getType()))
+                                    .setSchema(schema.getData())
+                                    .setSchemaId(schemaId)
+                                    .setUser(schema.getUser())
+                                    .setDeleted(false)
+                                    .setTimestamp(clock.millis());
+                            Functions.addProps(info, schema.getProps());
+
+                            start.setValue(this.clock.millis());
+                            return CompletableFuture.completedFuture(Pair.of(info.toByteArray(), context));
+                        });
+                }))).whenComplete((v, ex) -> {
+                    var latencyMs = this.clock.millis() - start.longValue();
+                    if (ex != null) {
+                        if (ex instanceof IncompatibleSchemaException) {
+                            log.warn()
+                                    .attr("schemaId", schemaId)
+                                    .exception(ex)
+                                    .log("Put schema failed due to incompatible schema");
+                        } else {
+                            log.error().attr("schemaId", schemaId).exception(ex).log("Put schema failed");
+                        }
+                        if (start.longValue() != 0) {
+                            this.stats.recordPutFailed(schemaId, latencyMs);
+                        }
+                        promise.completeExceptionally(ex);
+                    } else {
+                        log.debug().attr("schemaId", schemaId).log("Put schema finished");
+                        // The schema storage will return null schema version if no schema is persisted to the storage
+                        if (v != null) {
+                            promise.complete(v);
+                            if (start.longValue() != 0) {
+                                this.stats.recordPutLatency(schemaId, this.clock.millis() - start.longValue());
+                            }
+                        }
+                    }
+            });
+        return promise;
+    }
+
+    @Override
+    public CompletableFuture<SchemaVersion> deleteSchema(String schemaId, String user, boolean force) {
+        long start = this.clock.millis();
+
+        if (force) {
+            return deleteSchemaStorage(schemaId, true);
+        }
+        byte[] deletedEntry = deleted(schemaId, user).toByteArray();
+        return schemaStorage
+                .put(schemaId, deletedEntry, new byte[]{})
+                .whenComplete((v, t) -> {
+                    var latencyMs = this.clock.millis() - start;
+                    if (t != null) {
+                        log.error().attr("schemaId", schemaId).attr("user", user).log("User delete schema failed");
+                        this.stats.recordDelFailed(schemaId, latencyMs);
+                    } else {
+                        log.debug().attr("schemaId", schemaId).attr("user", user).log("User delete schema finished");
+                        this.stats.recordDelLatency(schemaId, latencyMs);
+                    }
+                });
+    }
+
+    @Override
+    public CompletableFuture<SchemaVersion> deleteSchemaStorage(String schemaId) {
+        return deleteSchemaStorage(schemaId, false);
+    }
+
+    @Override
+    public CompletableFuture<SchemaVersion> deleteSchemaStorage(String schemaId, boolean forcefully) {
+        long start = this.clock.millis();
+
+        return schemaStorage.delete(schemaId, forcefully)
+                .whenComplete((v, t) -> {
+                    var latencyMs = this.clock.millis() - start;
+                    if (t != null) {
+                        this.stats.recordDelFailed(schemaId, latencyMs);
+                        log.error().attr("schemaId", schemaId).log("Delete schema storage failed");
+                    } else {
+                        this.stats.recordDelLatency(schemaId, latencyMs);
+                        log.debug().attr("schemaId", schemaId).log("Delete schema storage finished");
+                    }
+                });
+    }
+
+    @Override
+    public CompletableFuture<Boolean> isCompatible(String schemaId, SchemaData schema,
+                                                   SchemaCompatibilityStrategy strategy) {
+        return checkCompatible(schemaId, schema, strategy).thenApply(v -> true);
+    }
+
+    private static boolean isTransitiveStrategy(SchemaCompatibilityStrategy strategy) {
+        if (FORWARD_TRANSITIVE.equals(strategy)
+                || BACKWARD_TRANSITIVE.equals(strategy)
+                || FULL_TRANSITIVE.equals(strategy)) {
+            return true;
+        }
+        return false;
+    }
+
+    @Override
+    public CompletableFuture<Void> checkCompatible(String schemaId, SchemaData schema,
+                                                                    SchemaCompatibilityStrategy strategy) {
+        switch (strategy) {
+            case FORWARD_TRANSITIVE:
+            case BACKWARD_TRANSITIVE:
+            case FULL_TRANSITIVE:
+                return checkCompatibilityWithAll(schemaId, schema, strategy);
+            default:
+                return checkCompatibilityWithLatest(schemaId, schema, strategy);
+        }
+    }
+
+    @Override
+    public SchemaVersion versionFromBytes(byte[] version) {
+        return schemaStorage.versionFromBytes(version);
+    }
+
+    @Override
+    public void close() throws Exception {
+        schemaStorage.close();
+        this.stats.close();
+    }
+
+    private SchemaInfo deleted(String schemaId, String user) {
+        return new SchemaInfo()
+            .setSchemaId(schemaId)
+            .setType(SchemaInfo.SchemaType.NONE)
+            .setSchema(new byte[0])
+            .setUser(user)
+            .setDeleted(true)
+            .setTimestamp(clock.millis());
+    }
+
+    private void checkCompatible(SchemaAndMetadata existingSchema, SchemaData newSchema,
+                                 SchemaCompatibilityStrategy strategy) throws IncompatibleSchemaException {
+        SchemaData existingSchemaData = existingSchema.schema;
+        if (newSchema.getType() != existingSchemaData.getType()) {
+            throw new IncompatibleSchemaException(String.format("Incompatible schema: "
+                            + "exists schema type %s, new schema type %s",
+                    existingSchemaData.getType(), newSchema.getType()));
+        }
+        SchemaHash existingHash = SchemaHash.of(existingSchemaData);
+        SchemaHash newHash = SchemaHash.of(newSchema);
+        if (!newHash.equals(existingHash)) {
+            compatibilityChecks.getOrDefault(newSchema.getType(), SchemaCompatibilityCheck.DEFAULT)
+                    .checkCompatible(existingSchemaData, newSchema, strategy);
+        }
+    }
+
+    public CompletableFuture<Long> findSchemaVersion(String schemaId, SchemaData schemaData) {
+        return trimDeletedSchemaAndGetList(schemaId)
+                .thenCompose(schemaAndMetadataList -> {
+                    SchemaHash newHash = SchemaHash.of(schemaData);
+                    for (SchemaAndMetadata schemaAndMetadata : schemaAndMetadataList) {
+                        if (newHash.equals(SchemaHash.of(schemaAndMetadata.schema))) {
+                            return completedFuture(((LongSchemaVersion) schemaStorage
+                                    .versionFromBytes(schemaAndMetadata.version.bytes())).getVersion());
+                        }
+                    }
+                    return completedFuture(NO_SCHEMA_VERSION);
+                });
+    }
+
+    @Override
+    public CompletableFuture<Void> checkConsumerCompatibility(String schemaId, SchemaData schemaData,
+                                                              SchemaCompatibilityStrategy strategy) {
+        if (SchemaCompatibilityStrategy.ALWAYS_COMPATIBLE == strategy) {
+            return CompletableFuture.completedFuture(null);
+        }
+        return getSchema(schemaId).thenCompose(existingSchema -> {
+            if (existingSchema != null && !existingSchema.schema.isDeleted()) {
+                if (strategy == SchemaCompatibilityStrategy.BACKWARD
+                        || strategy == SchemaCompatibilityStrategy.FORWARD
+                        || strategy == SchemaCompatibilityStrategy.FORWARD_TRANSITIVE
+                        || strategy == SchemaCompatibilityStrategy.FULL) {
+                    return checkCompatibilityWithLatest(schemaId, schemaData, SchemaCompatibilityStrategy.BACKWARD);
+                } else {
+                    return checkCompatibilityWithAll(schemaId, schemaData, strategy);
+                }
+            } else {
+                return FutureUtil.failedFuture(new NotExistSchemaException("Topic does not have schema to check"));
+            }
+        });
+    }
+
+    @Override
+    public CompletableFuture<SchemaVersion> getSchemaVersionBySchemaData(
+            List<SchemaAndMetadata> schemaAndMetadataList,
+            SchemaData schemaData) {
+        if (schemaAndMetadataList == null || schemaAndMetadataList.size() == 0) {
+            return CompletableFuture.completedFuture(null);
+        }
+        final CompletableFuture<SchemaVersion> completableFuture = new CompletableFuture<>();
+        SchemaVersion schemaVersion;
+        if (isUsingAvroSchemaParser(schemaData.getType())) {
+            Schema.Parser parser = new Schema.Parser(StructSchemaDataValidator.COMPATIBLE_NAME_VALIDATOR);
+            Schema newSchema = parser.parse(new String(schemaData.getData(), UTF_8));
+
+            for (SchemaAndMetadata schemaAndMetadata : schemaAndMetadataList) {
+                if (isUsingAvroSchemaParser(schemaAndMetadata.schema.getType())) {
+                    Schema.Parser existParser =
+                            new Schema.Parser(StructSchemaDataValidator.COMPATIBLE_NAME_VALIDATOR);
+                    Schema existSchema = existParser.parse(new String(schemaAndMetadata.schema.getData(), UTF_8));
+                    if (newSchema.equals(existSchema) && schemaAndMetadata.schema.getType() == schemaData.getType()) {
+                        schemaVersion = schemaAndMetadata.version;
+                        completableFuture.complete(schemaVersion);
+                        return completableFuture;
+                    }
+                } else {
+                    if (Arrays.equals(hashFunction.hashBytes(schemaAndMetadata.schema.getData()).asBytes(),
+                            hashFunction.hashBytes(schemaData.getData()).asBytes())
+                            && schemaAndMetadata.schema.getType() == schemaData.getType()) {
+                        schemaVersion = schemaAndMetadata.version;
+                        completableFuture.complete(schemaVersion);
+                        return completableFuture;
+                    }
+                }
+            }
+        } else {
+            for (SchemaAndMetadata schemaAndMetadata : schemaAndMetadataList) {
+                if (Arrays.equals(hashFunction.hashBytes(schemaAndMetadata.schema.getData()).asBytes(),
+                        hashFunction.hashBytes(schemaData.getData()).asBytes())
+                        && schemaAndMetadata.schema.getType() == schemaData.getType()) {
+                    schemaVersion = schemaAndMetadata.version;
+                    completableFuture.complete(schemaVersion);
+                    return completableFuture;
+                }
+            }
+        }
+        completableFuture.complete(null);
+        return completableFuture;
+    }
+
+    private CompletableFuture<Void> checkCompatibilityWithLatest(String schemaId, SchemaData schema,
+                                                                    SchemaCompatibilityStrategy strategy) {
+        if (SchemaCompatibilityStrategy.ALWAYS_COMPATIBLE == strategy) {
+            return CompletableFuture.completedFuture(null);
+        }
+        return getSchema(schemaId).thenCompose(existingSchema -> {
+            if (existingSchema != null && !existingSchema.schema.isDeleted()) {
+                CompletableFuture<Void> result = new CompletableFuture<>();
+                result.whenComplete((__, t) -> {
+                    if (t != null) {
+                        log.warn().attr("schemaId", schemaId).log("Schema is incompatible");
+                        this.stats.recordSchemaIncompatible(schemaId);
+                    } else {
+                        log.debug().attr("schemaId", schemaId).log("Schema is compatible");
+                        this.stats.recordSchemaCompatible(schemaId);
+                    }
+                });
+
+                try {
+                    checkCompatible(existingSchema, schema, strategy);
+                    result.complete(null);
+                } catch (IncompatibleSchemaException e) {
+                    result.completeExceptionally(e);
+                }
+                return result;
+            } else {
+                return CompletableFuture.completedFuture(null);
+            }
+        });
+    }
+
+    private CompletableFuture<Void> checkCompatibilityWithAll(String schemaId, SchemaData schema,
+                                                                     SchemaCompatibilityStrategy strategy) {
+
+        return trimDeletedSchemaAndGetList(schemaId).thenCompose(schemaAndMetadataList ->
+                checkCompatibilityWithAll(schemaId, schema, strategy, schemaAndMetadataList));
+    }
+
+    private CompletableFuture<Void> checkCompatibilityWithAll(String schemaId, SchemaData schema,
+                                                              SchemaCompatibilityStrategy strategy,
+                                                              List<SchemaAndMetadata> schemaAndMetadataList) {
+        CompletableFuture<Void> result = new CompletableFuture<>();
+        result.whenComplete((v, t) -> {
+            if (t != null) {
+                this.stats.recordSchemaIncompatible(schemaId);
+                log.warn()
+                        .attr("schemaId", schemaId)
+                        .attr("type", schema.getType())
+                        .log("Schema is incompatible, schema type");
+            } else {
+                this.stats.recordSchemaCompatible(schemaId);
+                log.debug()
+                        .attr("schemaId", schemaId)
+                        .attr("type", schema.getType())
+                        .log("Schema is compatible, schema type");
+            }
+        });
+
+        if (strategy == SchemaCompatibilityStrategy.ALWAYS_COMPATIBLE) {
+            result.complete(null);
+        } else {
+            SchemaAndMetadata breakSchema = null;
+            for (SchemaAndMetadata schemaAndMetadata : schemaAndMetadataList) {
+                if (schemaAndMetadata.schema.getType() != schema.getType()) {
+                    breakSchema = schemaAndMetadata;
+                    break;
+                }
+            }
+            if (breakSchema == null) {
+                try {
+                    compatibilityChecks.getOrDefault(schema.getType(), SchemaCompatibilityCheck.DEFAULT)
+                            .checkCompatible(schemaAndMetadataList
+                                    .stream()
+                                    .map(schemaAndMetadata -> schemaAndMetadata.schema)
+                                    .collect(Collectors.toList()), schema, strategy);
+                    result.complete(null);
+                } catch (Exception e) {
+                    if (e instanceof IncompatibleSchemaException) {
+                        result.completeExceptionally(e);
+                    } else {
+                        result.completeExceptionally(new IncompatibleSchemaException(e));
+                    }
+                }
+            } else {
+                result.completeExceptionally(new IncompatibleSchemaException(
+                        String.format("Incompatible schema: exists schema type %s, new schema type %s",
+                                breakSchema.schema.getType(), schema.getType())));
+            }
+        }
+        return result;
+    }
+
+    public CompletableFuture<List<SchemaAndMetadata>> trimDeletedSchemaAndGetList(String schemaId) {
+        CompletableFuture<List<CompletableFuture<SchemaAndMetadata>>> schemaFutureList = getAllSchemas(schemaId);
+        return trimDeletedSchemaAndGetList(schemaId, schemaFutureList);
+    }
+
+    private CompletableFuture<List<SchemaAndMetadata>> trimDeletedSchemaAndGetList(String schemaId,
+                CompletableFuture<List<CompletableFuture<SchemaAndMetadata>>> schemaFutureList) {
+        CompletableFuture<List<SchemaAndMetadata>> schemaResult = new CompletableFuture<>();
+        schemaFutureList.thenCompose(FutureUtils::collect).handle((schemaList, ex) -> {
+            List<SchemaAndMetadata> list = ex != null ? new ArrayList<>() : schemaList;
+            if (ex != null) {
+                final Throwable rc = FutureUtil.unwrapCompletionException(ex);
+                boolean recoverable = !(rc instanceof SchemaException) || ((SchemaException) rc).isRecoverable();
+                // if error is recoverable then fail the request.
+                if (recoverable) {
+                    schemaResult.completeExceptionally(rc);
+                    return null;
+                }
+                // clean the schema list for recoverable and delete the schema from zk
+                schemaFutureList.getNow(Collections.emptyList()).forEach(schemaFuture -> {
+                    if (!schemaFuture.isCompletedExceptionally()) {
+                        list.add(schemaFuture.getNow(null));
+                        return;
+                    }
+                });
+                trimDeletedSchemaAndGetList(list);
+                // clean up the broken schema from zk
+                deleteSchemaStorage(schemaId, true).handle((sv, th) -> {
+                    log.info()
+                            .exceptionMessage(rc)
+                            .attr("schemaId", schemaId)
+                            .attr("arg2", (th == null ? "successful" : "failed, " + th.getCause().getMessage()))
+                            .log("Clean up non-recoverable schema. Deletion of schema");
+                    schemaResult.complete(list);
+                    return null;
+                });
+                return null;
+            }
+            // trim the deleted schema and return the result if schema is retrieved successfully
+            List<SchemaAndMetadata> trimmed = trimDeletedSchemaAndGetList(list);
+            schemaResult.complete(trimmed);
+            return null;
+        });
+        return schemaResult;
+    }
+
+    private List<SchemaAndMetadata> trimDeletedSchemaAndGetList(List<SchemaAndMetadata> list) {
+        // Trim the prefix of schemas before the latest delete.
+        int lastIndex = list.size() - 1;
+        for (int i = lastIndex; i >= 0; i--) {
+            if (list.get(i).schema.isDeleted()) {
+                if (i == lastIndex) { // if the latest schema is a delete, there's no schemas to compare
+                    return Collections.emptyList();
+                } else {
+                    return list.subList(i + 1, list.size());
+                }
+            }
+        }
+        return list;
+    }
+
+    interface Functions {
+        static SchemaType convertToDomainType(SchemaInfo.SchemaType type) {
+            if (type.getValue() < 0) {
+                return SchemaType.NONE;
+            } else {
+                // the value of type in `SchemaType` is always 1 less than the value of type `SchemaInfo.SchemaType`
+                return SchemaType.valueOf(type.getValue() - 1);
+            }
+        }
+
+        static SchemaInfo.SchemaType convertFromDomainType(SchemaType type) {
+            if (type.getValue() < 0) {
+                return SchemaInfo.SchemaType.NONE;
+            } else {
+                return SchemaInfo.SchemaType.valueOf(type.getValue() + 1);
+            }
+        }
+
+        static Map<String, String> toMap(SchemaInfo info) {
+            Map<String, String> map = new HashMap<>();
+            for (int i = 0; i < info.getPropsCount(); i++) {
+                SchemaInfo.KeyValuePair pair = info.getPropAt(i);
+                map.put(pair.getKey(), pair.getValue());
+            }
+            return map;
+        }
+
+        static void addProps(SchemaInfo info, Map<String, String> map) {
+            if (map != null) {
+                for (Map.Entry<String, String> entry : map.entrySet()) {
+                    info.addProp().setKey(entry.getKey()).setValue(entry.getValue());
+                }
+            }
+        }
+
+        static SchemaData schemaInfoToSchema(SchemaInfo info) {
+            return SchemaData.builder()
+                .user(info.getUser())
+                .type(convertToDomainType(info.getType()))
+                .data(info.getSchema())
+                .timestamp(info.getTimestamp())
+                .isDeleted(info.isDeleted())
+                .props(toMap(info))
+                .build();
+        }
+
+        static CompletableFuture<SchemaInfo> bytesToSchemaInfo(byte[] bytes) {
+            CompletableFuture<SchemaInfo> future;
+            try {
+                SchemaInfo info = new SchemaInfo();
+                info.parseFrom(bytes);
+                future = completedFuture(info);
+            } catch (Exception e) {
+                future = new CompletableFuture<>();
+                future.completeExceptionally(e);
+            }
+            return future;
+        }
+    }
+
+    public static boolean isUsingAvroSchemaParser(SchemaType type) {
+        switch (type) {
+            case AVRO:
+            case JSON:
+            case PROTOBUF:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+}
